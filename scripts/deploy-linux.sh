@@ -19,7 +19,15 @@ set -euo pipefail
 REPO="AlaIchhe/Codex-AI-Gateway"
 APP_ROOT=/opt/codex-ai-gateway
 PORT=8787
-BIND=${2:-127.0.0.1}
+BIND_FILE=$APP_ROOT/bind-address
+if [ -n "${2:-}" ]; then
+  BIND=$2
+  echo "$BIND" > "$BIND_FILE"
+elif [ -f "$BIND_FILE" ]; then
+  BIND=$(head -1 "$BIND_FILE" | tr -d '[:space:]')
+else
+  BIND=127.0.0.1
+fi
 
 [ "$(id -u)" -eq 0 ] || { echo "错误: 请用 root 运行（sudo）"; exit 1; }
 
