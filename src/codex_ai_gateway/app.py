@@ -20,7 +20,6 @@ from codex_ai_gateway.integrations.secret_store import SecretStore
 from codex_ai_gateway.persistence.file_store import init_data_dir
 from codex_ai_gateway.runtime import Runtime
 from codex_ai_gateway.services.local_codex import LocalCodexAutomationService
-from codex_ai_gateway.services.presets import load_preset_catalog
 
 
 def create_app(

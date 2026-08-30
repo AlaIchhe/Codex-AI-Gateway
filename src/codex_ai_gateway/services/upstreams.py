@@ -2,17 +2,16 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-import asyncio
 import httpx
 
 from codex_ai_gateway.models.entities import (
     Offering,
     OfferingStatus,
     Upstream,
-    UpstreamKind,
     WireProtocol,
 )
 from codex_ai_gateway.util import utc_now, uuid7
