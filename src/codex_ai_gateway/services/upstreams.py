@@ -194,6 +194,8 @@ async def probe_model_protocols(
 async def discover_offerings(
     upstream: Upstream,
     api_credential: str,
+    *,
+    protocol_map: dict[str, list[WireProtocol]] | None = None,
 ) -> list[Offering]:
     """Discover offerings for each confirmed protocol."""
     base = upstream.base_url.rstrip("/")
@@ -237,6 +239,7 @@ def build_preset_offerings(
     discovery: Any,
     *,
     snapshot_id: str,
+    protocol_map: dict[str, list[WireProtocol]],
 ) -> list[Offering]:
     """根据成功的官方文档发现结果构建 offerings，不调用 /models。"""
     now = utc_now()
