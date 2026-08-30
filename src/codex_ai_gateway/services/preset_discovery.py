@@ -23,7 +23,7 @@ from codex_ai_gateway.util import utc_now, uuid7
 
 PRESET_DOCUMENT_TIMEOUT = httpx.Timeout(8.0, connect=3.0)
 PRESET_DOCUMENT_MAX_BYTES = 5 * 1024 * 1024
-_ALLOWED_CONTENT_TYPES = {"text/html", "application/xhtml+xml"}
+_ALLOWED_CONTENT_TYPES = {"text/html", "application/xhtml+xml", "application/json"}
 
 
 class PresetDiscoveryResult(BaseModel):
@@ -78,6 +78,22 @@ def _failure(
     )
 
 
+
+def _is_same_registrable_domain(source_host: str | None, final_host: str | None) -> bool:
+    """Check that final host shares the same registrable domain (last two labels)."""
+    if not source_host or not final_host:
+        return False
+    source_host = source_host.lower().rstrip(".")
+    final_host = final_host.lower().rstrip(".")
+    if source_host == final_host:
+        return True
+    source_parts = source_host.rsplit(".", 2)
+    final_parts = final_host.rsplit(".", 2)
+    if len(source_parts) < 2 or len(final_parts) < 2:
+        return False
+    return source_parts[-2:] == final_parts[-2:]
+
+
 async def discover_preset(preset: PresetProvider) -> PresetDiscoveryResult:
     attempted_at = utc_now()
     try:
@@ -102,7 +118,7 @@ async def discover_preset(preset: PresetProvider) -> PresetDiscoveryResult:
         async with httpx.AsyncClient(
             timeout=PRESET_DOCUMENT_TIMEOUT,
             follow_redirects=True,
-            headers={"Accept": "text/html,application/xhtml+xml"},
+            headers={"Accept": "text/html,application/xhtml+xml,application/json"},
         ) as client:
             async with client.stream("GET", preset.doc_url) as response:
                 content_type = response.headers.get("content-type", "").split(";", 1)[0].strip().lower() or None

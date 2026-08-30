@@ -56,13 +56,24 @@ def _unique_model_ids(values: list[str]) -> list[str]:
     return result
 
 
+_DOMAIN_LIKE_RE = re.compile(
+    r"^[A-Za-z0-9][A-Za-z0-9.-]*\.(com|org|net|io|ai|cn|dev|app|gov|edu|co|uk|jp|de)(/|$)", re.I,
+)
+_PURE_WORD_PATH_RE = re.compile(r"^[A-Za-z]+/[A-Za-z]+$")
+
+
 def _model_ids_from_text(value: str) -> list[str]:
     candidates = re.findall(
         r"(?<![A-Za-z0-9])(?:[A-Za-z0-9]+[._:+/@-]){1,}[A-Za-z0-9]+(?![A-Za-z0-9])",
         value,
     )
     return _unique_model_ids(
-        [candidate for candidate in candidates if "://" not in candidate and not candidate.lower().startswith(("http", "www"))]
+        candidate
+        for candidate in candidates
+        if "://" not in candidate
+        and not candidate.lower().startswith(("http", "www"))
+        and not _DOMAIN_LIKE_RE.match(candidate)
+        and not _PURE_WORD_PATH_RE.match(candidate)
     )
 
 
@@ -193,6 +204,42 @@ class _TableParser(HTMLParser):
             self.current_cell.append(data)
 
 
+
+def extract_volcengine_doc_api(document: str) -> ExtractionResult:
+    """Parse volcengine docs API getDocDetail response (Result.Content JSON string)."""
+    try:
+        response = json.loads(document)
+    except json.JSONDecodeError as exc:
+        raise PresetExtractionError("extractor_invalid_payload", "官方文档 API 响应不是合法 JSON") from exc
+    result = response.get("Result") if isinstance(response, dict) else None
+    content_str = result.get("Content") if isinstance(result, dict) else None
+    if not isinstance(content_str, str):
+        raise PresetExtractionError("extractor_structure_changed", "官方文档 API 响应缺少 Content 字段")
+    try:
+        content = json.loads(content_str)
+    except json.JSONDecodeError as exc:
+        raise PresetExtractionError("extractor_invalid_payload", "官方文档 Content 不是合法 JSON") from exc
+    data = content.get("data") if isinstance(content, dict) else None
+    if not isinstance(data, dict):
+        raise PresetExtractionError("extractor_structure_changed", "官方文档 Content 缺少 data 字段")
+    values: list[str] = []
+    op_count = 0
+    for block in data.values():
+        if not isinstance(block, dict) or not isinstance(block.get("ops"), list):
+            continue
+        for operation in block["ops"]:
+            if not isinstance(operation, dict):
+                continue
+            op_count += 1
+            insert = operation.get("insert")
+            if isinstance(insert, str):
+                values.extend(_model_ids_from_text(insert))
+            elif isinstance(insert, dict):
+                values.extend(_model_ids_from_text(json.dumps(insert, ensure_ascii=False)))
+    model_ids = _unique_model_ids(values)
+    if not model_ids:
+        raise PresetExtractionError("extractor_no_models", "官方文档 API 未提取到合法模型列表")
+    return ExtractionResult(model_ids=model_ids, evidence={"format": "doc_api_quill_delta", "operation_count": op_count})
 def extract_opencode_html_table(document: str) -> ExtractionResult:
     parser = _TableParser()
     parser.feed(document)
@@ -220,6 +267,11 @@ EXTRACTOR_REGISTRY: dict[str, PresetExtractor] = {
         key="volcengine_quill_delta",
         version="volcengine-quill-delta-v1",
         extract=extract_volcengine_quill_delta,
+    ),
+    "volcengine_doc_api_v1": PresetExtractor(
+        key="volcengine_doc_api_v1",
+        version="volcengine-doc-api-v1",
+        extract=extract_volcengine_doc_api,
     ),
     "opencode_html_table": PresetExtractor(
         key="opencode_html_table",
