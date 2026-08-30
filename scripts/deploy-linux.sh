@@ -106,7 +106,8 @@ EOF
 
 ln -sfn "$REL_DIR" "$CURRENT"
 systemctl daemon-reload
-systemctl enable --now codex-ai-gateway >/dev/null 2>&1 || systemctl restart codex-ai-gateway
+systemctl enable codex-ai-gateway >/dev/null 2>&1
+systemctl restart codex-ai-gateway
 
 echo "==> 健康检查"
 sleep 3
