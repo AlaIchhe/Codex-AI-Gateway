@@ -1,0 +1,365 @@
+""""网关数据面：全局 token 认证、规范模型路由、协议选择与备用切换。"""
+
+from __future__ import annotations
+
+import json
+import logging
+from collections.abc import AsyncIterator
+from typing import Any
+
+from fastapi import APIRouter, Request
+from fastapi.responses import Response, StreamingResponse
+
+from codex_ai_gateway.adapters.protocol_normal_form import (
+    UntranslatableCapabilityError,
+    normalize_request,
+    validate_translatable,
+)
+from codex_ai_gateway.adapters.responses_chat_translation import (
+    chat_request_from_normal,
+    parse_chat_sse_frame,
+    response_completed_event,
+    response_created_event,
+    response_message_done_event,
+    response_message_started_events,
+    response_sse,
+    translate_chat_chunk_to_response_event,
+)
+from codex_ai_gateway.api.errors import (
+    GatewayError,
+    gateway_error_response,
+    make_auth_error,
+    make_invalid_request,
+)
+from codex_ai_gateway.domain.error_mapping import map_provider_error
+from codex_ai_gateway.domain.routing import (
+    RoutingError,
+    resolve_canonical_model,
+    route_candidates,
+)
+from codex_ai_gateway.domain.usage import (
+    estimate_usage_from_text,
+    merge_usage_categories,
+    parse_provider_usage,
+    reporting_basis_for,
+)
+from codex_ai_gateway.models.entities import (
+    GatewayToken,
+    Outcome,
+    ProviderErrorType,
+    Upstream,
+    UsageEvent,
+    WireProtocol,
+)
+from codex_ai_gateway.runtime import Runtime
+from codex_ai_gateway.services.gateway_token import verify_gateway_token
+from codex_ai_gateway.services.upstreams import request_failure_fields
+from codex_ai_gateway.util import utc_now
+
+router = APIRouter()
+logger = logging.getLogger("codex_ai_gateway.gateway")
+FALLBACK_STATUSES = {429, 502, 503, 529}
+
+
+def _runtime(request: Request) -> Runtime:
+    return request.app.state.runtime
+
+
+def _extract_bearer(request: Request) -> str | None:
+    auth = request.headers.get("authorization")
+    if auth:
+        if not auth.lower().startswith("bearer "):
+            return None
+        return auth[7:].strip()
+    return request.headers.get("x-api-key")
+
+
+def _authenticate(request: Request, runtime: Runtime) -> GatewayToken:
+    raw = _extract_bearer(request)
+    if not raw:
+        raise make_auth_error("missing_gateway_token", "请提供全局网关 token。")
+    state = runtime.state_store.read_state()
+    token = verify_gateway_token(raw, state.gateway_tokens, runtime.signing_key)
+    if token is None:
+        raise make_auth_error("unauthorized_gateway_token", "全局网关 token 无效或已吊销。")
+    runtime.state_store.mutate(lambda s: _touch_token(s, token.id))
+    return token
+
+
+def _touch_token(state: Any, token_id: str) -> None:
+    for token in state.gateway_tokens:
+        if token.id == token_id:
+            token.last_used_at = utc_now()
+
+
+def _read_body(request: Request) -> dict[str, Any]:
+    body = getattr(request.state, "gateway_body", None)
+    if body is not None:
+        return body
+    return {}
+
+
+async def _gateway(request: Request) -> Response:
+    runtime = _runtime(request)
+    candidates: list[tuple[Any, Upstream, WireProtocol]] = []
+    canonical = None
+    body: dict[str, Any] = {}
+    try:
+        _authenticate(request, runtime)
+        raw_body = await request.body()
+        try:
+            body = json.loads(raw_body or b"{}")
+        except json.JSONDecodeError as exc:
+            raise make_invalid_request("invalid_json", "请求体不是有效 JSON。") from exc
+        request.state.gateway_body = body
+        model = body.get("model")
+        if not model:
+            raise make_invalid_request("missing_model", "请求缺少 model 字段。")
+        state = runtime.state_store.read_state()
+        canonical = resolve_canonical_model(state, str(model))
+        candidates = route_candidates(state, canonical)
+        if not candidates:
+            raise RoutingError(code="no_available_upstream", message="该模型没有可用的健康上游。", status_code=503)
+        return await _attempt_with_fallback(request, runtime, canonical.id, candidates, body)
+    except GatewayError as exc:
+        return gateway_error_response(error_type=exc.error_type, code=exc.code, message=exc.message, status_code=exc.status_code, details=exc.details, headers=exc.headers)
+    except RoutingError as exc:
+        return gateway_error_response(error_type="invalid_request", code=exc.code, message=exc.message, status_code=exc.status_code)
+    except UntranslatableCapabilityError as exc:
+        return gateway_error_response(error_type="untranslatable_capability", code="untranslatable_capability", message=exc.message, status_code=422, details={"capability": exc.capability})
+    except Exception as exc:
+        logger.exception("gateway request failed: %s", type(exc).__name__)
+        return gateway_error_response(error_type="gateway_error", code="gateway_internal_error", message="网关内部错误。", status_code=500)
+
+
+@router.post("/v1/responses")
+async def responses_v1(request: Request) -> Response:
+    return await _gateway(request)
+
+
+@router.post("/responses")
+async def responses_root(request: Request) -> Response:
+    return await _gateway(request)
+
+
+async def _attempt_with_fallback(
+    request: Request,
+    runtime: Runtime,
+    canonical_id: str,
+    candidates: list[tuple[Any, Upstream, WireProtocol]],
+    body: dict[str, Any],
+) -> Response:
+    last_error: GatewayError | None = None
+    for ordinal, (offering, upstream, protocol) in enumerate(candidates, start=1):
+        event = _new_event(runtime, canonical_id, offering, upstream, protocol, ordinal)
+        runtime.usage_log.create_pending(event)
+        try:
+            if protocol == WireProtocol.chat_completions:
+                normal = normalize_request(inbound_protocol="responses", body=body)
+                validate_translatable(normal)
+                chat_body = chat_request_from_normal(normal, target_model=offering.provider_model_id)
+            else:
+                chat_body = body
+            streaming = bool(body.get("stream"))
+            if streaming:
+                return await _stream_response(request, runtime, event, upstream, chat_body, protocol, offering)
+            result = await runtime.upstream_client.request(
+                upstream,
+                path="/chat/completions" if protocol == WireProtocol.chat_completions else "/responses",
+                method="POST",
+                json_body=chat_body,
+                headers=_public_headers(request),
+            )
+            if result.status_code in FALLBACK_STATUSES:
+                mapped = _mapped_error(result.status_code, result.body)
+                runtime.state_store.mutate(
+                    lambda state, upstream=upstream, result=result: _mark_upstream_failure(state, upstream, result.status_code)
+                )
+                _finalize(runtime, event, Outcome.failed, mapped=mapped, status_code=result.status_code)
+                last_error = mapped
+                continue
+            if result.status_code >= 400:
+                mapped = _mapped_error(result.status_code, result.body)
+                _finalize(runtime, event, Outcome.failed, mapped=mapped, status_code=result.status_code)
+                return mapped_response(mapped)
+            _finalize_success(runtime, event, result.body)
+            return Response(
+                content=result.body,
+                status_code=result.status_code,
+                media_type=result.headers.get("content-type", "application/json"),
+            )
+        except Exception as exc:
+            logger.warning("upstream attempt failed: %s", type(exc).__name__)
+            mapped = _mapped_error(502, b"", error=exc)
+            runtime.state_store.mutate(lambda state, upstream=upstream: _mark_upstream_failure(state, upstream, None))
+            _finalize(runtime, event, Outcome.failed, mapped=mapped, status_code=502, fallback_trigger="connection_failure")
+            last_error = mapped
+            continue
+    if last_error:
+        return mapped_response(last_error)
+    return gateway_error_response(error_type="provider_error", code="no_available_upstream", message="所有上游尝试失败。", status_code=502)
+
+
+def _mark_upstream_failure(state: Any, upstream: Upstream, status_code: int | None) -> None:
+    fields = request_failure_fields(status_code)
+    for index, item in enumerate(state.upstreams):
+        if item.id == upstream.id:
+            state.upstreams[index] = item.model_copy(update=fields)
+            return
+
+
+def _public_headers(request: Request) -> dict[str, str]:
+    allowed = {"accept", "content-type", "user-agent"}
+    return {k: v for k, v in request.headers.items() if k.lower() in allowed}
+
+
+def _new_event(runtime: Runtime, canonical_id: str, offering: Any, upstream: Upstream, protocol: WireProtocol, ordinal: int) -> UsageEvent:
+    state = runtime.state_store.read_state()
+    canonical = next((m for m in state.canonical_models if m.id == canonical_id), None)
+    return UsageEvent(
+        id=str(__import__("codex_ai_gateway.util", fromlist=["uuid7"]).uuid7()),
+        client_request_id=str(__import__("codex_ai_gateway.util", fromlist=["uuid7"]).uuid7()),
+        started_at=utc_now(),
+        upstream_id=upstream.id,
+        upstream_label=upstream.name,
+        offering_id=offering.id,
+        canonical_model_id=canonical.id if canonical else canonical_id,
+        canonical_model_label=canonical.slug if canonical else None,
+        provider_model_id=offering.provider_model_id,
+        inbound_protocol=WireProtocol.responses,
+        outbound_protocol=protocol,
+        outcome=Outcome.failed,
+        attempt_ordinal=ordinal,
+    )
+
+
+def _mapped_error(status_code: int, body: bytes, *, error: Exception | None = None) -> GatewayError:
+    provider = map_provider_error(
+        status_code,
+        body=body,
+        error_text=str(error) if error else None,
+    )
+    return GatewayError(
+        error_type="provider_error",
+        code=provider.get("error_mapping_code", "provider_upstream_fault"),
+        message=provider.get("message", "上游请求失败。"),
+        status_code=status_code,
+        details={"upstream_status": status_code, "upstream_error_type": provider.get("upstream_error_type"), "fingerprint": provider.get("fingerprint")},
+    )
+
+
+def mapped_response(exc: GatewayError) -> Response:
+    return gateway_error_response(error_type=exc.error_type, code=exc.code, message=exc.message, status_code=exc.status_code, details=exc.details)
+
+
+async def _stream_response(
+    request: Request,
+    runtime: Runtime,
+    event: UsageEvent,
+    upstream: Upstream,
+    chat_body: dict[str, Any] | None,
+    protocol: WireProtocol,
+    offering: Any,
+) -> Response:
+    path = "/chat/completions" if protocol == WireProtocol.chat_completions else "/responses"
+    upstream_stream = await runtime.upstream_client.open_stream(
+        upstream,
+        path=path,
+        method="POST",
+        json_body=chat_body,
+        headers=_public_headers(request),
+    )
+    if upstream_stream.status_code in FALLBACK_STATUSES and upstream_stream.first_byte_ms is not None:
+        error_body = await upstream_stream.read_error_body()
+        await upstream_stream.aclose()
+        raise RoutingError(
+            code="fallback_upstream_error",
+            message=f"上游返回 {upstream_stream.status_code}，尝试备用上游。",
+            status_code=upstream_stream.status_code,
+        )
+    if upstream_stream.status_code >= 400:
+        error_body = await upstream_stream.read_error_body()
+        await upstream_stream.aclose()
+        mapped = _mapped_error(upstream_stream.status_code, error_body)
+        _finalize(runtime, event, Outcome.failed, mapped=mapped, status_code=upstream_stream.status_code)
+        return mapped_response(mapped)
+
+    async def iterator() -> AsyncIterator[bytes]:
+        started = False
+        stream_initialized = False
+        accumulated_text = ""
+        last_chat_chunk: dict[str, Any] | None = None
+        buffer = ""
+        try:
+            async for chunk in upstream_stream:
+                started = True
+                if protocol == WireProtocol.responses:
+                    yield chunk
+                    continue
+                buffer += chunk.decode("utf-8", errors="ignore")
+                while "\n\n" in buffer:
+                    frame, buffer = buffer.split("\n\n", 1)
+                    parsed = parse_chat_sse_frame(frame)
+                    if parsed is None:
+                        continue
+                    last_chat_chunk = parsed
+                    if not stream_initialized:
+                        yield response_sse(response_created_event(event.canonical_model_label or event.provider_model_id))
+                        for lifecycle_event in response_message_started_events():
+                            yield response_sse(lifecycle_event)
+                        stream_initialized = True
+                    translated = translate_chat_chunk_to_response_event(parsed)
+                    if translated:
+                        accumulated_text += str(translated.get("delta", ""))
+                        yield response_sse(translated)
+            if protocol == WireProtocol.chat_completions:
+                if not stream_initialized:
+                    yield response_sse(response_created_event(event.canonical_model_label or event.provider_model_id))
+                    for lifecycle_event in response_message_started_events():
+                        yield response_sse(lifecycle_event)
+                yield response_sse(response_message_done_event(accumulated_text))
+                yield response_sse(response_completed_event(
+                    model=event.canonical_model_label or event.provider_model_id,
+                    usage=(last_chat_chunk or {}).get("usage"),
+                ))
+            _finalize_success(runtime, event, b"", streaming=True)
+        except Exception as exc:
+            _finalize(runtime, event, Outcome.failed if started else Outcome.interrupted, mapped=_mapped_error(502, b"", error=exc), status_code=502)
+            raise
+        finally:
+            await upstream_stream.aclose()
+
+    media_type = "text/event-stream" if chat_body is None else "text/event-stream"
+    return StreamingResponse(iterator(), media_type=media_type)
+
+
+def _finalize_success(runtime: Runtime, event: UsageEvent, body: bytes, *, streaming: bool = False) -> None:
+    usage = parse_provider_usage(body)
+    estimated = estimate_usage_from_text(body)
+    merged = merge_usage_categories(usage, estimated)
+    event.token_usage_by_category = merged
+    event.reporting_basis = reporting_basis_for(usage)
+    event.outcome = Outcome.completed
+    event.duration_ms = 0
+    runtime.usage_log.record_finalized(event)
+
+
+def _finalize(
+    runtime: Runtime,
+    event: UsageEvent,
+    outcome: Outcome,
+    *,
+    mapped: GatewayError | None = None,
+    status_code: int | None = None,
+    fallback_trigger: str | None = None,
+) -> None:
+    event.outcome = outcome
+    event.duration_ms = 0
+    if status_code:
+        event.http_upstream_status = status_code
+    if mapped:
+        event.error_mapping_code = mapped.code
+        event.provider_error_type = ProviderErrorType(mapped.details.get("provider_error_type", "upstream_fault"))
+    if fallback_trigger:
+        event.fallback_trigger = fallback_trigger
+    runtime.usage_log.record_finalized(event)

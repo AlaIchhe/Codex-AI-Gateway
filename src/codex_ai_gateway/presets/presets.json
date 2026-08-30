@@ -1,0 +1,43 @@
+{
+  "version": "2026-08-30",
+  "presets": [
+    {
+      "preset_id": "volcengine-ark-coding",
+      "name": "火山方舟 Coding Plan",
+      "icon": "flame",
+      "base_url": "https://ark.cn-beijing.volces.com/api/coding/v3",
+      "default_headers": {},
+      "doc_url": "https://www.volcengine.com/docs/82379/1925114",
+      "model_source": "official_doc",
+      "extractor_key": "volcengine_quill_delta",
+      "extractor_version": "volcengine-quill-delta-v1",
+      "identity_aliases": {
+        "doubao-seed": "seed"
+      },
+      "source": {
+        "kind": "official_doc",
+        "url": "https://www.volcengine.com/docs/82379/1925114",
+        "extractor_key": "volcengine_quill_delta",
+        "extractor_version": "volcengine-quill-delta-v1"
+      }
+    },
+    {
+      "preset_id": "opencode-go",
+      "name": "OpenCode Go",
+      "icon": "terminal",
+      "base_url": "https://opencode.ai/zen/go/v1",
+      "default_headers": {},
+      "doc_url": "https://opencode.ai/docs/zh-cn/go/",
+      "model_source": "official_doc",
+      "extractor_key": "opencode_html_table",
+      "extractor_version": "opencode-docs-table-v1",
+      "identity_aliases": {},
+      "source": {
+        "kind": "official_doc",
+        "url": "https://opencode.ai/docs/zh-cn/go/",
+        "extractor_key": "opencode_html_table",
+        "extractor_version": "opencode-docs-table-v1"
+      }
+    }
+  ]
+}

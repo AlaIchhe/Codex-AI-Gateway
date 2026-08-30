@@ -1,0 +1,43 @@
+[project]
+name = "codex-ai-gateway"
+version = "0.1.0"
+description = "Codex AI Gateway - local unified model access gateway"
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "fastapi==0.115.12",
+    "uvicorn[standard]==0.34.0",
+    "httpx==0.28.1",
+    "pydantic==2.10.6",
+    "pydantic-settings==2.7.1",
+    "tomlkit==0.13.2",
+    "keyring==25.6.0",
+    "python-multipart==0.0.20",
+]
+
+[project.optional-dependencies]
+dev = [
+    "ruff==0.9.6",
+]
+
+[project.scripts]
+codex-ai-gateway = "codex_ai_gateway.cli:main"
+
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/codex_ai_gateway"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+exclude = [".venv", "build", "dist"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+ignore = ["E501"]
+
+[tool.ruff.format]
+quote-style = "double"
