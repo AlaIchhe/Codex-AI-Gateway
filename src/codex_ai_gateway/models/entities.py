@@ -54,6 +54,7 @@ class MatchMode(str, Enum):
     suffix_ignored = "suffix_ignored"
     ambiguous = "ambiguous"
     missing = "missing"
+    upstream_fallback = "upstream_fallback"
 
 
 class Outcome(str, Enum):
@@ -167,7 +168,7 @@ class Offering(BaseModel):
 
 class CanonicalModel(BaseModel):
     id: str
-    openrouter_model_id: str
+    openrouter_model_id: str | None = None
     display_name: str
     slug: str
     capability_baseline: dict[str, Any] = Field(default_factory=dict)

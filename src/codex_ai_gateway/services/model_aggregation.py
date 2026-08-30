@@ -8,10 +8,13 @@ from typing import Any
 from codex_ai_gateway.models.entities import (
     Offering,
     OfferingStatus,
+    UpstreamStatus,
 )
 from codex_ai_gateway.services.model_identity import (
     MatchResult,
+    build_standard_catalog,
     canonical_from_candidate,
+    canonical_from_offering,
     match_offering,
 )
 from codex_ai_gateway.util import utc_now
@@ -20,14 +23,19 @@ from codex_ai_gateway.util import utc_now
 async def aggregate_models(
     runtime: Any, *, offerings: list[Offering], upstreams: list[Any]
 ) -> dict[str, int]:
-    """为每个 offering 更新映射，并自动维护 CanonicalModel。"""
-    from codex_ai_gateway.models.entities import UpstreamStatus
+    """为每个 offering 更新映射，并自动维护 CanonicalModel。
 
+    canonical 关联键：家族键（family_key）→ canonical.slug。
+    命中标准目录的映射以 openrouter_model_id 作滚动指针；上游回退模型
+    openrouter_model_id=None，slug 为归一化 provider id。
+    """
     runtime.state_store.read_state()
     upstream_by_id = {item.id: item for item in upstreams}
     snapshot_data = await _snapshot(runtime)
     openrouter_models = snapshot_data["models"]
     snapshot_id = snapshot_data["snapshot_id"]
+    # 标准目录构建一次，全部 offering 复用同一分组与择新结果。
+    catalog = build_standard_catalog(openrouter_models)
     results: list[MatchResult] = []
     for offering in offerings:
         if offering.status == OfferingStatus.disabled:
@@ -49,6 +57,7 @@ async def aggregate_models(
                 namespace_prefixes=set(prefixes or set()),
                 snapshot_id=snapshot_id,
                 aliases=aliases or None,
+                catalog=catalog,
             )
         )
     now = utc_now()
@@ -63,24 +72,42 @@ async def aggregate_models(
         ]
         state.model_mappings.extend(r.mapping for r in results)
         for result in results:
-            if result.candidate is None:
+            mapping = result.mapping
+            offering = offering_for(state, mapping.offering_id)
+            if offering is None:
                 continue
-            model_id = str(result.candidate.get("id"))
-            existing = next(
-                (m for m in state.canonical_models if m.openrouter_model_id == model_id), None
+            slug = mapping.family_key or mapping.normalized_key.rsplit("/", 1)[-1].strip("-") or "fallback"
+            canonical = next(
+                (m for m in state.canonical_models if m.slug == slug),
+                None,
             )
-            if existing is None:
-                state.canonical_models.append(canonical_from_candidate(result.candidate, now=now))
+            if result.candidate is not None:
+                # 命中标准目录：slug 优先复用，滚动更新 openrouter_model_id 指针与基线。
+                if canonical is None:
+                    canonical = canonical_from_candidate(
+                        result.candidate, now=now, slug=slug
+                    )
+                    state.canonical_models.append(canonical)
+                else:
+                    canonical.openrouter_model_id = mapping.openrouter_model_id
+                    canonical.capability_baseline = result.candidate
+                    canonical.updated_at = now
+            else:
+                # 上游回退：不覆盖已存在的同 slug canonical（避免换掉目录命中身份）。
+                if canonical is None:
+                    fallback = canonical_from_offering(offering, now=now, slug=slug)
+                    state.canonical_models.append(fallback)
         for result in results:
             offering = next((o for o in state.offerings if o.id == result.mapping.offering_id), None)
             if offering is None:
                 continue
+            slug = (
+                result.mapping.family_key
+                or result.mapping.normalized_key.rsplit("/", 1)[-1].strip("-")
+                or "fallback"
+            )
             canonical = next(
-                (
-                    m
-                    for m in state.canonical_models
-                    if m.openrouter_model_id == result.mapping.openrouter_model_id
-                ),
+                (m for m in state.canonical_models if m.slug == slug),
                 None,
             )
             offering.canonical_model_id = canonical.id if canonical else None
@@ -88,7 +115,7 @@ async def aggregate_models(
         # 重建可用状态：任一 enabled upstream 的 approved matched offering 即可用。
         for model in state.canonical_models:
             offering_ids = {
-                m.offering_id for m in state.model_mappings if m.openrouter_model_id == model.openrouter_model_id
+                o.id for o in state.offerings if o.canonical_model_id == model.id
             }
             available = False
             for offering in state.offerings:
@@ -103,6 +130,10 @@ async def aggregate_models(
 
     runtime.state_store.mutate(apply)
     return {"offerings": len(offerings), "matched": sum(1 for r in results if r.candidate)}
+
+
+def offering_for(state: Any, offering_id: str) -> Offering | None:
+    return next((o for o in state.offerings if o.id == offering_id), None)
 
 
 def _snapshot_current(snapshot: Any, *, now: str | None = None) -> bool:

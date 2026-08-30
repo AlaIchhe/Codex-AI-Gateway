@@ -2,6 +2,10 @@
 
 身份匹配契约见 specs/001-codex-ai-gateway/spec.md FR-008/FR-052/FR-057。
 前缀必须由上游显式声明；日期是版本身份；发布通道和服务变体不改变身份。
+
+v0.2.2 起：身份匹配基于「标准目录」——把 OpenRouter 快照按家族键
+（剥命名空间 / 日期后缀 / 滚动别名）分组，同家族按 created 择新取 1 条，
+匹配命中即归族，未命中由上游原生元数据回退。
 """
 
 from __future__ import annotations
@@ -36,6 +40,8 @@ _DATE_SHORT = re.compile(r"[-:_.@+.]?(\d{2})(\d{2})(\d{2})$")
 # OpenRouter 常见 MMDD 版本后缀（如 deepseek-v4-pro-0813、deepseek-v4-flash-0731），
 # 仅识别为月份/日期范围均合法的 4 位后缀；不合法则保留原样（避免误伤版本号）。
 _DATE_MD = re.compile(r"[-:_.@+.]?(\d{2})(\d{2})$")
+# MM-DD 带分隔符形态（如 qwen3.6-plus-04-02），与 canonical_slug 的日期后缀形态一致。
+_DATE_MD_DASHED = re.compile(r"[-:_.@+.]?(\d{2})[-:_.@+.](\d{2})$")
 _SUFFIX_RE = re.compile(r"[-:_.@+.]?(?P<suffix>ga|preview|latest|free|batch|experimental|online|search|reasoning|thinking)$")
 _SEPARATORS = str.maketrans({"/": "-", ":": "-", "_": "-", ".": "-", "@": "-", "+": "-"})
 
@@ -44,6 +50,16 @@ _SEPARATORS = str.maketrans({"/": "-", ":": "-", "_": "-", ".": "-", "@": "-", "
 class OpenRouterSnapshotData:
     models: list[dict[str, Any]]
     snapshot: ExternalMetadataSnapshot | None
+
+
+@dataclass(frozen=True)
+class StandardEntry:
+    """标准目录条目：家族键 → 同家族（跨厂商合并后）的唯一条目。"""
+
+    family_key: str
+    entry: dict[str, Any]
+    openrouter_model_id: str
+    created: int | None
 
 
 @dataclass(frozen=True)
@@ -103,7 +119,11 @@ def normalize_model_id(value: str, *, namespace_prefixes: set[str] | None = None
 
 
 def _parse_identity(value: str) -> tuple[str, str | None, str | None]:
-    """返回 (family_key, date_text, ignored_suffix)。未知后缀保留在 family 中。"""
+    """返回 (family_key_base, date_text, ignored_suffix)。
+
+    family_key_base 保留厂商路径段（如 deepseek/deepseek-v4-flash）；
+    跨厂商分组时取尾段比较。未知后缀保留在 family 中。
+    """
     family = value.translate(_SEPARATORS)
     date_value: date | None = None
     suffixes: list[str] = []
@@ -126,6 +146,14 @@ def _parse_identity(value: str) -> tuple[str, str | None, str | None]:
                     if 1 <= month <= 12 and 1 <= day <= 31:
                         family = family[: match.start()]
                         date_value = date(2000, month, day)
+                else:
+                    # MM-DD 带分隔符（如同 qwen3.6-plus-04-02），与 MMDD 同语义。
+                    match = _DATE_MD_DASHED.search(family)
+                    if match:
+                        month, day = int(match.group(1)), int(match.group(2))
+                        if 1 <= month <= 12 and 1 <= day <= 31:
+                            family = family[: match.start()]
+                            date_value = date(2000, month, day)
             if date_value is not None:
                 continue
         suffix_match = _SUFFIX_RE.search(family)
@@ -135,6 +163,79 @@ def _parse_identity(value: str) -> tuple[str, str | None, str | None]:
             continue
         break
     return family.strip("-"), _date_text(date_value) if date_value else None, "-".join(reversed(suffixes)) or None
+
+
+def _tail_key(value: str) -> str:
+    """取路径尾段作为跨厂商分组键。"""
+    return value.rsplit("/", 1)[-1]
+
+
+def family_key_of(
+    value: str,
+    *,
+    namespace_prefixes: set[str] | None = None,
+    aliases: dict[str, str] | None = None,
+) -> str:
+    """家族键（尾段、无厂商）：归一化 → 剥离厂商命名空间/滚动别名/日期后缀。
+
+    匹配与路由共用同一归一逻辑，避免两套正则漂移。OpenRouter id 形态为
+    `vendor/model-name`，尾段即模型家族名；`~vendor/x-latest` 的 `~`
+    前缀视为厂商命名空间标记一并剥离。
+    """
+    prefixes = _declared_prefixes(namespace_prefixes)
+    raw = _apply_aliases(normalize_model_id(value, namespace_prefixes=prefixes), aliases)
+    raw = raw.lstrip("~")
+    raw = _tail_key(raw)
+    family, _, _ = _parse_identity(raw)
+    return family
+
+
+def _entry_created(model: dict[str, Any]) -> int | None:
+    value = model.get("created")
+    if isinstance(value, int | float) and not isinstance(value, bool):
+        return int(value)
+    return None
+
+
+def build_standard_catalog(
+    models: list[dict[str, Any]],
+    *,
+    namespace_prefixes: set[str] | None = None,
+    aliases: dict[str, str] | None = None,
+) -> list[StandardEntry]:
+    """从 OpenRouter 快照构建标准目录。
+
+    - 剔除带 `:` 变体后缀的条目（:free / :batch）
+    - 按尾段家族键分组（跨厂商同名合并）
+    - 同家族按 created 降序取第 1 条；created 缺失视为最旧
+    """
+    prefixes = _declared_prefixes(namespace_prefixes)
+    grouped: dict[str, list[tuple[dict[str, Any], str, int | None]]] = {}
+    for model in models:
+        if not isinstance(model, dict):
+            continue
+        model_id = str(model.get("id", ""))
+        if not model_id or ":" in model_id:
+            continue
+        family = family_key_of(
+            model_id, namespace_prefixes=prefixes, aliases=aliases
+        )
+        if not family:
+            continue
+        grouped.setdefault(family, []).append((model, model_id, _entry_created(model)))
+    catalog: list[StandardEntry] = []
+    for family_key, entries in grouped.items():
+        entries.sort(key=lambda item: (item[2] is not None, item[2] or 0), reverse=True)
+        model, model_id, created = entries[0]
+        catalog.append(
+            StandardEntry(
+                family_key=family_key,
+                entry=model,
+                openrouter_model_id=model_id,
+                created=created,
+            )
+        )
+    return catalog
 
 
 def snapshot_from_response(
@@ -199,30 +300,6 @@ async def fetch_openrouter_models(api_key: str | None = None) -> list[dict[str, 
     return (await fetch_openrouter_snapshot(api_key)).models
 
 
-def _ambiguous(
-    offering: Offering,
-    *,
-    normalized: str,
-    family: str,
-    reason: str,
-    candidates: list[dict[str, Any]],
-    provider_date: str | None = None,
-) -> MatchResult:
-    mapping = ModelIdentityMapping(
-        id=uuid7(),
-        offering_id=offering.id,
-        openrouter_model_id=None,
-        match_mode=MatchMode.ambiguous,
-        normalized_key=normalized,
-        family_key=family,
-        provider_date=provider_date,
-        ignored_suffix=None,
-        evidence_json={"reason": reason, "candidates": [m.get("id") for m in candidates], "matched_at": utc_now()},
-        matched_at=utc_now(),
-    )
-    return MatchResult(mapping, None)
-
-
 def match_offering(
     offering: Offering,
     models: list[dict[str, Any]],
@@ -230,189 +307,97 @@ def match_offering(
     namespace_prefixes: set[str] | None = None,
     snapshot_id: str | None = None,
     aliases: dict[str, str] | None = None,
+    catalog: list[StandardEntry] | None = None,
 ) -> MatchResult:
+    """按标准目录匹配 offering；未命中时回退到上游原生元数据。
+
+    - 命中：match_mode=normalized，openrouter_model_id=标准条目 id，
+      candidate=标准条目（供能力基线提取）
+    - 未命中：match_mode=upstream_fallback，openrouter_model_id=None，
+      candidate=None（聚合侧用 offering.native_metadata_json 建 canonical）
+
+    catalog 可由调用方传入（聚合时构建一次复用），缺省时即时构建。
+    """
     prefixes = _declared_prefixes(namespace_prefixes)
-    normalized = _apply_aliases(normalize_model_id(offering.provider_model_id, namespace_prefixes=prefixes), aliases)
-    provider_family, provider_date, provider_suffix = _parse_identity(normalized)
-    entries: list[tuple[dict[str, Any], str, str, str | None, str | None, str | None]] = []
-    for model in models:
-        if not isinstance(model, dict):
-            continue
-        model_id = _apply_aliases(normalize_model_id(str(model.get("id", "")), namespace_prefixes=prefixes), aliases)
-        if "/" in model_id:
-            model_id = model_id.split("/", 1)[-1]
-        if not model_id:
-            continue
-        # OpenRouter 的 id 常保留 0731 这类短版本号，canonical_slug 才携带
-        # 完整日期。日期匹配必须优先使用 canonical_slug。
-        identity_id = _apply_aliases(normalize_model_id(
-            str(model.get("canonical_slug") or model.get("id", "")),
-            namespace_prefixes=prefixes,
-        ), aliases)
-        if "/" in identity_id:
-            identity_id = identity_id.split("/", 1)[-1]
-        family, or_date, or_suffix = _parse_identity(identity_id)
-        entries.append((model, model_id, family, or_date, or_suffix, identity_id))
-
-    direct = [(m, mid, fam, od, osuf, iid) for m, mid, fam, od, osuf, iid in entries if mid == normalized]
-    if len(direct) == 1:
-        model, mid, family, or_date, or_suffix, _ = direct[0]
-        evidence = {
-            "reason": "normalized_exact",
-            "input": offering.provider_model_id,
-            "normalized": normalized,
-            "openrouter_snapshot_id": snapshot_id,
-            "provider_family": provider_family,
-            "openrouter_family": family,
-            "provider_date": provider_date,
-            "openrouter_date": or_date,
-            "provider_suffix": provider_suffix,
-            "openrouter_suffix": or_suffix,
-            "matched_at": utc_now(),
-        }
-        mapping = ModelIdentityMapping(
-            id=uuid7(), offering_id=offering.id, openrouter_model_id=str(model.get("id")),
-            match_mode=MatchMode.exact, normalized_key=normalized, family_key=family,
-            provider_date=provider_date, openrouter_date=or_date, ignored_suffix=provider_suffix or or_suffix,
-            evidence_json=evidence, matched_at=utc_now(),
-        )
-        return MatchResult(mapping, model)
-    if len(direct) > 1:
-        return _ambiguous(offering, normalized=normalized, family=provider_family, reason="exact_ambiguous", candidates=[m for m, *_ in direct], provider_date=provider_date)
-
-    provider_family_key = provider_family.rsplit('/', 1)[-1]
-    family_candidates = [entry for entry in entries if _parse_identity(entry[1].rsplit('/', 1)[-1])[0] == provider_family_key]
-    def _is_variant_entry(entry: tuple[dict[str, Any], str, str, str | None, str | None, str | None]) -> bool:
-        value = entry[1].lower()
-        return any(tag in value for tag in (":batch", "-batch", ":free", "-free", "-latest", "latest"))
-
-    if provider_date is not None:
-        exact_date = [
-            entry for entry in family_candidates
-            if entry[3] == provider_date and not _is_variant_entry(entry)
-        ]
-        if len(exact_date) == 1:
-            model, model_id, family, or_date, or_suffix, _ = exact_date[0]
-            evidence = {
-                "reason": "exact_provider_date", "openrouter_snapshot_id": snapshot_id,
-                "provider_family": provider_family, "openrouter_family": family,
-                "provider_date": provider_date, "openrouter_date": or_date,
-                "provider_suffix": provider_suffix, "openrouter_suffix": or_suffix,
-                "matched_at": utc_now(),
-            }
-            mapping = ModelIdentityMapping(
-                id=uuid7(), offering_id=offering.id, openrouter_model_id=str(model.get("id")),
-                match_mode=MatchMode.date_version, normalized_key=normalized, family_key=family,
-                provider_date=provider_date, openrouter_date=or_date, ignored_suffix=provider_suffix or or_suffix,
-                evidence_json=evidence, matched_at=utc_now(),
-            )
-            return MatchResult(mapping, model)
-        if len(exact_date) > 1:
-            return _ambiguous(offering, normalized=normalized, family=provider_family, reason="provider_date_ambiguous", candidates=[m for m, *_ in exact_date], provider_date=provider_date)
-
-        earlier = [
-            entry for entry in family_candidates
-            if entry[3] is not None and entry[3] <= provider_date and not _is_variant_entry(entry)
-        ]
-        if earlier:
-            latest_date = max(entry[3] for entry in earlier)
-            nearest = [entry for entry in earlier if entry[3] == latest_date]
-            if len(nearest) == 1:
-                model, model_id, family, or_date, or_suffix, _ = nearest[0]
-                evidence = {
-                    "reason": "nearest_earlier_provider_date", "openrouter_snapshot_id": snapshot_id,
-                    "provider_family": provider_family, "openrouter_family": family,
-                    "provider_date": provider_date, "openrouter_date": or_date,
-                    "provider_suffix": provider_suffix, "openrouter_suffix": or_suffix,
-                    "matched_at": utc_now(),
-                }
-                mapping = ModelIdentityMapping(
-                    id=uuid7(), offering_id=offering.id, openrouter_model_id=str(model.get("id")),
-                    match_mode=MatchMode.date_version, normalized_key=normalized, family_key=family,
-                    provider_date=provider_date, openrouter_date=or_date, ignored_suffix=provider_suffix or or_suffix,
-                    evidence_json=evidence, matched_at=utc_now(),
-                )
-                return MatchResult(mapping, model)
-
-        # OpenRouter 常以基础条目承载滚动版本；provider 的日期变体在无精确
-        # 或更早日期候选时可回退到唯一基础条目，但这仍低于精确日期优先级。
-        base_entries = [entry for entry in family_candidates if entry[3] is None and not _is_variant_entry(entry)]
-        if len(base_entries) == 1:
-            model, model_id, family, or_date, or_suffix, _ = base_entries[0]
-            evidence = {
-                "reason": "provider_date_to_base_entry", "openrouter_snapshot_id": snapshot_id,
-                "provider_family": provider_family, "openrouter_family": family,
-                "provider_date": provider_date, "openrouter_date": or_date,
-                "provider_suffix": provider_suffix, "openrouter_suffix": or_suffix,
-                "matched_at": utc_now(),
-            }
-            mapping = ModelIdentityMapping(
-                id=uuid7(), offering_id=offering.id, openrouter_model_id=str(model.get("id")),
-                match_mode=MatchMode.date_version, normalized_key=normalized, family_key=family,
-                provider_date=provider_date, openrouter_date=or_date, ignored_suffix=provider_suffix or or_suffix,
-                evidence_json=evidence, matched_at=utc_now(),
-            )
-            return MatchResult(mapping, model)
-        return MatchResult(
-            ModelIdentityMapping(
-                id=uuid7(), offering_id=offering.id, openrouter_model_id=None,
-                match_mode=MatchMode.missing, normalized_key=normalized, family_key=provider_family,
-                provider_date=provider_date, evidence_json={"reason": "provider_date_not_found", "openrouter_snapshot_id": snapshot_id, "matched_at": utc_now()},
-                matched_at=utc_now(),
-            ),
-            None,
-        )
-
-    dated = [(entry, _parsed_date(entry[3] or "")) for entry in family_candidates if entry[3] and not _is_variant_entry(entry)]
-    dated = [(entry, value) for entry, value in dated if value is not None]
-    today = date.fromisoformat(utc_now()[:10])
-    earlier = [(entry, value) for entry, value in dated if value <= today]
-    if earlier:
-        latest = max(value for _, value in earlier)
-        selected = [entry for entry, value in earlier if value == latest]
-    else:
-        base = [entry for entry in family_candidates if entry[3] is None and not _is_variant_entry(entry)]
-        selected = base
-    if len(selected) == 1:
-        model, model_id, family, or_date, or_suffix, _ = selected[0]
-        mode = MatchMode.suffix_ignored if provider_suffix or or_suffix else MatchMode.date_version if or_date else MatchMode.normalized
-        evidence = {
-            "reason": "latest_earlier_version" if dated else "base_entry",
-            "openrouter_snapshot_id": snapshot_id,
-            "provider_family": provider_family, "openrouter_family": family,
-            "provider_date": provider_date, "openrouter_date": or_date,
-            "provider_suffix": provider_suffix, "openrouter_suffix": or_suffix,
-            "matched_at": utc_now(),
-        }
-        mapping = ModelIdentityMapping(
-            id=uuid7(), offering_id=offering.id, openrouter_model_id=str(model.get("id")),
-            match_mode=mode, normalized_key=normalized, family_key=family,
-            provider_date=provider_date, openrouter_date=or_date, ignored_suffix=provider_suffix or or_suffix,
-            evidence_json=evidence, matched_at=utc_now(),
-        )
-        return MatchResult(mapping, model)
-    if len(selected) > 1:
-        return _ambiguous(offering, normalized=normalized, family=provider_family, reason="family_ambiguous", candidates=[m for m, *_ in selected])
-    return MatchResult(
-        ModelIdentityMapping(
-            id=uuid7(), offering_id=offering.id, openrouter_model_id=None,
-            match_mode=MatchMode.missing, normalized_key=normalized, family_key=provider_family,
-            provider_date=provider_date, evidence_json={"reason": "not_in_openrouter_catalog", "openrouter_snapshot_id": snapshot_id, "matched_at": utc_now()},
-            matched_at=utc_now(),
-        ),
-        None,
+    normalized = _apply_aliases(
+        normalize_model_id(offering.provider_model_id, namespace_prefixes=prefixes), aliases
     )
+    family_key = family_key_of(offering.provider_model_id, namespace_prefixes=prefixes, aliases=aliases)
+    if catalog is None:
+        catalog = build_standard_catalog(models, namespace_prefixes=prefixes, aliases=aliases)
+    entry = next((item for item in catalog if item.family_key == family_key), None)
+    if entry is None:
+        mapping = ModelIdentityMapping(
+            id=uuid7(),
+            offering_id=offering.id,
+            openrouter_model_id=None,
+            match_mode=MatchMode.upstream_fallback,
+            normalized_key=normalized,
+            family_key=family_key,
+            evidence_json={
+                "reason": "not_in_standard_catalog",
+                "openrouter_snapshot_id": snapshot_id,
+                "matched_at": utc_now(),
+            },
+            matched_at=utc_now(),
+        )
+        return MatchResult(mapping, None)
+    mapping = ModelIdentityMapping(
+        id=uuid7(),
+        offering_id=offering.id,
+        openrouter_model_id=entry.openrouter_model_id,
+        match_mode=MatchMode.normalized,
+        normalized_key=normalized,
+        family_key=family_key,
+        evidence_json={
+            "reason": "standard_catalog_hit",
+            "openrouter_model_id": entry.openrouter_model_id,
+            "created": entry.created,
+            "openrouter_snapshot_id": snapshot_id,
+            "matched_at": utc_now(),
+        },
+        matched_at=utc_now(),
+    )
+    return MatchResult(mapping, entry.entry)
 
 
-def canonical_from_candidate(candidate: dict[str, Any], *, now: str) -> CanonicalModel:
+def canonical_from_candidate(
+    candidate: dict[str, Any], *, now: str, slug: str | None = None
+) -> CanonicalModel:
     model_id = str(candidate.get("id", ""))
-    slug = model_id.rsplit("/", 1)[-1]
+    slug = slug or model_id.rsplit("/", 1)[-1]
     return CanonicalModel(
         id=uuid7(),
         openrouter_model_id=model_id,
         display_name=str(candidate.get("name") or slug),
         slug=slug,
         capability_baseline=candidate,
+        status="unavailable",
+        first_matched_at=now,
+        updated_at=now,
+    )
+
+
+def canonical_from_offering(
+    offering: Offering,
+    *,
+    now: str,
+    namespace_prefixes: set[str] | None = None,
+    aliases: dict[str, str] | None = None,
+    slug: str | None = None,
+) -> CanonicalModel:
+    """上游回退路径：以归一化 provider id 为 slug 建 canonical。"""
+    prefixes = _declared_prefixes(namespace_prefixes)
+    normalized = _apply_aliases(
+        normalize_model_id(offering.provider_model_id, namespace_prefixes=prefixes), aliases
+    )
+    slug = slug or normalized.rsplit("/", 1)[-1].strip("-") or "fallback"
+    return CanonicalModel(
+        id=uuid7(),
+        openrouter_model_id=None,
+        display_name=offering.display_name or slug,
+        slug=slug,
+        capability_baseline=dict(offering.native_metadata_json or {}),
         status="unavailable",
         first_matched_at=now,
         updated_at=now,

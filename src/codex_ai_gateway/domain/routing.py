@@ -14,6 +14,7 @@ from codex_ai_gateway.models.entities import (
     UpstreamStatus,
     WireProtocol,
 )
+from codex_ai_gateway.services.model_identity import family_key_of
 from codex_ai_gateway.services.upstreams import is_cooling_down
 
 
@@ -39,22 +40,24 @@ def _enabled_upstreams(state: Any) -> list[Upstream]:
 
 def resolve_canonical_model(state: Any, model: str) -> CanonicalModel:
     normalized = model.strip().lower()
-    canonical = next(
-        (
-            m
-            for m in state.canonical_models
-            if m.status == "available"
-            and (m.slug.lower() == normalized or m.openrouter_model_id.lower() == normalized)
-        ),
-        None,
+    family_key = family_key_of(normalized)
+    for m in state.canonical_models:
+        if m.status != "available":
+            continue
+        slug = m.slug.lower()
+        # 家族键精确匹配覆盖日期/滚动别名变体；openrouter_model_id 精确匹配作为补充。
+        openrouter_id = m.openrouter_model_id.lower() if m.openrouter_model_id else None
+        if (
+            slug == normalized
+            or slug == family_key
+            or (openrouter_id is not None and openrouter_id == normalized)
+        ):
+            return m
+    raise RoutingError(
+        code="unknown_model",
+        message=f"模型 '{model}' 不在可路由目录中。",
+        status_code=404,
     )
-    if canonical is None:
-        raise RoutingError(
-            code="unknown_model",
-            message=f"模型 '{model}' 不在可路由目录中。",
-            status_code=404,
-        )
-    return canonical
 
 
 def route_candidates(

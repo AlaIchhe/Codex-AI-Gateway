@@ -59,13 +59,14 @@ export type ModelSummary = {
   display_name: string
   slug: string
   metadata_status: string
+  source: string
   upstream_count: number
   upstream_names: string[]
   priority_summary: string
 }
 
 export type ModelDetail = {
-  model: { id: string; display_name: string; openrouter_model_id: string }
+  model: { id: string; display_name: string; openrouter_model_id: string | null }
   identity_evidence: Array<Record<string, unknown>>
   catalog_candidates: Array<Record<string, unknown>>
   catalog_evidence: Array<Record<string, unknown>>

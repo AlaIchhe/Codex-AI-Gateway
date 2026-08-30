@@ -515,6 +515,7 @@ async def list_models(request: Request) -> list[dict[str, Any]]:
             "display_name": model.display_name,
             "slug": model.slug,
             "metadata_status": "complete" if model.capability_baseline else "missing",
+            "source": "upstream_fallback" if model.openrouter_model_id is None else "openrouter",
             "upstream_count": len(upstreams),
             "upstream_names": upstreams,
             "priority_summary": "自定义" if override else "继承全局",
@@ -528,8 +529,8 @@ async def get_model(request: Request, model_id: str) -> dict[str, Any]:
     model = next((m for m in state.canonical_models if m.id == model_id), None)
     if model is None:
         _not_found("模型不存在")
-    evidence = [m for m in state.model_mappings if m.openrouter_model_id == model.openrouter_model_id]
     offering_ids = {o.id for o in state.offerings if o.canonical_model_id == model.id}
+    evidence = [m for m in state.model_mappings if m.offering_id in offering_ids]
     candidates = [c for c in state.catalog_candidates if c.offering_id in offering_ids]
     candidate_ids = {c.id for c in candidates}
     catalog_evidence = [
