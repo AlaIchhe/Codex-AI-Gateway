@@ -63,10 +63,21 @@ OLD_TARGET=$(readlink -f "$CURRENT" 2>/dev/null || true)
 
 echo "==> 安装后端依赖"
 mkdir -p "$REL_DIR/backend"
-if command -v uv >/dev/null 2>&1; then
-  (cd "$REL_DIR/backend" && uv venv && uv pip install "$REL_DIR"/wheels/*.whl)
+trap 'rm -rf "$REL_DIR"' ERR   # 部署中途失败时清理残留
+UV_BIN=""
+command -v uv >/dev/null 2>&1 && UV_BIN=$(command -v uv)
+if [ -z "$UV_BIN" ]; then
+  for p in "$HOME/.local/bin/uv" /root/.local/bin/uv /usr/local/bin/uv; do
+    [ -x "$p" ] && UV_BIN=$p && break
+  done
+fi
+if [ -n "$UV_BIN" ]; then
+  (cd "$REL_DIR/backend" && "$UV_BIN" venv && "$UV_BIN" pip install "$REL_DIR"/wheels/*.whl)
 else
-  PY=$(command -v python3.12 || command -v python3)
+  PY=""
+  command -v python3.12 >/dev/null 2>&1 && PY=$(command -v python3.12)
+  [ -z "$PY" ] && [ -x /usr/bin/python3.12 ] && PY=/usr/bin/python3.12
+  [ -n "$PY" ] || { echo "错误: 需要 uv 或 Python 3.12（网关要求 <3.13，当前 python3 不满足）"; exit 1; }
   (cd "$REL_DIR/backend" && "$PY" -m venv .venv \
     && ./.venv/bin/pip install --upgrade pip \
     && ./.venv/bin/pip install "$REL_DIR"/wheels/*.whl)
@@ -99,6 +110,7 @@ systemctl enable --now codex-ai-gateway >/dev/null 2>&1 || systemctl restart cod
 
 echo "==> 健康检查"
 sleep 3
+trap - ERR
 if curl -sf "http://127.0.0.1:$PORT/healthz" | grep -q '"status":"ok"'; then
   echo "部署成功: $(readlink -f "$CURRENT")"
   echo "管理界面: http://127.0.0.1:$PORT"
