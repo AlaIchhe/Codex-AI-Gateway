@@ -70,6 +70,16 @@
       "includes": ["src/routeTree.gen.ts"],
       "linter": {
         "enabled": false
+      },
+      "formatter": {
+        "enabled": false
+      },
+      "assist": {
+        "actions": {
+          "source": {
+            "organizeImports": "off"
+          }
+        }
       }
     }
   ]
