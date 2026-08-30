@@ -12,8 +12,8 @@
 #   1. 从 GitHub Releases 下载构建产物（无需手动下载）
 #   2. 安装到 /opt/codex-ai-gateway/releases/<时间戳>/，切换 current 软链
 #   3. 创建 venv 并安装 wheels/（优先用 uv，回退 python3.12 venv+pip）
-#   4. 写入 /etc/systemd/system/codex-ai-gateway.service 并启用
-#   5. 健康检查失败时自动回滚 current
+#   4. 写入 /etc/systemd/system/codex-ai-gateway.service 并重启服务
+#   5. 健康检查（最长等 30 秒）失败时自动回滚 current 并重启
 set -euo pipefail
 
 REPO="AlaIchhe/Codex-AI-Gateway"
@@ -42,7 +42,7 @@ ZIP_URL=$(curl -fsSL "$API_URL" \
 
 TMP_ZIP=$(mktemp /tmp/codex-ai-gateway-XXXXXX.zip)
 echo "==> 下载 $ZIP_URL"
-curl -fSL --retry 3 -o "$TMP_ZIP" "$ZIP_URL"
+curl -fsSL --retry 3 -o "$TMP_ZIP" "$ZIP_URL"
 
 STAMP=$(date +%Y%m%d-%H%M%S)
 REL_DIR=$APP_ROOT/releases/$STAMP
@@ -84,18 +84,27 @@ else
 fi
 [ -x "$REL_DIR/backend/.venv/bin/python" ] || { echo "错误: venv 创建失败"; exit 1; }
 
+# 网关凭据存入 keyring；若本机配有 keyring 解锁服务则声明依赖
+KREQ=""
+if systemctl list-unit-files 2>/dev/null | grep -q '^codex-keyring-unlock.service'; then
+  KREQ="Requires=codex-keyring-unlock.service"$'\n'"After=codex-keyring-unlock.service"
+fi
+
 echo "==> 写入 systemd 服务"
 cat > "$UNIT" <<EOF
 [Unit]
 Description=Codex AI Gateway
 After=network-online.target
 Wants=network-online.target
+$KREQ
 
 [Service]
 Type=simple
 WorkingDirectory=$REL_DIR/backend
 Environment=CODEX_AI_GATEWAY_DATA_DIR=$APP_ROOT/data
 Environment=CODEX_AI_GATEWAY_FRONTEND_DIST=$REL_DIR/dist
+Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/0/bus
+Environment=XDG_RUNTIME_DIR=/run/user/0
 ExecStart=$REL_DIR/backend/.venv/bin/python -m uvicorn codex_ai_gateway.app:app --host $BIND --port $PORT
 Restart=on-failure
 RestartSec=3
@@ -109,10 +118,16 @@ systemctl daemon-reload
 systemctl enable codex-ai-gateway >/dev/null 2>&1
 systemctl restart codex-ai-gateway
 
-echo "==> 健康检查"
-sleep 3
-trap - ERR
-if curl -sf "http://127.0.0.1:$PORT/healthz" | grep -q '"status":"ok"'; then
+echo "==> 健康检查（最长 30 秒）"
+OK=""
+for i in $(seq 1 30); do
+  if curl -sf "http://127.0.0.1:$PORT/healthz" 2>/dev/null | grep -q '"status":"ok"'; then
+    OK=1; break
+  fi
+  sleep 1
+done
+
+if [ -n "$OK" ]; then
   echo "部署成功: $(readlink -f "$CURRENT")"
   echo "管理界面: http://127.0.0.1:$PORT"
 else
