@@ -239,6 +239,8 @@ def match_offering(
         if not isinstance(model, dict):
             continue
         model_id = _apply_aliases(normalize_model_id(str(model.get("id", "")), namespace_prefixes=prefixes), aliases)
+        if "/" in model_id:
+            model_id = model_id.split("/", 1)[-1]
         if not model_id:
             continue
         # OpenRouter 的 id 常保留 0731 这类短版本号，canonical_slug 才携带
@@ -247,6 +249,8 @@ def match_offering(
             str(model.get("canonical_slug") or model.get("id", "")),
             namespace_prefixes=prefixes,
         ), aliases)
+        if "/" in identity_id:
+            identity_id = identity_id.split("/", 1)[-1]
         family, or_date, or_suffix = _parse_identity(identity_id)
         entries.append((model, model_id, family, or_date, or_suffix, identity_id))
 
