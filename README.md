@@ -23,12 +23,11 @@ bun run build
 
 ## 2. 部署（Linux 一键脚本）
 
-在目标机器上拉取部署脚本并运行，脚本会自动从 GitHub Releases 下载最新
-构建产物并完成全流程部署：
+在目标机器上拉取部署脚本并直接运行，脚本会自动从 GitHub Releases 下载
+最新构建产物并完成全流程部署：
 
 ```bash
-wget -qO deploy-linux.sh https://raw.githubusercontent.com/AlaIchhe/Codex-AI-Gateway/main/scripts/deploy-linux.sh
-sudo bash deploy-linux.sh
+curl -fsSL https://raw.githubusercontent.com/AlaIchhe/Codex-AI-Gateway/main/scripts/deploy-linux.sh | sudo bash
 ```
 
 脚本自动完成：下载 Release 产物（无需手动下载）、安装到
@@ -39,8 +38,8 @@ venv 并安装 wheels、写入并启用 systemd 服务（开机自启、崩溃�
 可选参数：
 
 ```bash
-sudo bash deploy-linux.sh v0.1.0        # 指定版本
-sudo bash deploy-linux.sh "" 0.0.0.0    # 指定监听地址（默认 127.0.0.1）
+curl -fsSL https://raw.githubusercontent.com/AlaIchhe/Codex-AI-Gateway/main/scripts/deploy-linux.sh | sudo bash -s -- v0.1.0        # 指定版本
+curl -fsSL https://raw.githubusercontent.com/AlaIchhe/Codex-AI-Gateway/main/scripts/deploy-linux.sh | sudo bash -s -- "" 0.0.0.0    # 指定监听地址（默认 127.0.0.1）
 ```
 
 依赖：`curl`、`unzip`，以及 `uv` 或 Python 3.12（二选一，用于创建 venv）。
