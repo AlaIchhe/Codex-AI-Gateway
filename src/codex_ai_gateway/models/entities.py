@@ -138,13 +138,12 @@ class Upstream(BaseModel):
     preset_id: str | None = None
     preset_version: str | None = None
     base_url: str
-    confirmed_protocols: list[WireProtocol] = Field(default_factory=list)
     auth_credential_ref: str
     default_headers: dict[str, str] = Field(default_factory=dict)
     namespace_prefixes: set[str] = Field(default_factory=set)
-    connectivity_probe: dict[str, Any] | None = None
     last_health_at: str | None = None
     last_health_result: str | None = None
+    model_protocol_probe: dict[str, list[str]] = Field(default_factory=dict)
     cooldown_until: str | None = None
     created_at: str
     updated_at: str

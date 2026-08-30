@@ -58,7 +58,7 @@ from codex_ai_gateway.services.presets import (
 from codex_ai_gateway.services.upstreams import (
     build_preset_offerings,
     discover_offerings,
-    probe_upstream,
+    probe_model_protocols,
 )
 from codex_ai_gateway.util import utc_now, uuid7
 
@@ -113,9 +113,7 @@ async def patch_settings(request: Request, patch: SettingsPatch) -> SettingsView
 
 def _upstream_view(upstream: Upstream, state: Any | None = None) -> dict[str, Any]:
     data = upstream.model_dump(mode="json")
-    data["connectivity_probe"] = upstream.connectivity_probe
-    data["confirmed_protocols"] = [p.value for p in upstream.confirmed_protocols]
-    data["protocol_probe_summary"] = _probe_summary(upstream)
+    data["model_protocol_probe"] = upstream.model_protocol_probe
     if state is not None and upstream.kind == UpstreamKind.preset and upstream.preset_id:
         data["preset_discovery"] = preset_discovery_view(
             state,
@@ -228,38 +226,98 @@ def _apply_preset_discovery(
     runtime.state_store.mutate(apply, trigger="preset.discovery")
 
 
-def _probe_summary(upstream: Upstream) -> str:
-    probe = upstream.connectivity_probe or {}
-    endpoints = probe.get("endpoints") or {}
-    failures = []
-    for _name, evidence in endpoints.items():
-        if not evidence.get("confirmed"):
-            failures.append(evidence.get("reason") or "probe_failed")
-    if not failures:
-        return "探测成功"
-    return "探测失败：" + "；".join(failures)
-
 
 def _credential_ref(runtime: Any, upstream_id: str) -> str:
     return f"upstream:{upstream_id}:api_credential"
 
 
-async def _probe_and_refresh(runtime: Any, upstream: Upstream) -> Upstream:
+async def _run_upstream_pipeline(runtime: Any, upstream: Upstream) -> Upstream:
+    """Run full pipeline: discover models -> probe protocols -> build offerings."""
     credential = runtime.secret_store.get_secret(upstream.auth_credential_ref) or ""
-    probe = await probe_upstream(upstream, credential)
-    confirmed = [
-        WireProtocol(name)
-        for name, evidence in probe["endpoints"].items()
-        if evidence.get("confirmed")
-    ]
-    refreshed = upstream.model_copy(update={
-        "connectivity_probe": probe,
-        "confirmed_protocols": confirmed,
-        "last_health_at": probe.get("checked_at"),
-        "last_health_result": _probe_summary(upstream.model_copy(update={"connectivity_probe": probe})),
+
+    # Phase 1: discover model IDs
+    if upstream.kind == UpstreamKind.preset:
+        preset = get_preset_provider(upstream.preset_id or "")
+        discovery = await discover_preset(preset)
+        if discovery.status != "succeeded":
+            return _update_upstream_health(runtime, upstream, "探测失败：" + (discovery.failure_message or "未知错误"))
+        model_ids = discovery.model_ids
+    else:
+        import httpx
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                resp = await client.get(
+                    f"{upstream.base_url.rstrip('/')}/models",
+                    headers={"Authorization": f"Bearer {credential}"},
+                )
+                resp.raise_for_status()
+                data = resp.json()
+            model_ids = [item["id"] for item in data.get("data", []) if isinstance(item, dict) and item.get("id")]
+        except Exception:
+            model_ids = []
+
+    if not model_ids:
+        return _update_upstream_health(runtime, upstream, "未发现可用模型")
+
+    # Phase 2: incremental diff - only probe new models
+    existing_probe = dict(upstream.model_protocol_probe or {})
+    to_probe = [mid for mid in model_ids if mid not in existing_probe]
+    removed = [mid for mid in existing_probe if mid not in set(model_ids)]
+
+    # Phase 3: probe model protocols (batched)
+    if to_probe:
+        new_results = await probe_model_protocols(upstream, credential, to_probe)
+        for mid in removed:
+            existing_probe.pop(mid, None)
+        for mid, protocols in new_results.items():
+            existing_probe[mid] = [p.value for p in protocols]
+    else:
+        for mid in removed:
+            existing_probe.pop(mid, None)
+
+    # Phase 4: build offerings
+    protocol_map = {
+        mid: [WireProtocol(p) for p in protocols]
+        for mid, protocols in existing_probe.items()
+    }
+    if upstream.kind == UpstreamKind.preset:
+        snapshot_id = uuid7()
+        discovery.snapshot_id = snapshot_id
+        discovered = build_preset_offerings(
+            upstream, discovery, snapshot_id=snapshot_id, protocol_map=protocol_map,
+        )
+        _apply_preset_discovery(runtime, upstream, discovery, discovered)
+    else:
+        discovered = await discover_offerings(upstream, credential, protocol_map=protocol_map)
+        def apply(state: Any) -> None:
+            old_ids = {o.id for o in state.offerings if o.upstream_id == upstream.id}
+            state.offerings = [o for o in state.offerings if o.upstream_id != upstream.id]
+            state.model_mappings = [m for m in state.model_mappings if m.offering_id not in old_ids]
+            state.offerings.extend(discovered)
+        runtime.state_store.mutate(apply, trigger="upstream.offerings.refresh")
+
+    confirmed_count = sum(1 for ps in existing_probe.values() if ps)
+    result_text = f"探测完成：{len(model_ids)} 个模型，{confirmed_count} 个有可用协议"
+    refreshed = _update_upstream_health(runtime, upstream, result_text, model_protocol_probe=existing_probe)
+    return refreshed
+
+
+def _update_upstream_health(
+    runtime: Any,
+    upstream: Upstream,
+    result_text: str,
+    *,
+    model_protocol_probe: dict[str, list[str]] | None = None,
+) -> Upstream:
+    update = {
+        "last_health_at": utc_now(),
+        "last_health_result": result_text,
         "cooldown_until": None,
         "updated_at": utc_now(),
-    })
+    }
+    if model_protocol_probe is not None:
+        update["model_protocol_probe"] = model_protocol_probe
+    refreshed = upstream.model_copy(update=update)
 
     def apply(state: Any) -> None:
         for index, item in enumerate(state.upstreams):
@@ -335,10 +393,30 @@ async def create_upstream(request: Request, payload: UpstreamCreate) -> dict[str
     runtime.state_store.mutate(apply)
     if payload.api_credential:
         runtime.secret_store.set_secret(upstream.auth_credential_ref, payload.api_credential)
-    refreshed = await _probe_and_refresh(runtime, upstream)
+    refreshed = await _run_upstream_pipeline(runtime, upstream)
     await _offerings(runtime, refreshed)
     await _maybe_aggregate(runtime)
     return _upstream_view(refreshed, runtime.state_store.read_state())
+
+@router.post("/debug/probe/{upstream_id}")
+async def debug_probe(request: Request, upstream_id: str) -> dict[str, Any]:
+    """Backend-only debug probe. Not exposed in frontend UI."""
+    runtime = _runtime(request)
+    state = runtime.state_store.read_state()
+    existing = next((u for u in state.upstreams if u.id == upstream_id), None)
+    if existing is None:
+        _not_found('上游不存在')
+    refreshed = await _run_upstream_pipeline(runtime, existing)
+    await _maybe_aggregate(runtime)
+    new_state = runtime.state_store.read_state()
+    offerings = [o.model_dump(mode='json') for o in new_state.offerings if o.upstream_id == upstream_id]
+    return {
+        'upstream_id': upstream_id,
+        'model_protocol_probe': refreshed.model_protocol_probe,
+        'last_health_result': refreshed.last_health_result,
+        'offerings_count': len(offerings),
+    }
+
 
 
 @router.put("/upstreams/{upstream_id}")
@@ -369,7 +447,7 @@ async def update_upstream(request: Request, upstream_id: str, payload: UpstreamU
     runtime.state_store.mutate(apply)
     if payload.api_credential:
         runtime.secret_store.set_secret(existing.auth_credential_ref, payload.api_credential)
-    refreshed = await _probe_and_refresh(runtime, updated)
+    refreshed = await _run_upstream_pipeline(runtime, updated)
     await _offerings(runtime, refreshed)
     await _maybe_aggregate(runtime)
     return _upstream_view(refreshed, runtime.state_store.read_state())
@@ -397,45 +475,18 @@ async def probe(request: Request, upstream_id: str) -> dict[str, Any]:
     existing = next((u for u in state.upstreams if u.id == upstream_id), None)
     if existing is None:
         _not_found("上游不存在")
-    refreshed = await _probe_and_refresh(runtime, existing)
+    refreshed = await _run_upstream_pipeline(runtime, existing)
     await _offerings(runtime, refreshed)
     await _maybe_aggregate(runtime)
     return _upstream_view(refreshed, runtime.state_store.read_state())
 
 
 async def _offerings(runtime: Any, upstream: Upstream) -> list[Offering]:
-    discovery: PresetDiscoveryResult | None = None
-    if upstream.kind == UpstreamKind.preset:
-        preset = get_preset_provider(upstream.preset_id or "")
-        discovery = await discover_preset(preset)
-        if discovery.status == "succeeded":
-            snapshot_id = uuid7()
-            discovery.snapshot_id = snapshot_id
-            discovered = build_preset_offerings(
-                upstream,
-                discovery,
-                snapshot_id=snapshot_id,
-            )
-        else:
-            discovered = []
-        _apply_preset_discovery(runtime, upstream, discovery, discovered)
-    else:
-        credential = runtime.secret_store.get_secret(upstream.auth_credential_ref) or ""
-        discovered = await discover_offerings(upstream, credential)
-
-        def apply(state: Any) -> None:
-            old_offering_ids = {o.id for o in state.offerings if o.upstream_id == upstream.id}
-            state.offerings = [o for o in state.offerings if o.upstream_id != upstream.id]
-            state.model_mappings = [
-                item for item in state.model_mappings if item.offering_id not in old_offering_ids
-            ]
-            state.offerings.extend(discovered)
-
-        runtime.state_store.mutate(apply, trigger="upstream.offerings.refresh")
+    """Legacy entry point - delegates to pipeline."""
+    await _run_upstream_pipeline(runtime, upstream)
     await run_catalog_automation(runtime)
-    LocalCodexAutomationService().run_auto_maintenance(runtime, trigger="catalog.changed")
-    return discovered
-
+    LocalCodexAutomationService().run_auto_maintenance(runtime, trigger='catalog.changed')
+    return [o for o in runtime.state_store.read_state().offerings if o.upstream_id == upstream.id]
 
 async def _maybe_aggregate(runtime: Any) -> dict[str, int]:
     state = runtime.state_store.read_state()

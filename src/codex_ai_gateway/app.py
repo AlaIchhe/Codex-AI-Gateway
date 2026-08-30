@@ -20,6 +20,7 @@ from codex_ai_gateway.integrations.secret_store import SecretStore
 from codex_ai_gateway.persistence.file_store import init_data_dir
 from codex_ai_gateway.runtime import Runtime
 from codex_ai_gateway.services.local_codex import LocalCodexAutomationService
+from codex_ai_gateway.services.presets import load_preset_catalog
 
 
 def create_app(
@@ -83,6 +84,34 @@ def create_app(
             )
         except Exception:
             logging.getLogger(__name__).exception("本地 Codex 自动维护失败")
+
+    @app.on_event("startup")
+    async def start_model_refresh_loop() -> None:
+        """后台定时刷新预设模型列表与协议探测（每 5 小时）。"""
+        import asyncio
+
+        async def _model_refresh_loop():
+            while True:
+                try:
+                    state = runtime.state_store.read_state()
+                    preset_upstreams = [
+                        u for u in state.upstreams
+                        if u.kind.value == "preset" and u.status.value == "enabled"
+                    ]
+                    for upstream in preset_upstreams:
+                        try:
+                            from codex_ai_gateway.api.admin import _run_upstream_pipeline
+                            await _run_upstream_pipeline(runtime, upstream)
+                        except Exception:
+                            logging.getLogger(__name__).exception(
+                                "自动模型探测失败: upstream=%s", upstream.id,
+                            )
+                except Exception:
+                    logging.getLogger(__name__).exception("模型刷新循环异常")
+                await asyncio.sleep(5 * 3600)
+
+        if os.environ.get("CODEX_AI_GATEWAY_DISABLE_STARTUP_AUTOMATION") != "1":
+            asyncio.create_task(_model_refresh_loop())
 
     @app.get("/healthz", include_in_schema=False)
     async def healthz() -> dict[str, str]:

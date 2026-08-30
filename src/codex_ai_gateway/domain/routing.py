@@ -87,7 +87,6 @@ def route_candidates(
             if o.canonical_model_id == canonical.id
             and o.status == OfferingStatus.approved
             and o.upstream_id == upstream.id
-            and o.wire_protocol in upstream.confirmed_protocols
         ]
         if any(o.wire_protocol == WireProtocol.responses for o in candidates):
             offering = next(o for o in candidates if o.wire_protocol == WireProtocol.responses)

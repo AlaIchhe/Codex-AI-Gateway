@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+import asyncio
 import httpx
 
 from codex_ai_gateway.models.entities import (
@@ -62,161 +63,133 @@ def _protocol_evidence(
     return evidence
 
 
-async def _probe_endpoint(
-    client: httpx.AsyncClient,
-    *,
-    upstream: Upstream,
-    api_credential: str,
-    path: str,
-) -> dict[str, Any]:
-    """发送不会生成模型输出的空 JSON 请求。
+# ---------------------------------------------------------------------------
+# 模型级协议探测
+# ---------------------------------------------------------------------------
 
-    200 表示端点可用；400/409/422 且 JSON 响应表示端点存在但请求缺少必要字段。
-    401、403、404、405、429 与网络错误都不能安全确认协议。
-    """
-    url = f"{upstream.base_url.rstrip('/')}{path}"
-    last_error: Exception | None = None
-    for _attempt in range(PROBE_ATTEMPTS):
-        try:
-            response = await client.post(
-                url,
-                json={},
-                headers=_headers(upstream, api_credential),
-            )
-            content_type = response.headers.get("content-type")
-            try:
-                parsed = response.json()
-                body_shape = "object" if isinstance(parsed, dict) else "array" if isinstance(parsed, list) else "other"
-            except ValueError:
-                parsed = None
-                body_shape = "non_json"
-            json_validation = body_shape in {"object", "array"}
-            # 部分网关对"模型不存在/参数校验错误"返回 401/403，但 body 是明确的
-            # 模型校验错误（如 ModelError: "Model ... not supported"）。此时认证实际
-            # 已通过（否则会返回 authentication/unauthorized 类错误），端点存在，
-            # 应视为 provider_validation_error 而非 authentication_required。
-            effective_status = response.status_code
-            is_model_error = (
-                json_validation
-                and isinstance(parsed, dict)
-                and (
-                    isinstance(parsed.get("error"), dict)
-                    and str(parsed["error"].get("type", "")).lower() in {"modelerror", "invalidrequest", "invalid_request_error"}
-                    or isinstance(parsed.get("error"), dict)
-                    and str(parsed["error"].get("message", "")).lower().startswith("model")
-                )
-            )
-            if response.status_code in {401, 403} and is_model_error:
-                effective_status = 400
-            reason = (
-                "endpoint_not_found"
-                if response.status_code in {404, 405}
-                else "provider_validation_error"
-                if effective_status in {400, 409, 422} and json_validation
-                else "authentication_required"
-                if response.status_code in {401, 403}
-                else "rate_limited_probe_rejected"
-                if response.status_code == 429
-                else "non_json_response"
-                if not json_validation
-                else "unexpected_validation_response"
-                if response.status_code >= 400
-                else None
-            )
-            return _protocol_evidence(
-                http_status=effective_status,
-                content_type=content_type,
-                reason=reason,
-                body_shape=body_shape,
-            )
-        except httpx.HTTPError as exc:
-            last_error = exc
-    return _protocol_evidence(error=str(last_error), reason="network_error")
+PROBE_MODEL_BATCH_SIZE = 5
+PROBE_MODEL_BATCH_DELAY_SECONDS = 2.0
 
 
-async def _probe_account(
-    client: httpx.AsyncClient,
-    *,
-    upstream: Upstream,
-    api_credential: str,
-) -> dict[str, Any]:
-    """Validate credentials through the non-billing model catalog endpoint."""
-    try:
-        response = await client.get(
-            f"{upstream.base_url.rstrip('/')}/models",
-            headers=_headers(upstream, api_credential),
-        )
-        return {
-            "confirmed": response.status_code == 200,
-            "http_status": response.status_code,
-            "checked_at": utc_now(),
-        }
-    except httpx.HTTPError as exc:
-        return {"confirmed": False, "error": str(exc), "checked_at": utc_now()}
-
-
-async def probe_upstream(upstream: Upstream, api_credential: str) -> dict[str, Any]:
-    """确认上游支持的 Responses 或 Chat Completions 接口。
-
-    两个探测相互独立；任一失败不阻塞另一个，也不阻塞上游创建。
-    双端点均确认时优先 Responses，单端点确认时使用该协议，否则保持未确认。
-    """
-    is_preset = upstream.kind == UpstreamKind.preset
-    async with httpx.AsyncClient(timeout=PROBE_TIMEOUT_SECONDS) as client:
-        if is_preset:
-            # 预设 Provider MUST NOT 调用 /models；连通性由出站端点探针判定。
-            account_probe = {
-                "confirmed": True,
-                "reason": "preset_skips_models_interface",
-                "checked_at": utc_now(),
-            }
-        else:
-            account_probe = await _probe_account(
-                client,
-                upstream=upstream,
-                api_credential=api_credential,
-            )
-        responses = await _probe_endpoint(
-            client,
-            upstream=upstream,
-            api_credential=api_credential,
-            path="/responses",
-        )
-        chat_completions = await _probe_endpoint(
-            client,
-            upstream=upstream,
-            api_credential=api_credential,
-            path="/chat/completions",
-        )
-    confirmed: list[WireProtocol] = []
-    if responses["confirmed"] and account_probe["confirmed"]:
-        responses["confirmation"] = (
-            "endpoint_validation" if is_preset else "account_and_endpoint_validation"
-        )
-        confirmed.append(WireProtocol.responses)
-    if chat_completions["confirmed"] and account_probe["confirmed"]:
-        chat_completions["confirmation"] = (
-            "endpoint_validation" if is_preset else "account_and_endpoint_validation"
-        )
-        confirmed.append(WireProtocol.chat_completions)
-    selection_reason = (
-        "both_confirmed"
-        if len(confirmed) == 2
-        else confirmed[0].value if confirmed
-        else "no_endpoint_safely_confirmed"
-    )
+def _probe_body(protocol: WireProtocol, model_id: str) -> dict[str, Any]:
+    """构造 max_output_tokens=1 的极简探测请求体。"""
+    if protocol == WireProtocol.responses:
+        return {"model": model_id, "input": "hi", "max_output_tokens": 1}
     return {
-        "confirmed": bool(confirmed),
-        "confirmed_protocols": [p.value for p in confirmed],
-        "selection_reason": selection_reason,
-        "endpoints": {
-            "responses": responses,
-            "chat_completions": chat_completions,
-        },
-        "account_probe": account_probe,
-        "checked_at": utc_now(),
+        "model": model_id,
+        "messages": [{"role": "user", "content": "hi"}],
+        "max_tokens": 1,
     }
 
+
+def _interpret_probe_response(status_code: int, body: dict[str, Any] | None) -> tuple[bool, str]:
+    """解析探测响应，返回 (confirmed, reason)。"""
+    if status_code == 200:
+        return True, "model_confirmed"
+    if status_code in {400, 404, 422}:
+        error = body.get("error") if isinstance(body, dict) else None
+        if isinstance(error, dict):
+            error_type = str(error.get("type", "")).lower()
+            error_msg = str(error.get("message", "")).lower()
+            if "model" in error_type or "model" in error_msg or status_code == 404:
+                return False, "model_not_supported_on_protocol"
+        return False, "model_not_supported_on_protocol"
+    if status_code == 429:
+        return False, "rate_limited_probe_rejected"
+    if status_code in {401, 403}:
+        return False, "authentication_required"
+    return False, f"unexpected_status_{status_code}"
+
+
+async def _probe_model_endpoint(
+    client: httpx.AsyncClient,
+    *,
+    upstream: Upstream,
+    api_credential: str,
+    protocol: WireProtocol,
+    model_id: str,
+) -> dict[str, Any]:
+    """对单个模型在单个协议下发送极简请求，确认可用性。"""
+    path = "/responses" if protocol == WireProtocol.responses else "/chat/completions"
+    url = f"{upstream.base_url.rstrip('/')}{path}"
+    body = _probe_body(protocol, model_id)
+    headers = _headers(upstream, api_credential)
+    try:
+        response = await client.post(url, json=body, headers=headers)
+        parsed = None
+        try:
+            parsed = response.json()
+        except ValueError:
+            pass
+        confirmed, reason = _interpret_probe_response(response.status_code, parsed)
+        return {
+            "confirmed": confirmed,
+            "reason": reason,
+            "http_status": response.status_code,
+            "model_id": model_id,
+            "protocol": protocol.value,
+        }
+    except httpx.HTTPError as exc:
+        return {
+            "confirmed": False,
+            "reason": "network_error",
+            "error": str(exc),
+            "model_id": model_id,
+            "protocol": protocol.value,
+        }
+
+
+async def _probe_single_model(
+    client: httpx.AsyncClient,
+    *,
+    upstream: Upstream,
+    api_credential: str,
+    model_id: str,
+) -> tuple[str, list[WireProtocol]]:
+    """并发探测一个模型的两个协议，返回 (model_id, confirmed_protocols)。"""
+    responses_task = _probe_model_endpoint(
+        client, upstream=upstream, api_credential=api_credential,
+        protocol=WireProtocol.responses, model_id=model_id,
+    )
+    chat_task = _probe_model_endpoint(
+        client, upstream=upstream, api_credential=api_credential,
+        protocol=WireProtocol.chat_completions, model_id=model_id,
+    )
+    responses_result, chat_result = await asyncio.gather(responses_task, chat_task)
+    confirmed: list[WireProtocol] = []
+    if responses_result["confirmed"]:
+        confirmed.append(WireProtocol.responses)
+    if chat_result["confirmed"]:
+        confirmed.append(WireProtocol.chat_completions)
+    return model_id, confirmed
+
+
+async def probe_model_protocols(
+    upstream: Upstream,
+    api_credential: str,
+    model_ids: list[str],
+) -> dict[str, list[WireProtocol]]:
+    """分批探测每个模型的协议支持。
+
+    每批 BATCH_SIZE 个模型并发探测（每模型 2 个协议并发），
+    批间等待 BATCH_DELAY_SECONDS 秒以缓解限流。
+    返回 {model_id: [confirmed protocols]}。
+    """
+    results: dict[str, list[WireProtocol]] = {}
+    total = len(model_ids)
+    for i in range(0, total, PROBE_MODEL_BATCH_SIZE):
+        batch = model_ids[i:i + PROBE_MODEL_BATCH_SIZE]
+        async with httpx.AsyncClient(timeout=PROBE_TIMEOUT_SECONDS) as client:
+            tasks = [
+                _probe_single_model(client, upstream=upstream, api_credential=api_credential, model_id=mid)
+                for mid in batch
+            ]
+            batch_results = await asyncio.gather(*tasks)
+        for mid, protocols in batch_results:
+            results[mid] = protocols
+        if i + PROBE_MODEL_BATCH_SIZE < total:
+            await asyncio.sleep(PROBE_MODEL_BATCH_DELAY_SECONDS)
+    return results
 
 async def discover_offerings(
     upstream: Upstream,
@@ -238,7 +211,7 @@ async def discover_offerings(
     for item in models:
         if not isinstance(item, dict) or not item.get("id"):
             continue
-        for protocol in upstream.confirmed_protocols:
+        for protocol in (protocol_map or {}).get(str(item.get("id")), []):
             result.append(
                 Offering(
                     id=uuid7(),
@@ -269,7 +242,7 @@ def build_preset_offerings(
     now = utc_now()
     result: list[Offering] = []
     for model_id in discovery.model_ids:
-        for protocol in upstream.confirmed_protocols:
+        for protocol in protocol_map.get(model_id, []):
             evidence = {
                 "source": "preset_official_doc",
                 "source_url": discovery.source_url,
