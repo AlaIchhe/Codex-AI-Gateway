@@ -76,7 +76,7 @@ trap 'rm -rf "$REL_DIR"' ERR   # 部署中途失败时清理残留
 UV_BIN=""
 command -v uv >/dev/null 2>&1 && UV_BIN=$(command -v uv)
 if [ -z "$UV_BIN" ]; then
-  for p in "$HOME/.local/bin/uv" /root/.local/bin/uv /usr/local/bin/uv; do
+  for p in "${HOME:-/root}/.local/bin/uv" /root/.local/bin/uv /usr/local/bin/uv; do
     [ -x "$p" ] && UV_BIN=$p && break
   done
 fi
