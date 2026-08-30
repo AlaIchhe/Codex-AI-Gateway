@@ -254,7 +254,7 @@ def match_offering(
         family, or_date, or_suffix = _parse_identity(identity_id)
         entries.append((model, model_id, family, or_date, or_suffix, identity_id))
 
-    direct = [(m, mid, fam, od, osuf, mid) for m, mid, fam, od, osuf, mid in entries if mid == normalized]
+    direct = [(m, mid, fam, od, osuf, iid) for m, mid, fam, od, osuf, iid in entries if mid == normalized]
     if len(direct) == 1:
         model, mid, family, or_date, or_suffix, _ = direct[0]
         evidence = {
