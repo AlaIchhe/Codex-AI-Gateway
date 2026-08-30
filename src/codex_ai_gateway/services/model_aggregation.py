@@ -77,10 +77,7 @@ async def aggregate_models(
             if offering is None:
                 continue
             slug = mapping.family_key or mapping.normalized_key.rsplit("/", 1)[-1].strip("-") or "fallback"
-            canonical = next(
-                (m for m in state.canonical_models if m.slug == slug),
-                None,
-            )
+            canonical = _canonical_by_slug(state, slug)
             if result.candidate is not None:
                 # 命中标准目录：slug 优先复用，滚动更新 openrouter_model_id 指针与基线。
                 if canonical is None:
@@ -89,6 +86,9 @@ async def aggregate_models(
                     )
                     state.canonical_models.append(canonical)
                 else:
+                    if canonical.slug != slug:
+                        # 旧数据中 slug 为归一化形态（如 glm-5-3-flash），统一为家族基础名。
+                        canonical.slug = slug
                     canonical.openrouter_model_id = mapping.openrouter_model_id
                     canonical.capability_baseline = result.candidate
                     canonical.updated_at = now
@@ -106,10 +106,7 @@ async def aggregate_models(
                 or result.mapping.normalized_key.rsplit("/", 1)[-1].strip("-")
                 or "fallback"
             )
-            canonical = next(
-                (m for m in state.canonical_models if m.slug == slug),
-                None,
-            )
+            canonical = _canonical_by_slug(state, slug)
             offering.canonical_model_id = canonical.id if canonical else None
             offering.updated_at = now
         # 重建可用状态：任一 enabled upstream 的 approved matched offering 即可用。
@@ -130,6 +127,22 @@ async def aggregate_models(
 
     runtime.state_store.mutate(apply)
     return {"offerings": len(offerings), "matched": sum(1 for r in results if r.candidate)}
+
+
+def _canonical_by_slug(
+    state: Any, slug: str
+) -> Any | None:
+    """按 slug 查找 canonical；精确未命中时按归一化形态匹配（`.`/`-` 互换），
+    兼容旧版本数据中 slug 为归一化连字符形态（如 glm-5-3-flash）的情况。
+    """
+    canon = next((m for m in state.canonical_models if m.slug == slug), None)
+    if canon is not None:
+        return canon
+    normalized = slug.replace(".", "-").replace("/", "-")
+    return next(
+        (m for m in state.canonical_models if m.slug.replace(".", "-").replace("/", "-") == normalized),
+        None,
+    )
 
 
 def offering_for(state: Any, offering_id: str) -> Offering | None:

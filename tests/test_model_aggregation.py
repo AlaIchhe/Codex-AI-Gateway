@@ -95,3 +95,30 @@ class TestUpstreamFallback:
         r1 = match_offering(_offering("deepseek-v4-flash"), [], catalog=catalog)
         r2 = match_offering(_offering("deepseek-v4-flash-0731"), [], catalog=catalog)
         assert r1.mapping.family_key == r2.mapping.family_key
+
+
+class TestCanonicalBySlugCompatibility:
+    def test_normalized_slug_reuse(self) -> None:
+        """旧数据 slug 为归一化形态（glm-5-3-flash）时，按家族基础名可复用。"""
+        from codex_ai_gateway.services.model_aggregation import _canonical_by_slug
+
+        class State:
+            canonical_models = [_canonical("glm-5-3-flash", None)]
+
+        state = State()
+        found = _canonical_by_slug(state, "glm-5.3-flash")
+        assert found is not None
+        assert found.slug == "glm-5-3-flash"
+
+    def test_exact_slug_preferred(self) -> None:
+        from codex_ai_gateway.services.model_aggregation import _canonical_by_slug
+
+        class State:
+            canonical_models = [
+                _canonical("glm-5-3-flash", None),
+                _canonical("glm-5.3-flash", None),
+            ]
+
+        state = State()
+        found = _canonical_by_slug(state, "glm-5.3-flash")
+        assert found.slug == "glm-5.3-flash"

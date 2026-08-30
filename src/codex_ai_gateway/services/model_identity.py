@@ -43,7 +43,7 @@ _DATE_MD = re.compile(r"[-:_.@+.]?(\d{2})(\d{2})$")
 # MM-DD 带分隔符形态（如 qwen3.6-plus-04-02），与 canonical_slug 的日期后缀形态一致。
 _DATE_MD_DASHED = re.compile(r"[-:_.@+.]?(\d{2})[-:_.@+.](\d{2})$")
 _SUFFIX_RE = re.compile(r"[-:_.@+.]?(?P<suffix>ga|preview|latest|free|batch|experimental|online|search|reasoning|thinking)$")
-_SEPARATORS = str.maketrans({"/": "-", ":": "-", "_": "-", ".": "-", "@": "-", "+": "-"})
+_SEPARATORS = str.maketrans({"/": "-", ":": "-", "_": "-", "@": "-", "+": "-"})
 
 
 @dataclass(frozen=True)

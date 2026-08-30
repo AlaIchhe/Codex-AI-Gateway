@@ -55,15 +55,17 @@ class TestFamilyKeyOf:
         assert family_key_of("some-model-1331") == "some-model-1331"
 
     def test_strips_dashed_mmdd_date(self) -> None:
-        # `.` 被归一化为 `-`（既有 _parse_identity 行为），但日期后缀仍正确剥离。
-        assert family_key_of("qwen3.6-plus-04-02") == "qwen3-6-plus"
+        # 保留点号（家族基础名形态），仅剥离日期后缀。
+        assert family_key_of("qwen3.6-plus-04-02") == "qwen3.6-plus"
 
     def test_strips_full_iso_and_long_date(self) -> None:
         assert family_key_of("deepseek-v4-flash-2026-08-01") == "deepseek-v4-flash"
         assert family_key_of("deepseek-v4-flash-20260801") == "deepseek-v4-flash"
 
     def test_lowercases_and_normalizes_separators(self) -> None:
+        # 厂商路径分隔符归一为 `-`；点号保留（家族基础名形态）。
         assert family_key_of("DeepSeek/V4-Flash") == "v4-flash"
+        assert family_key_of("qwen3.6-plus") == "qwen3.6-plus"
 
     def test_respects_declared_namespace_prefix(self) -> None:
         assert (
@@ -112,7 +114,7 @@ class TestBuildStandardCatalog:
         ]
         catalog = build_standard_catalog(models)
         assert len(catalog) == 1
-        assert catalog[0].family_key == "qwen3-6-plus"
+        assert catalog[0].family_key == "qwen3.6-plus"
 
     def test_empty_models_returns_empty(self) -> None:
         assert build_standard_catalog([]) == []
