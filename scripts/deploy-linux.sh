@@ -35,9 +35,10 @@ esac
 
 echo "==> 查询 GitHub Release（$API_REF）"
 API_URL="https://api.github.com/repos/$REPO/releases/$API_REF"
-ZIP_URL=$(curl -fsSL "$API_URL" \
-  | grep -o '"browser_download_url": *"[^"]*\.zip"' | head -1 | cut -d'"' -f4) \
-  || { echo "错误: 查询 Release 失败"; exit 1; }
+API_RESP=$(curl -fsSL "$API_URL") || { echo "错误: 查询 Release 失败"; exit 1; }
+RELEASE_TAG=$(echo "$API_RESP" | grep -o '"tag_name": *"[^"]*"' | head -1 | cut -d'"' -f4)
+ZIP_URL=$(echo "$API_RESP" \
+  | grep -o '"browser_download_url": *"[^"]*\.zip"' | head -1 | cut -d'"' -f4)
 [ -n "$ZIP_URL" ] || { echo "错误: Release 中未找到 zip 产物"; exit 1; }
 
 TMP_ZIP=$(mktemp /tmp/codex-ai-gateway-XXXXXX.zip)
@@ -130,6 +131,7 @@ done
 if [ -n "$OK" ]; then
   echo "部署成功: $(readlink -f "$CURRENT")"
   echo "管理界面: http://127.0.0.1:$PORT"
+  echo "$RELEASE_TAG" > "$APP_ROOT/deployed-version"
 else
   echo "健康检查失败，回滚到 $OLD_TARGET"
   if [ -n "$OLD_TARGET" ] && [ -d "$OLD_TARGET" ]; then
@@ -141,3 +143,39 @@ else
   journalctl -u codex-ai-gateway -n 30 --no-pager || true
   exit 1
 fi
+
+echo "==> 安装自动更新"
+mkdir -p "$APP_ROOT/bin"
+curl -fsSL --retry 3 \
+  "https://raw.githubusercontent.com/$REPO/main/scripts/auto-update.sh" \
+  -o "$APP_ROOT/bin/auto-update.sh"
+chmod +x "$APP_ROOT/bin/auto-update.sh"
+
+cat > /etc/systemd/system/codex-ai-gateway-update.service <<'UNIT'
+[Unit]
+Description=Codex AI Gateway Auto Update
+After=network-online.target codex-ai-gateway.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/codex-ai-gateway/bin/auto-update.sh
+TimeoutStartSec=600
+UNIT
+
+cat > /etc/systemd/system/codex-ai-gateway-update.timer <<'UNIT'
+[Unit]
+Description=Codex AI Gateway Auto Update Timer
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+UNIT
+
+systemctl daemon-reload
+systemctl enable --now codex-ai-gateway-update.timer >/dev/null 2>&1
+echo "自动更新已启用（每 5 分钟检查一次）"

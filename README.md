@@ -68,6 +68,26 @@ systemctl status codex-ai-gateway
 解析失败时，当前预设模型会被清空并停止路由，历史快照和失败原因仍可在详情中查询；
 下一次网页探测成功后才恢复，不提供手工模型列表修正。
 
+### 自动更新
+
+部署脚本会自动安装 systemd timer（每 5 分钟检查一次），检测到 GitHub
+Releases 有新版本时自动下载、部署并执行健康检查（失败回滚）。无需手动
+SSH 重新部署。
+
+发布流程简化为：
+
+```bash
+git tag v0.x.0 && git push --tags   # CI 自动构建并发布 Release
+# 服务器 5 分钟内自动检测并部署
+```
+
+手动触发立即检查：
+
+```bash
+sudo systemctl start codex-ai-gateway-update.service
+journalctl -u codex-ai-gateway-update -n 20 --no-pager
+```
+
 ### 自定义 Provider
 
 自定义 Provider 继续填写名称、Base URL 和 API 凭据。Base URL 必须是 API 根，例如：
