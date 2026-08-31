@@ -251,3 +251,28 @@ def validate_translatable(normal: NormalRequest) -> None:
     if normal.extra.get("instructions") is not None:
         # instructions 需要一个 system 前缀，由翻译器处理
         pass
+
+
+def ensure_prefill_continuation(body: dict[str, Any]) -> dict[str, Any]:
+    """responses 透传前的 prefill 规范化。
+
+    input 以 assistant 消息结尾时，部分上游（如火山方舟对不支持 prefill
+    的模型）会拒绝整个请求。此时追加一条 user 续写消息，语义等价于
+    "继续"，对支持 prefill 的上游无实质影响。
+    """
+    raw_input = body.get("input")
+    if not isinstance(raw_input, list) or not raw_input:
+        return body
+    last = raw_input[-1]
+    if not isinstance(last, dict) or last.get("role") != "assistant":
+        return body
+    patched = dict(body)
+    patched["input"] = [
+        *raw_input,
+        {
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "Continue."}],
+        },
+    ]
+    return patched

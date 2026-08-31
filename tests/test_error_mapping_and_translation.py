@@ -8,6 +8,7 @@ import pytest
 
 from codex_ai_gateway.adapters.protocol_normal_form import (
     UntranslatableCapabilityError,
+    ensure_prefill_continuation,
     normalize_request,
 )
 from codex_ai_gateway.domain.error_mapping import map_provider_error
@@ -79,3 +80,36 @@ def test_non_dict_input_item_raises():
             inbound_protocol="responses",
             body={"model": "m", "input": [42]},
         )
+
+
+def test_prefill_continuation_appends_user_after_assistant_last():
+    body = {
+        "model": "glm-5.3-flash",
+        "input": [
+            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+            {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "partial"}]},
+        ],
+    }
+    patched = ensure_prefill_continuation(body)
+    assert patched is not body
+    assert patched["input"][-1]["role"] == "user"
+    assert patched["input"][-1]["content"][0]["text"] == "Continue."
+    assert len(body["input"]) == 2  # 原请求不被修改
+
+
+def test_prefill_continuation_noop_for_user_last():
+    body = {
+        "model": "m",
+        "input": [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]}],
+    }
+    assert ensure_prefill_continuation(body) is body
+
+
+def test_prefill_continuation_noop_for_string_input():
+    body = {"model": "m", "input": "hi"}
+    assert ensure_prefill_continuation(body) is body
+
+
+def test_prefill_continuation_noop_without_input():
+    body = {"model": "m"}
+    assert ensure_prefill_continuation(body) is body
