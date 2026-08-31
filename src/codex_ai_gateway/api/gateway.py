@@ -28,6 +28,7 @@ from codex_ai_gateway.adapters.responses_chat_translation import (
     response_sse,
     translate_chat_chunk_to_response_event,
 )
+from codex_ai_gateway.adapters.responses_passthrough import ResponsesPassthrough
 from codex_ai_gateway.adapters.sse_stream import SSEFrameBuffer
 from codex_ai_gateway.api.errors import (
     GatewayError,
@@ -305,6 +306,7 @@ async def _stream_response(
         accumulated_tool_calls: dict[int, dict[str, Any]] = {}
         last_chat_chunk: dict[str, Any] | None = None
         sse_buffer = SSEFrameBuffer()
+        responses_passthrough = ResponsesPassthrough()
         READ_TIMEOUT = 15  # seconds per tick → keepalive or error
         MAX_IDLE_TICKS = 8  # 8 × 15s = 120s without data → error
         keepalive_frame = b": keepalive\n\n"
@@ -340,8 +342,10 @@ async def _stream_response(
                 idle_ticks = 0
 
                 if not is_chat:
-                    # Responses 协议透传
-                    yield chunk
+                    # Responses 协议透传 + 孤儿 delta 修补
+                    frames = responses_passthrough.feed(chunk)
+                    for frame in frames:
+                        yield frame
                     continue
 
                 # Chat 协议：SSE 解析 + 翻译
@@ -374,6 +378,10 @@ async def _stream_response(
                             existing["function"]["arguments"] += fn["arguments"]
 
             # flush remaining buffer
+            if not is_chat:
+                for frame in responses_passthrough.flush():
+                    yield frame
+
             if is_chat:
                 for parsed in sse_buffer.flush():
                     translated_list = translate_chat_chunk_to_response_event(parsed)
