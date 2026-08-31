@@ -78,6 +78,15 @@ export function ModelsPage() {
     },
     onError: (e: Error) => toast.error(e.message),
   })
+  const resetRouting = useMutation({
+    mutationFn: (id: string) => api.deleteModelRouting(id),
+    onSuccess: () => {
+      toast.success("模型优先级已重置为全局偏好。")
+      setPriorityModel(null)
+      invalidate()
+    },
+    onError: (e: Error) => toast.error(e.message),
+  })
   const rows = models.data ?? []
 
   function openPriority(modelId: string, upstreamNames: string[]) {
@@ -175,6 +184,22 @@ export function ModelsPage() {
                           )}
                         </ul>
                       </DragDropProvider>
+                      <div className="mt-3 border-t pt-2">
+                        <Button
+                          size="sm"
+                          variant="ghost"
+                          className="w-full text-xs text-muted-foreground hover:text-foreground"
+                          disabled={
+                            resetRouting.isPending ||
+                            !model.priority_summary.includes("自定义")
+                          }
+                          onClick={() => resetRouting.mutate(model.id)}
+                        >
+                          {resetRouting.isPending
+                            ? "重置中..."
+                            : "重置为全局优先级"}
+                        </Button>
+                      </div>
                     </PopoverContent>
                   </Popover>
                 </TableCell>

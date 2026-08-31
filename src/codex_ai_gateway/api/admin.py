@@ -524,14 +524,34 @@ async def list_models(request: Request) -> list[dict[str, Any]]:
         if model.status != "available":
             continue
         offerings = [o for o in state.offerings if o.canonical_model_id == model.id]
-        upstreams = []
+        upstream_by_id = {u.id: u for u in state.upstreams}
+        offering_upstream_names: list[str] = []
+        seen_upstream_ids: set[str] = set()
         for offering in offerings:
-            upstream = next((u for u in state.upstreams if u.id == offering.upstream_id), None)
-            if upstream and upstream.name not in upstreams:
-                upstreams.append(upstream.name)
+            if offering.upstream_id in seen_upstream_ids:
+                continue
+            seen_upstream_ids.add(offering.upstream_id)
+            up = upstream_by_id.get(offering.upstream_id)
+            if up:
+                offering_upstream_names.append(up.name)
         override = next(
             (r for r in state.routing_preferences if r.canonical_model_id == model.id), None
         )
+        global_pref = next(
+            (r for r in state.routing_preferences if r.scope == RoutingScope.global_preference), None
+        )
+        ordered_ids = (
+            override.ordered_upstream_ids if override
+            else global_pref.ordered_upstream_ids if global_pref
+            else None
+        )
+        if ordered_ids:
+            id_to_name = {uid: upstream_by_id[uid].name for uid in ordered_ids if uid in upstream_by_id}
+            prioritized = [id_to_name[uid] for uid in ordered_ids if uid in id_to_name and id_to_name[uid] in offering_upstream_names]
+            remaining = [n for n in offering_upstream_names if n not in prioritized]
+            upstreams = prioritized + remaining
+        else:
+            upstreams = offering_upstream_names
         result.append({
             "id": model.id,
             "openrouter_model_id": model.openrouter_model_id,
@@ -672,6 +692,24 @@ async def _put_routing(request: Request, model_id: str | None, payload: RoutingP
     return {"scope": "global" if model_id is None else "canonical_model", "canonical_model_id": model_id, "ordered_upstream_ids": payload.ordered_upstream_ids}
 
 
+@router.delete("/routing/models/{model_id}")
+async def delete_model_routing(request: Request, model_id: str) -> dict[str, Any]:
+    """重置模型路由优先级：移除该模型的自定义排序，回退到全局偏好。"""
+    runtime = _runtime(request)
+    state = runtime.state_store.read_state()
+    if not any(m.id == model_id for m in state.canonical_models):
+        _not_found("模型不存在")
+
+    def apply(state: Any) -> None:
+        state.routing_preferences = [
+            r for r in state.routing_preferences
+            if not (r.scope == RoutingScope.canonical_model and r.canonical_model_id == model_id)
+        ]
+
+    runtime.state_store.mutate(apply)
+    return {"scope": "canonical_model", "canonical_model_id": model_id, "deleted": True}
+
+
 @router.get("/gateway-token")
 async def get_gateway_token(request: Request) -> GatewayTokenView:
     state = _runtime(request).state_store.read_state()
@@ -722,3 +760,5 @@ async def _trigger_codex_if_configured(runtime: Any) -> None:
             runtime,
             trigger="gateway_token.change",
         )
+
+

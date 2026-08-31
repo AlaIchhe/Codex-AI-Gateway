@@ -204,6 +204,10 @@ export const api = {
       method: "PUT",
       body: JSON.stringify({ ordered_upstream_ids: upstreamIds }),
     }),
+  deleteModelRouting: (id: string) =>
+    request<unknown>(`/admin/routing/models/${id}`, {
+      method: "DELETE",
+    }),
   getGatewayToken: () => request<GatewayTokenView>("/admin/gateway-token"),
   rotateGatewayToken: () =>
     request<GatewayTokenView>("/admin/gateway-token/rotate", {
