@@ -11,11 +11,11 @@ from codex_ai_gateway.models.entities import (
     UpstreamStatus,
 )
 from codex_ai_gateway.services.model_identity import (
-    clean_display_name,
     MatchResult,
     build_standard_catalog,
     canonical_from_candidate,
     canonical_from_offering,
+    clean_display_name,
     match_offering,
 )
 from codex_ai_gateway.util import utc_now

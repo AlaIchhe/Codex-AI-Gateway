@@ -225,6 +225,26 @@ def response_message_started_events() -> list[dict[str, Any]]:
     ]
 
 
+def response_function_call_done_events(tool_calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """把累积的 Chat tool_calls 完成态转为 Responses function_call done 事件。"""
+    events: list[dict[str, Any]] = []
+    for tc in tool_calls:
+        fn = tc.get("function") or {}
+        events.append({
+            "type": "response.output_item.done",
+            "output_index": (tc.get("index") or 0) + 1,
+            "item": {
+                "id": tc.get("id") or f"call_{tc.get('index', 0)}",
+                "type": "function_call",
+                "call_id": tc.get("id") or f"call_{tc.get('index', 0)}",
+                "name": fn.get("name") or "",
+                "arguments": fn.get("arguments") or "",
+                "status": "completed",
+            },
+        })
+    return events
+
+
 def response_message_done_event(text: str) -> dict[str, Any]:
     return {
         "type": "response.output_item.done",
@@ -235,6 +255,23 @@ def response_message_done_event(text: str) -> dict[str, Any]:
             "status": "completed",
             "role": "assistant",
             "content": [{"type": "output_text", "text": text, "annotations": []}],
+        },
+    }
+
+
+def response_failed_event(model: str, error_message: str) -> dict[str, Any]:
+    """mid-stream 错误时通知客户端。"""
+    return {
+        "type": "response.failed",
+        "response": {
+            "id": "resp_placeholder",
+            "object": "response",
+            "model": model,
+            "status": "failed",
+            "error": {
+                "code": "upstream_error",
+                "message": error_message,
+            },
         },
     }
 

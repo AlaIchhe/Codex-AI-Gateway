@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from collections.abc import AsyncIterator
@@ -18,14 +19,16 @@ from codex_ai_gateway.adapters.protocol_normal_form import (
 )
 from codex_ai_gateway.adapters.responses_chat_translation import (
     chat_request_from_normal,
-    parse_chat_sse_frame,
     response_completed_event,
     response_created_event,
+    response_failed_event,
+    response_function_call_done_events,
     response_message_done_event,
     response_message_started_events,
     response_sse,
     translate_chat_chunk_to_response_event,
 )
+from codex_ai_gateway.adapters.sse_stream import SSEFrameBuffer
 from codex_ai_gateway.api.errors import (
     GatewayError,
     gateway_error_response,
@@ -292,55 +295,133 @@ async def _stream_response(
         _finalize(runtime, event, Outcome.failed, mapped=mapped, status_code=upstream_stream.status_code)
         return mapped_response(mapped)
 
+    is_chat = protocol == WireProtocol.chat_completions
+    model_label = event.canonical_model_label or event.provider_model_id
+
     async def iterator() -> AsyncIterator[bytes]:
         started = False
         stream_initialized = False
         accumulated_text = ""
+        accumulated_tool_calls: dict[int, dict[str, Any]] = {}
         last_chat_chunk: dict[str, Any] | None = None
-        buffer = ""
+        sse_buffer = SSEFrameBuffer()
+        READ_TIMEOUT = 15  # seconds per tick → keepalive or error
+        MAX_IDLE_TICKS = 8  # 8 × 15s = 120s without data → error
+        keepalive_frame = b": keepalive\n\n"
+
+        stream_iter = upstream_stream.__aiter__()
+
+        async def _next_chunk() -> bytes | None:
+            """读一个 chunk，超时抛出 asyncio.TimeoutError。"""
+            try:
+                return await asyncio.wait_for(
+                    stream_iter.__anext__(), timeout=READ_TIMEOUT
+                )
+            except StopAsyncIteration:
+                return None
+
+        idle_ticks = 0
         try:
-            async for chunk in upstream_stream:
+            while True:
+                try:
+                    chunk = await _next_chunk()
+                except TimeoutError:
+                    idle_ticks += 1
+                    if idle_ticks >= MAX_IDLE_TICKS:
+                        raise TimeoutError(f"上游 {READ_TIMEOUT * MAX_IDLE_TICKS}s 无数据，中止流式传输。") from None
+                    # Send keepalive to prevent proxy timeout
+                    yield keepalive_frame
+                    continue
+
+                if chunk is None:
+                    break  # upstream stream ended
+
                 started = True
-                if protocol == WireProtocol.responses:
+                idle_ticks = 0
+
+                if not is_chat:
+                    # Responses 协议透传
                     yield chunk
                     continue
-                buffer += chunk.decode("utf-8", errors="ignore")
-                while "\n\n" in buffer:
-                    frame, buffer = buffer.split("\n\n", 1)
-                    parsed = parse_chat_sse_frame(frame)
-                    if parsed is None:
-                        continue
+
+                # Chat 协议：SSE 解析 + 翻译
+                events = sse_buffer.feed(chunk)
+                for parsed in events:
                     last_chat_chunk = parsed
                     if not stream_initialized:
-                        yield response_sse(response_created_event(event.canonical_model_label or event.provider_model_id))
+                        yield response_sse(response_created_event(model_label))
                         for lifecycle_event in response_message_started_events():
                             yield response_sse(lifecycle_event)
                         stream_initialized = True
-                    translated = translate_chat_chunk_to_response_event(parsed)
-                    if translated:
-                        accumulated_text += str(translated.get("delta", ""))
+
+                    translated_list = translate_chat_chunk_to_response_event(parsed)
+                    for translated in translated_list:
+                        if translated.get("type") == "response.output_text.delta":
+                            accumulated_text += str(translated.get("delta", ""))
                         yield response_sse(translated)
-            if protocol == WireProtocol.chat_completions:
+
+                    # 累积 tool_calls 信息（供 finalize 使用）
+                    tc_list = (parsed.get("choices") or [{}])[0].get("delta", {}).get("tool_calls") or []
+                    for tc in tc_list:
+                        tc_index = tc.get("index", 0)
+                        existing = accumulated_tool_calls.setdefault(tc_index, {"index": tc_index, "id": None, "function": {"name": "", "arguments": ""}})
+                        if tc.get("id"):
+                            existing["id"] = tc["id"]
+                        fn = tc.get("function") or {}
+                        if fn.get("name"):
+                            existing["function"]["name"] = fn["name"]
+                        if fn.get("arguments"):
+                            existing["function"]["arguments"] += fn["arguments"]
+
+            # flush remaining buffer
+            if is_chat:
+                for parsed in sse_buffer.flush():
+                    translated_list = translate_chat_chunk_to_response_event(parsed)
+                    for translated in translated_list:
+                        if translated.get("type") == "response.output_text.delta":
+                            accumulated_text += str(translated.get("delta", ""))
+                        yield response_sse(translated)
+
+            if is_chat:
                 if not stream_initialized:
-                    yield response_sse(response_created_event(event.canonical_model_label or event.provider_model_id))
+                    yield response_sse(response_created_event(model_label))
                     for lifecycle_event in response_message_started_events():
                         yield response_sse(lifecycle_event)
+
+                # Send tool_call done events
+                if accumulated_tool_calls:
+                    for tc_done in response_function_call_done_events(
+                        [accumulated_tool_calls[i] for i in sorted(accumulated_tool_calls)]
+                    ):
+                        yield response_sse(tc_done)
+
                 yield response_sse(response_message_done_event(accumulated_text))
                 yield response_sse(response_completed_event(
-                    model=event.canonical_model_label or event.provider_model_id,
+                    model=model_label,
                     usage=(last_chat_chunk or {}).get("usage"),
                 ))
+
             _finalize_success(runtime, event, b"", streaming=True)
         except Exception as exc:
-            _finalize(runtime, event, Outcome.failed if started else Outcome.interrupted, mapped=_mapped_error(502, b"", error=exc, upstream=upstream), status_code=502)
+            error_msg = f"上游 {upstream.name} 流式传输异常: {type(exc).__name__}: {exc}"
+            _finalize(
+                runtime, event,
+                Outcome.failed if started else Outcome.interrupted,
+                mapped=_mapped_error(502, b"", error=exc, upstream=upstream),
+                status_code=502,
+            )
+            # Notify client with response.failed event instead of raising
+            if started and stream_initialized:
+                try:
+                    yield response_sse(response_failed_event(model_label, error_msg))
+                    yield response_sse(response_completed_event(model=model_label, usage=None))
+                except Exception:
+                    pass
             raise
         finally:
             await upstream_stream.aclose()
 
-    media_type = "text/event-stream" if chat_body is None else "text/event-stream"
-    return StreamingResponse(iterator(), media_type=media_type)
-
-
+    return StreamingResponse(iterator(), media_type="text/event-stream")
 def _finalize_success(runtime: Runtime, event: UsageEvent, body: bytes, *, streaming: bool = False) -> None:
     usage = parse_provider_usage(body)
     estimated = estimate_usage_from_text(body)
