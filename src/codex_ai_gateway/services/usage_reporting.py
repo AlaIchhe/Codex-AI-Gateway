@@ -87,9 +87,9 @@ class UsageReportingService:
 
     def _group_key(self, ev: dict[str, Any], group_by: str) -> str:
         if group_by == "canonical_model":
-            return ev.get("canonical_model_id") or ev.get("canonical_model_label") or "unknown"
+            return ev.get("canonical_model_label") or ev.get("canonical_model_id") or "unknown"
         if group_by == "upstream":
-            return ev.get("upstream_id") or "unknown"
+            return ev.get("upstream_label") or ev.get("upstream_id") or "unknown"
         if group_by == "offering":
             return ev.get("offering_id") or "unknown"
         if group_by == "protocol":

@@ -21,10 +21,8 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/coss/components/table"
-import { Overlay } from "@/components/coss/overlay"
 import { PageHeader } from "@/components/page-header"
 import { api } from "@/lib/api"
-import { useOverlaySearch } from "@/lib/search-params"
 import { cn } from "@/lib/utils"
 
 function SortableItem({
@@ -61,7 +59,6 @@ function SortableItem({
 
 export function ModelsPage() {
   const queryClient = useQueryClient()
-  const [evidenceId, setEvidenceId] = useOverlaySearch("evidence")
   const [order, setOrder] = useState<string[]>([])
   const [priorityModel, setPriorityModel] = useState<string | null>(null)
   const upstreams = useQuery({
@@ -69,11 +66,6 @@ export function ModelsPage() {
     queryFn: api.listUpstreams,
   })
   const models = useQuery({ queryKey: ["models"], queryFn: api.listModels })
-  const detail = useQuery({
-    queryKey: ["model-detail", evidenceId],
-    queryFn: () => api.getModel(evidenceId ?? ""),
-    enabled: Boolean(evidenceId),
-  })
   const invalidate = () => {
     void queryClient.invalidateQueries({ queryKey: ["models"] })
   }
@@ -81,7 +73,6 @@ export function ModelsPage() {
     mutationFn: ({ id, ids }: { id: string; ids: string[] }) =>
       api.putModelRouting(id, ids),
     onSuccess: () => {
-      setPriorityModel(null)
       toast.success("模型优先级已保存。")
       invalidate()
     },
@@ -105,7 +96,11 @@ export function ModelsPage() {
     const from = source.initialIndex
     const to = source.index
     if (from === to) return
-    setOrder((prev) => arrayMove(prev, from, to))
+    setOrder((prev) => {
+      const next = arrayMove(prev, from, to)
+      saveRouting.mutate({ id: priorityModel ?? "", ids: next })
+      return next
+    })
   }
 
   return (
@@ -123,7 +118,6 @@ export function ModelsPage() {
             <TableRow>
               <TableHead>模型</TableHead>
               <TableHead>可用上游数</TableHead>
-              <TableHead>元数据</TableHead>
               <TableHead>优先级</TableHead>
               <TableHead className="text-right">操作</TableHead>
             </TableRow>
@@ -133,18 +127,8 @@ export function ModelsPage() {
               <TableRow key={model.id}>
                 <TableCell>{model.display_name}</TableCell>
                 <TableCell>{model.upstream_count}</TableCell>
-                <TableCell>
-                  {model.metadata_status === "complete" ? "完整" : "缺失"}
-                </TableCell>
                 <TableCell>{model.priority_summary}</TableCell>
-                <TableCell className="space-x-2 text-right">
-                  <Button
-                    size="sm"
-                    variant="outline"
-                    onClick={() => setEvidenceId(model.id)}
-                  >
-                    证据
-                  </Button>
+                <TableCell className="text-right">
                   <Popover
                     open={priorityModel === model.id}
                     onOpenChange={(open: boolean) => {
@@ -164,7 +148,7 @@ export function ModelsPage() {
                         {model.display_name}
                       </p>
                       <p className="mb-3 text-xs text-muted-foreground">
-                        拖拽手柄调整上游尝试顺序。
+                        拖拽手柄调整上游尝试顺序，松开即自动保存。
                       </p>
                       <DragDropProvider onDragEnd={handleDragEnd}>
                         <ul
@@ -191,20 +175,6 @@ export function ModelsPage() {
                           )}
                         </ul>
                       </DragDropProvider>
-                      <Button
-                        className="mt-3 w-full"
-                        size="sm"
-                        disabled={saveRouting.isPending || !order.length}
-                        onClick={() =>
-                          priorityModel &&
-                          saveRouting.mutate({
-                            id: priorityModel,
-                            ids: order,
-                          })
-                        }
-                      >
-                        {saveRouting.isPending ? "保存中…" : "保存优先级"}
-                      </Button>
                     </PopoverContent>
                   </Popover>
                 </TableCell>
@@ -213,7 +183,7 @@ export function ModelsPage() {
             {!rows.length && (
               <TableRow>
                 <TableCell
-                  colSpan={5}
+                  colSpan={4}
                   className="text-center text-muted-foreground"
                 >
                   暂无可用规范模型。
@@ -223,88 +193,6 @@ export function ModelsPage() {
           </TableBody>
         </Table>
       </AnimatedCard>
-      <Overlay
-        open={Boolean(evidenceId)}
-        onClose={() => setEvidenceId(null)}
-        title={`模型证据：${detail.data?.model.display_name ?? ""}`}
-        variant="sheet"
-      >
-        <div className="space-y-6">
-          <section aria-label="身份证据">
-            <h3 className="mb-2 font-medium">身份证据</h3>
-            {(detail.data?.identity_evidence ?? []).map((item) => (
-              <div
-                key={JSON.stringify(item)}
-                className="rounded-md border p-3 text-sm"
-              >
-                <pre className="whitespace-pre-wrap break-all">
-                  {JSON.stringify(item, null, 2)}
-                </pre>
-              </div>
-            ))}
-            {!detail.data?.identity_evidence.length && (
-              <p className="text-sm text-muted-foreground">暂无身份证据。</p>
-            )}
-          </section>
-          <section aria-label="目录候选与剔除原因">
-            <h3 className="mb-2 font-medium">目录候选与剔除原因</h3>
-            {(detail.data?.catalog_candidates ?? []).map((candidate) => (
-              <div
-                key={JSON.stringify(candidate)}
-                className="rounded-md border p-3 text-sm"
-              >
-                <pre className="whitespace-pre-wrap break-all">
-                  {JSON.stringify(candidate, null, 2)}
-                </pre>
-              </div>
-            ))}
-            {!detail.data?.catalog_candidates.length && (
-              <p className="text-sm text-muted-foreground">
-                暂无目录候选证据。
-              </p>
-            )}
-          </section>
-          <section aria-label="字段级证据">
-            <h3 className="mb-2 font-medium">字段级证据</h3>
-            {(detail.data?.catalog_evidence ?? []).flat().map((field) => {
-              const value = field as {
-                field_path?: string
-                verification_status?: string
-                resolution_reason?: string
-                advice?: string
-                observed_at?: string
-              }
-              return (
-                <div
-                  key={JSON.stringify(value)}
-                  className="rounded-md border p-3"
-                >
-                  <p className="font-medium">
-                    {value.field_path ?? "未知字段"}
-                  </p>
-                  <p className="text-sm text-muted-foreground">
-                    {value.verification_status ?? "-"}
-                  </p>
-                  {value.resolution_reason && (
-                    <p className="mt-1 text-sm">
-                      原因：{value.resolution_reason}
-                    </p>
-                  )}
-                  {value.advice && (
-                    <p className="text-sm">建议：{value.advice}</p>
-                  )}
-                  <p className="mt-1 text-xs text-muted-foreground">
-                    {value.observed_at}
-                  </p>
-                </div>
-              )
-            })}
-            {!detail.data?.catalog_evidence.length && (
-              <p className="text-sm text-muted-foreground">暂无字段级证据。</p>
-            )}
-          </section>
-        </div>
-      </Overlay>
     </section>
   )
 }

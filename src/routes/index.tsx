@@ -11,8 +11,14 @@ import {
 } from "lucide-react"
 import { useMemo } from "react"
 
-import { ChartCard, ChartLegend } from "@/components/chart-card"
-import { UsageChart } from "@/components/charts/UsageChart"
+import { ChartCard } from "@/components/chart-card"
+import {
+  Area,
+  AreaChart,
+  CartesianGrid,
+  XAxis,
+  YAxis,
+} from "@/components/charts/barrel"
 import { Badge } from "@/components/coss/components/badge"
 import { AnimatedShinyText } from "@/components/magicui/animated-shiny-text"
 import { BentoGrid } from "@/components/magicui/bento-grid"
@@ -21,6 +27,12 @@ import { InteractiveHoverButton } from "@/components/magicui/interactive-hover-b
 import { MagicCard } from "@/components/magicui/magic-card"
 import { OrbitingCircles } from "@/components/magicui/orbiting-circles"
 import { StatCard } from "@/components/stat-card"
+import {
+  type ChartConfig,
+  ChartContainer,
+  ChartTooltip,
+  ChartTooltipContent,
+} from "@/components/ui/chart"
 import { api } from "@/lib/api"
 
 function compact(n: number): string {
@@ -139,13 +151,44 @@ function DashboardPage() {
             loading={usage.isLoading}
             total={totals.attempts}
             totalLabel="Total"
-            legend={
-              <ChartLegend
-                items={[{ label: "尝试次数", color: "var(--chart-1)" }]}
-              />
-            }
           >
-            <UsageChart rows={periodRows} />
+            <ChartContainer
+              config={
+                {
+                  attempts: { label: "请求", color: "var(--chart-1)" },
+                } satisfies ChartConfig
+              }
+              className="h-72 w-full"
+            >
+              <AreaChart
+                data={periodRows}
+                margin={{ left: 8, right: 8, top: 8, bottom: 8 }}
+              >
+                <CartesianGrid strokeDasharray="3 3" vertical={false} />
+                <XAxis
+                  dataKey="bucket_start"
+                  stroke="currentColor"
+                  fontSize={12}
+                  tickLine={false}
+                  axisLine={false}
+                />
+                <YAxis
+                  stroke="currentColor"
+                  fontSize={12}
+                  tickLine={false}
+                  axisLine={false}
+                />
+                <ChartTooltip content={<ChartTooltipContent />} />
+                <Area
+                  type="monotone"
+                  dataKey="attempts"
+                  name="请求"
+                  stroke="var(--color-attempts)"
+                  fill="var(--color-attempts)"
+                  fillOpacity={0.15}
+                />
+              </AreaChart>
+            </ChartContainer>
           </ChartCard>
         </BlurFade>
 

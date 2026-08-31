@@ -279,7 +279,6 @@ export function UpstreamsPage() {
                   </TableHead>
                   <TableHead>名称</TableHead>
                   <TableHead>状态</TableHead>
-                  <TableHead>健康摘要</TableHead>
                   <TableHead className="text-right">操作</TableHead>
                 </TableRow>
               </TableHeader>
@@ -307,11 +306,7 @@ export function UpstreamsPage() {
                           {upstream.status === "enabled" ? "启用" : "禁用"}
                         </Badge>
                       </TableCell>
-                      <TableCell>
-                        {upstream.protocol_probe_summary ||
-                          upstream.last_health_result ||
-                          "暂无证据"}
-                      </TableCell>
+
                       <TableCell className="space-x-2 text-right">
                         <Button
                           size="sm"

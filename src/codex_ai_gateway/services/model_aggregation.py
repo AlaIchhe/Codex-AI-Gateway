@@ -91,6 +91,9 @@ async def aggregate_models(
                         canonical.slug = slug
                     canonical.openrouter_model_id = mapping.openrouter_model_id
                     canonical.capability_baseline = result.candidate
+                    canonical.display_name = str(
+                        result.candidate.get("name") or canonical.display_name
+                    )
                     canonical.updated_at = now
             else:
                 # 上游回退：不覆盖已存在的同 slug canonical（避免换掉目录命中身份）。

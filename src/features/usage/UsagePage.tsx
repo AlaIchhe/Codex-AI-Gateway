@@ -1,17 +1,16 @@
 import { useInfiniteQuery, useMutation, useQuery } from "@tanstack/react-query"
 import { useEffect, useMemo, useRef, useState } from "react"
 
-import { ChartCard, ChartLegend } from "@/components/chart-card"
+import { ChartCard } from "@/components/chart-card"
 import {
+  Area,
+  AreaChart,
   Bar,
   BarChart,
   CartesianGrid,
-  Tooltip,
   XAxis,
   YAxis,
 } from "@/components/charts/barrel"
-import { UsageBreakdownChart } from "@/components/charts/UsageBreakdownChart"
-import { UsageChart } from "@/components/charts/UsageChart"
 import { Button } from "@/components/coss/components/button"
 import { Input } from "@/components/coss/components/input"
 import { Label } from "@/components/coss/components/label"
@@ -28,8 +27,24 @@ import { BentoGrid } from "@/components/magicui/bento-grid"
 import { BlurFade } from "@/components/magicui/blur-fade"
 import { PageHeader } from "@/components/page-header"
 import { StatCard } from "@/components/stat-card"
+import {
+  type ChartConfig,
+  ChartContainer,
+  ChartLegend,
+  ChartLegendContent,
+  ChartTooltip,
+  ChartTooltipContent,
+} from "@/components/ui/chart"
 import { api, type UsageAttempt } from "@/lib/api"
 import { useOverlaySearch } from "@/lib/search-params"
+
+const chartConfig = {
+  attempts: { label: "请求", color: "var(--chart-1)" },
+  input: { label: "输入", color: "var(--chart-1)" },
+  output: { label: "输出", color: "var(--chart-2)" },
+  reasoning: { label: "推理", color: "var(--chart-3)" },
+  cached: { label: "缓存", color: "var(--chart-4)" },
+} satisfies ChartConfig
 
 function compact(n: number): string {
   if (Math.abs(n) >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`
@@ -190,7 +205,6 @@ export function UsagePage() {
         }
       />
 
-      {/* Stat cards */}
       <BentoGrid className="grid-cols-2 xl:grid-cols-4">
         <StatCard
           label="总请求"
@@ -217,7 +231,6 @@ export function UsagePage() {
         />
       </BentoGrid>
 
-      {/* Chart grid */}
       <div className="grid gap-4 lg:grid-cols-2">
         <BlurFade delay={0}>
           <ChartCard
@@ -225,13 +238,38 @@ export function UsagePage() {
             loading={periodData.isLoading}
             total={totals.attempts}
             totalLabel="Total"
-            legend={
-              <ChartLegend
-                items={[{ label: "尝试次数", color: "var(--chart-1)" }]}
-              />
-            }
           >
-            <UsageChart rows={periodRows} />
+            <ChartContainer config={chartConfig} className="h-72 w-full">
+              <AreaChart
+                data={periodRows}
+                margin={{ left: 8, right: 8, top: 8, bottom: 8 }}
+              >
+                <CartesianGrid strokeDasharray="3 3" vertical={false} />
+                <XAxis
+                  dataKey="bucket_start"
+                  stroke="currentColor"
+                  fontSize={12}
+                  tickLine={false}
+                  axisLine={false}
+                />
+                <YAxis
+                  stroke="currentColor"
+                  fontSize={12}
+                  tickLine={false}
+                  axisLine={false}
+                />
+                <ChartTooltip content={<ChartTooltipContent />} />
+                <ChartLegend content={<ChartLegendContent />} />
+                <Area
+                  type="monotone"
+                  dataKey="attempts"
+                  name="请求"
+                  stroke="var(--color-attempts)"
+                  fill="var(--color-attempts)"
+                  fillOpacity={0.15}
+                />
+              </AreaChart>
+            </ChartContainer>
           </ChartCard>
         </BlurFade>
 
@@ -241,18 +279,66 @@ export function UsagePage() {
             loading={periodData.isLoading}
             total={totalTokens}
             totalLabel="Total"
-            legend={
-              <ChartLegend
-                items={[
-                  { label: "输入", color: "var(--chart-1)" },
-                  { label: "输出", color: "var(--chart-2)" },
-                  { label: "推理", color: "var(--chart-3)" },
-                  { label: "缓存", color: "var(--chart-4)" },
-                ]}
-              />
-            }
           >
-            <UsageBreakdownChart rows={periodRows} />
+            <ChartContainer config={chartConfig} className="h-72 w-full">
+              <AreaChart
+                data={periodRows}
+                margin={{ left: 8, right: 8, top: 8, bottom: 8 }}
+              >
+                <CartesianGrid strokeDasharray="3 3" vertical={false} />
+                <XAxis
+                  dataKey="bucket_start"
+                  stroke="currentColor"
+                  fontSize={12}
+                  tickLine={false}
+                  axisLine={false}
+                />
+                <YAxis
+                  stroke="currentColor"
+                  fontSize={12}
+                  tickLine={false}
+                  axisLine={false}
+                />
+                <ChartTooltip content={<ChartTooltipContent />} />
+                <ChartLegend content={<ChartLegendContent />} />
+                <Area
+                  type="monotone"
+                  dataKey="provider_reported_input_tokens"
+                  name="输入"
+                  stackId="tokens"
+                  stroke="var(--color-input)"
+                  fill="var(--color-input)"
+                  fillOpacity={0.3}
+                />
+                <Area
+                  type="monotone"
+                  dataKey="estimated_output_tokens"
+                  name="输出"
+                  stackId="tokens"
+                  stroke="var(--color-output)"
+                  fill="var(--color-output)"
+                  fillOpacity={0.3}
+                />
+                <Area
+                  type="monotone"
+                  dataKey="reasoning_tokens"
+                  name="推理"
+                  stackId="tokens"
+                  stroke="var(--color-reasoning)"
+                  fill="var(--color-reasoning)"
+                  fillOpacity={0.3}
+                />
+                <Area
+                  type="monotone"
+                  dataKey="cache_read_tokens"
+                  name="缓存"
+                  stackId="tokens"
+                  stroke="var(--color-cached)"
+                  fill="var(--color-cached)"
+                  fillOpacity={0.3}
+                />
+              </AreaChart>
+            </ChartContainer>
           </ChartCard>
         </BlurFade>
 
@@ -263,30 +349,38 @@ export function UsagePage() {
             total={totals.attempts}
             totalLabel="Total"
           >
-            <div className="h-72 w-full">
+            <ChartContainer config={chartConfig} className="h-72 w-full">
               <BarChart
                 data={modelRows.slice(0, 8)}
                 layout="vertical"
                 margin={{ left: 8, right: 8, top: 8, bottom: 8 }}
               >
                 <CartesianGrid strokeDasharray="3 3" horizontal={false} />
-                <XAxis type="number" stroke="currentColor" fontSize={12} />
+                <XAxis
+                  type="number"
+                  stroke="currentColor"
+                  fontSize={12}
+                  tickLine={false}
+                  axisLine={false}
+                />
                 <YAxis
                   type="category"
                   dataKey="bucket_start"
-                  width={140}
+                  width={160}
                   stroke="currentColor"
                   fontSize={12}
+                  tickLine={false}
+                  axisLine={false}
                 />
-                <Tooltip />
+                <ChartTooltip content={<ChartTooltipContent />} />
                 <Bar
                   dataKey="attempts"
                   name="请求"
-                  fill="var(--chart-2)"
+                  fill="var(--color-attempts)"
                   radius={[0, 4, 4, 0]}
                 />
               </BarChart>
-            </div>
+            </ChartContainer>
           </ChartCard>
         </BlurFade>
 
@@ -297,35 +391,42 @@ export function UsagePage() {
             total={totals.attempts}
             totalLabel="Total"
           >
-            <div className="h-72 w-full">
+            <ChartContainer config={chartConfig} className="h-72 w-full">
               <BarChart
                 data={upstreamRows.slice(0, 8)}
                 layout="vertical"
                 margin={{ left: 8, right: 8, top: 8, bottom: 8 }}
               >
                 <CartesianGrid strokeDasharray="3 3" horizontal={false} />
-                <XAxis type="number" stroke="currentColor" fontSize={12} />
+                <XAxis
+                  type="number"
+                  stroke="currentColor"
+                  fontSize={12}
+                  tickLine={false}
+                  axisLine={false}
+                />
                 <YAxis
                   type="category"
                   dataKey="bucket_start"
-                  width={140}
+                  width={160}
                   stroke="currentColor"
                   fontSize={12}
+                  tickLine={false}
+                  axisLine={false}
                 />
-                <Tooltip />
+                <ChartTooltip content={<ChartTooltipContent />} />
                 <Bar
                   dataKey="attempts"
                   name="请求"
-                  fill="var(--chart-3)"
+                  fill="var(--color-attempts)"
                   radius={[0, 4, 4, 0]}
                 />
               </BarChart>
-            </div>
+            </ChartContainer>
           </ChartCard>
         </BlurFade>
       </div>
 
-      {/* Attempts audit */}
       <BlurFade delay={0.16}>
         <ChartCard
           title="Attempts 审计"
