@@ -91,10 +91,11 @@ class ResponsesPassthrough:
             return [_encode_sse(event)]
 
         # 检测孤儿 delta
-        prefix_events = self._check_orphan(etype)
+        source_item_id = event.get("item_id", "")
+        prefix_events = self._check_orphan(etype, source_item_id)
         return [_encode_sse(e) for e in prefix_events] + [_encode_sse(event)]
 
-    def _check_orphan(self, etype: str) -> list[dict[str, Any]]:
+    def _check_orphan(self, etype: str, source_item_id: str = "") -> list[dict[str, Any]]:
         """检测孤儿 delta 事件，返回需要注入的前置事件列表。"""
         has_reasoning = any(t == "reasoning" for t in self._active_items.values())
         has_message = any(t == "message" for t in self._active_items.values())
@@ -103,17 +104,20 @@ class ResponsesPassthrough:
         if etype.startswith(_REASONING_PREFIX) and not has_reasoning:
             # reasoning_summary_part.added 也需要 reasoning item
             # reasoning_summary_part.done 也是
-            return self._inject_item("reasoning", summary_part=True)
+            return self._inject_item("reasoning", source_item_id=source_item_id, summary_part=True)
         if etype.startswith(_MESSAGE_PREFIX) and not has_message:
-            return self._inject_item("message", summary_part=False)
+            return self._inject_item("message", source_item_id=source_item_id, summary_part=False)
         if etype.startswith(_FUNCTION_PREFIX) and not has_function:
-            return self._inject_item("function_call", summary_part=False)
+            return self._inject_item("function_call", source_item_id=source_item_id, summary_part=False)
         return []
 
-    def _inject_item(self, item_type: str, *, summary_part: bool) -> list[dict[str, Any]]:
-        """生成缺失的 output_item.added（+ content_part.added）事件。"""
+    def _inject_item(self, item_type: str, *, source_item_id: str = "", summary_part: bool = False) -> list[dict[str, Any]]:
+        """生成缺失的 output_item.added（+ content_part.added）事件。
+
+        使用源 delta 事件的 item_id（如果有），否则生成一个新 ID。
+        """
         self._injected_count += 1
-        item_id = f"injected-{item_type}-{self._injected_count}"
+        item_id = source_item_id if source_item_id else f"injected-{item_type}-{self._injected_count}"
         logger.debug("注入缺失的 output_item.added: type=%s id=%s", item_type, item_id)
 
         item: dict[str, Any] = {"id": item_id, "type": item_type, "status": "in_progress"}
