@@ -1,4 +1,8 @@
+import { arrayMove } from "@dnd-kit/helpers"
+import { DragDropProvider, type DragEndEvent } from "@dnd-kit/react"
+import { isSortable, useSortable } from "@dnd-kit/react/sortable"
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
+import { GripVertical } from "lucide-react"
 import { useState } from "react"
 import { toast } from "sonner"
 
@@ -16,6 +20,39 @@ import { Overlay } from "@/components/coss/overlay"
 import { PageHeader } from "@/components/page-header"
 import { api } from "@/lib/api"
 import { useOverlaySearch } from "@/lib/search-params"
+import { cn } from "@/lib/utils"
+
+function SortableItem({
+  id,
+  index,
+  label,
+}: {
+  id: string
+  index: number
+  label: string
+}) {
+  const { ref, handleRef, isDragging } = useSortable({ id, index })
+  return (
+    <li
+      ref={ref}
+      className={cn(
+        "flex items-center gap-3 rounded-md border p-2 text-sm transition-shadow",
+        isDragging && "opacity-40 shadow-lg",
+      )}
+    >
+      <button
+        ref={handleRef}
+        type="button"
+        aria-label={`拖动 ${label} 调整顺序`}
+        className="cursor-grab touch-none rounded p-1 text-muted-foreground hover:bg-muted hover:text-foreground active:cursor-grabbing"
+      >
+        <GripVertical className="size-4" />
+      </button>
+      <span className="text-muted-foreground">{index + 1}.</span>
+      <span>{label}</span>
+    </li>
+  )
+}
 
 export function ModelsPage() {
   const queryClient = useQueryClient()
@@ -35,30 +72,18 @@ export function ModelsPage() {
   const invalidate = () => {
     void queryClient.invalidateQueries({ queryKey: ["models"] })
   }
-  const success = (message: string) => {
-    toast.success(message)
-  }
   const saveRouting = useMutation({
     mutationFn: ({ id, ids }: { id: string; ids: string[] }) =>
       api.putModelRouting(id, ids),
     onSuccess: () => {
       setPriorityId(null)
-      success("模型优先级已保存。")
+      toast.success("模型优先级已保存。")
       invalidate()
     },
     onError: (e: Error) => toast.error(e.message),
   })
   const rows = models.data ?? []
   const selectedModel = rows.find((row) => row.id === priorityId)
-
-  function move(id: string, direction: -1 | 1) {
-    const index = order.indexOf(id)
-    const next = index + direction
-    if (index < 0 || next < 0 || next >= order.length) return
-    const reordered = [...order]
-    ;[reordered[index], reordered[next]] = [reordered[next], reordered[index]]
-    setOrder(reordered)
-  }
 
   function openPriority(modelId: string, upstreamNames: string[]) {
     setOrder(
@@ -67,6 +92,16 @@ export function ModelsPage() {
         .map((u) => u.id) ?? [],
     )
     setPriorityId(modelId)
+  }
+
+  function handleDragEnd(event: DragEndEvent) {
+    if (event.canceled) return
+    const { source } = event.operation
+    if (!isSortable(source)) return
+    const from = source.initialIndex
+    const to = source.index
+    if (from === to) return
+    setOrder((prev) => arrayMove(prev, from, to))
   }
 
   return (
@@ -78,7 +113,6 @@ export function ModelsPage() {
       <AnimatedCard
         title="规范模型"
         description="可用上游数与优先级摘要来自上游聚合。"
-        beam
       >
         <Table>
           <TableHeader>
@@ -137,48 +171,28 @@ export function ModelsPage() {
       >
         <div className="space-y-4">
           <p className="text-sm text-muted-foreground">
-            用上移/下移设置模型的上游尝试顺序。
+            拖拽手柄调整模型的上游尝试顺序。
           </p>
-          <ul aria-label="上游优先级" className="space-y-2">
-            {order.map((id, index) => {
-              const upstream = upstreams.data?.find((item) => item.id === id)
-              return (
-                <li
-                  key={id}
-                  className="flex items-center justify-between rounded-md border p-2 text-sm"
-                >
-                  <span>
-                    {index + 1}. {upstream?.name ?? id}
-                  </span>
-                  <span className="space-x-1">
-                    <Button
-                      type="button"
-                      size="sm"
-                      variant="outline"
-                      disabled={index === 0}
-                      onClick={() => move(id, -1)}
-                    >
-                      上移
-                    </Button>
-                    <Button
-                      type="button"
-                      size="sm"
-                      variant="outline"
-                      disabled={index === order.length - 1}
-                      onClick={() => move(id, 1)}
-                    >
-                      下移
-                    </Button>
-                  </span>
+          <DragDropProvider onDragEnd={handleDragEnd}>
+            <ul aria-label="上游优先级" className="space-y-2">
+              {order.map((id, index) => {
+                const upstream = upstreams.data?.find((item) => item.id === id)
+                return (
+                  <SortableItem
+                    key={id}
+                    id={id}
+                    index={index}
+                    label={upstream?.name ?? id}
+                  />
+                )
+              })}
+              {!order.length && (
+                <li className="text-sm text-muted-foreground">
+                  暂无可排序上游。
                 </li>
-              )
-            })}
-            {!order.length && (
-              <li className="text-sm text-muted-foreground">
-                暂无可排序上游。
-              </li>
-            )}
-          </ul>
+              )}
+            </ul>
+          </DragDropProvider>
           <Button
             disabled={saveRouting.isPending || !order.length}
             onClick={() =>

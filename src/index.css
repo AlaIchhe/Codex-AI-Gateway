@@ -312,3 +312,44 @@
     background-color: var(--color-muted-foreground, var(--color-border));
   }
 }
+
+/* Ripple Button animation (magicui) */
+@theme {
+  --animate-rippling: rippling var(--duration, 600ms) ease-out;
+}
+
+@keyframes rippling {
+  0% {
+    opacity: 1;
+    transform: scale(0);
+  }
+  100% {
+    opacity: 0;
+    transform: scale(2);
+  }
+}
+
+/* Animated Theme Toggler (magicui) — view-transition clip-path */
+::view-transition-old(root),
+::view-transition-new(root) {
+  animation: none;
+  mix-blend-mode: normal;
+}
+
+::view-transition-old(root) {
+  z-index: 1;
+}
+
+::view-transition-new(root) {
+  z-index: 9999;
+  clip-path: var(--magicui-theme-vt-clip-from, circle(0% at 50% 50%));
+  animation: none;
+}
+
+.dark::view-transition-old(root) {
+  z-index: 9999;
+}
+
+.dark::view-transition-new(root) {
+  z-index: 1;
+}

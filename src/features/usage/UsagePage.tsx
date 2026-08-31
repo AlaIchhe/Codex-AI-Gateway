@@ -187,7 +187,6 @@ export function UsagePage() {
       <AnimatedCard
         title="周期趋势"
         description="上报值与估算值在图表中分色显示。"
-        beam
       >
         <UsageChart rows={rows} />
       </AnimatedCard>

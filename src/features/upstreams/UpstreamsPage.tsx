@@ -259,7 +259,6 @@ export function UpstreamsPage() {
       <AnimatedCard
         title="上游列表"
         description="拖动行首手柄调整默认路由尝试顺序；系统不在此页面展示协议名称或确认状态。"
-        beam
       >
         {query.isLoading ? (
           <div className="p-4 text-sm text-muted-foreground">加载中…</div>

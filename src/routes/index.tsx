@@ -10,15 +10,15 @@ import {
   ShieldCheck,
 } from "lucide-react"
 import { useMemo } from "react"
-
 import { AnimatedCard } from "@/components/animated-card"
 import { Badge } from "@/components/coss/components/badge"
 import { AnimatedShinyText } from "@/components/magicui/animated-shiny-text"
 import { BentoGrid } from "@/components/magicui/bento-grid"
 import { BlurFade } from "@/components/magicui/blur-fade"
+import { InteractiveHoverButton } from "@/components/magicui/interactive-hover-button"
 import { MagicCard } from "@/components/magicui/magic-card"
 import { OrbitingCircles } from "@/components/magicui/orbiting-circles"
-import { ShineBorder } from "@/components/magicui/shine-border"
+import { ProgressiveBlur } from "@/components/magicui/progressive-blur"
 import { StatCard } from "@/components/stat-card"
 import { api } from "@/lib/api"
 
@@ -54,10 +54,6 @@ function DashboardPage() {
   return (
     <section aria-labelledby="dashboard-heading" className="space-y-5">
       <BlurFade className="relative overflow-hidden rounded-2xl border bg-card/70 p-5 shadow-sm backdrop-blur-xl">
-        <ShineBorder
-          duration={12}
-          shineColor={["var(--primary)", "var(--ring)"]}
-        />
         <div className="relative z-10 grid gap-6 lg:grid-cols-[1fr_auto] lg:items-center">
           <div>
             <Badge variant="secondary" className="mb-3">
@@ -73,20 +69,20 @@ function DashboardPage() {
               汇聚上游健康、模型目录与用量趋势，快速发现路由异常。
             </AnimatedShinyText>
             <div className="mt-4 flex flex-wrap gap-2">
-              <Link
-                to="/upstreams"
-                className="inline-flex h-8 items-center gap-1.5 rounded-lg border bg-background px-2.5 text-sm font-medium transition-colors hover:bg-muted hover:text-foreground"
+              <InteractiveHoverButton
+                type="button"
+                className="h-9 rounded-lg text-sm"
+                onClick={() => (window.location.href = "/upstreams")}
               >
                 管理上游
-                <ArrowRight className="size-3.5" />
-              </Link>
-              <Link
-                to="/usage"
-                className="inline-flex h-8 items-center gap-1.5 rounded-lg border bg-background px-2.5 text-sm font-medium transition-colors hover:bg-muted hover:text-foreground"
+              </InteractiveHoverButton>
+              <InteractiveHoverButton
+                type="button"
+                className="h-9 rounded-lg text-sm"
+                onClick={() => (window.location.href = "/usage")}
               >
                 查看用量
-                <ArrowRight className="size-3.5" />
-              </Link>
+              </InteractiveHoverButton>
             </div>
           </div>
 
@@ -99,6 +95,11 @@ function DashboardPage() {
             <ShieldCheck className="absolute size-7 text-primary" />
           </div>
         </div>
+        <ProgressiveBlur
+          position="bottom"
+          height="40%"
+          className="rounded-2xl"
+        />
       </BlurFade>
 
       <BentoGrid className="md:grid-cols-2 xl:grid-cols-4">
@@ -136,7 +137,6 @@ function DashboardPage() {
           className="lg:col-span-3"
           title="token 使用"
           description="输入与输出 token 的周期累计。"
-          beam
         >
           <div className="grid gap-4 sm:grid-cols-2">
             <div className="rounded-xl border bg-background/60 p-4">

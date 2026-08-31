@@ -4,8 +4,8 @@ import { useState } from "react"
 import { Button } from "@/components/coss/components/button"
 import { AnimatedGridPattern } from "@/components/magicui/animated-grid-pattern"
 import { AnimatedShinyText } from "@/components/magicui/animated-shiny-text"
-import { BorderBeam } from "@/components/magicui/border-beam"
-import { useTheme } from "@/components/theme-provider"
+import { AnimatedThemeToggler } from "@/components/magicui/animated-theme-toggler"
+import { LightRays } from "@/components/magicui/light-rays"
 import { cn } from "@/lib/utils"
 
 const navigation = [
@@ -47,33 +47,18 @@ function NavLinks({
   )
 }
 
-function ThemeToggle() {
-  const { theme, setTheme } = useTheme()
-  const label =
-    theme === "dark"
-      ? "切换到浅色主题"
-      : theme === "light"
-        ? "切换到深色主题"
-        : "切换主题"
-  return (
-    <Button
-      type="button"
-      variant="outline"
-      size="sm"
-      aria-label={label}
-      className="rounded-full"
-      onClick={() => setTheme(theme === "dark" ? "light" : "dark")}
-    >
-      {theme === "dark" ? "浅色" : "深色"}
-    </Button>
-  )
-}
-
 export function DashboardShell() {
   const [mobileOpen, setMobileOpen] = useState(false)
 
   return (
     <div className="relative min-h-dvh bg-background text-foreground">
+      <LightRays
+        count={5}
+        color="rgba(140, 180, 255, 0.12)"
+        blur={28}
+        speed={18}
+        className="fixed inset-0 -z-10"
+      />
       <AnimatedGridPattern
         numSquares={40}
         maxOpacity={0.08}
@@ -104,7 +89,7 @@ export function DashboardShell() {
         </aside>
 
         <div className="relative flex min-w-0 flex-1 flex-col">
-          <header className="sticky top-0 z-40 overflow-hidden border-b bg-background/82 backdrop-blur-xl">
+          <header className="sticky top-0 z-40 border-b bg-background/82 backdrop-blur-xl">
             <div className="mx-auto flex h-16 w-full max-w-7xl items-center justify-between gap-3 px-4">
               <div className="flex items-center gap-2">
                 <Button
@@ -132,14 +117,8 @@ export function DashboardShell() {
                   管理 · 路由 · 用量审计
                 </AnimatedShinyText>
               </div>
-              <ThemeToggle />
+              <AnimatedThemeToggler className="grid size-9 place-items-center rounded-full border text-foreground/80 transition-colors hover:bg-muted hover:text-foreground [&_svg]:size-4" />
             </div>
-            <BorderBeam
-              size={64}
-              duration={9}
-              colorFrom="var(--primary)"
-              colorTo="var(--ring)"
-            />
           </header>
 
           {mobileOpen ? (
