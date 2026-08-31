@@ -12,6 +12,7 @@ import {
 import { useMemo } from "react"
 
 import { AnimatedCard } from "@/components/animated-card"
+import { Badge } from "@/components/coss/components/badge"
 import { AnimatedShinyText } from "@/components/magicui/animated-shiny-text"
 import { BentoGrid } from "@/components/magicui/bento-grid"
 import { BlurFade } from "@/components/magicui/blur-fade"
@@ -19,7 +20,6 @@ import { MagicCard } from "@/components/magicui/magic-card"
 import { OrbitingCircles } from "@/components/magicui/orbiting-circles"
 import { ShineBorder } from "@/components/magicui/shine-border"
 import { StatCard } from "@/components/stat-card"
-import { Badge } from "@/components/ui/badge"
 import { api } from "@/lib/api"
 
 function DashboardPage() {

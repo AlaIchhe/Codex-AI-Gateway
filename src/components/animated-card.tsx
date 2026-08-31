@@ -1,14 +1,13 @@
 import type { ReactNode } from "react"
-
-import { BlurFade } from "@/components/magicui/blur-fade"
-import { BorderBeam } from "@/components/magicui/border-beam"
 import {
   Card,
   CardContent,
   CardDescription,
   CardHeader,
   CardTitle,
-} from "@/components/ui/card"
+} from "@/components/coss/components/card"
+import { BlurFade } from "@/components/magicui/blur-fade"
+import { BorderBeam } from "@/components/magicui/border-beam"
 
 export function AnimatedCard({
   title,

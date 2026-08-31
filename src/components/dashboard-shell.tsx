@@ -1,12 +1,11 @@
 import { Link, Outlet } from "@tanstack/react-router"
 import { BarChart3, Boxes, Menu, Network, ShieldAlert, X } from "lucide-react"
 import { useState } from "react"
-
+import { Button } from "@/components/coss/components/button"
 import { AnimatedGridPattern } from "@/components/magicui/animated-grid-pattern"
 import { AnimatedShinyText } from "@/components/magicui/animated-shiny-text"
 import { BorderBeam } from "@/components/magicui/border-beam"
 import { useTheme } from "@/components/theme-provider"
-import { Button } from "@/components/ui/button"
 import { cn } from "@/lib/utils"
 
 const navigation = [

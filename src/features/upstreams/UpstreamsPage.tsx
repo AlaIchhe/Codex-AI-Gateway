@@ -12,13 +12,11 @@ import type { PropsWithChildren } from "react"
 import { useEffect, useState } from "react"
 import { toast } from "sonner"
 import { AnimatedCard } from "@/components/animated-card"
-import { PageHeader } from "@/components/page-header"
-import { Alert, AlertDescription } from "@/components/ui/alert"
-import { Badge } from "@/components/ui/badge"
-import { Button } from "@/components/ui/button"
-import { Input } from "@/components/ui/input"
-import { Label } from "@/components/ui/label"
-import { Overlay } from "@/components/ui/overlay"
+import { Alert, AlertDescription } from "@/components/coss/components/alert"
+import { Badge } from "@/components/coss/components/badge"
+import { Button } from "@/components/coss/components/button"
+import { Input } from "@/components/coss/components/input"
+import { Label } from "@/components/coss/components/label"
 import {
   Table,
   TableBody,
@@ -26,7 +24,9 @@ import {
   TableHead,
   TableHeader,
   TableRow,
-} from "@/components/ui/table"
+} from "@/components/coss/components/table"
+import { Overlay } from "@/components/coss/overlay"
+import { PageHeader } from "@/components/page-header"
 import {
   api,
   type PresetCreateValues,
@@ -264,7 +264,7 @@ export function UpstreamsPage() {
         {query.isLoading ? (
           <div className="p-4 text-sm text-muted-foreground">加载中…</div>
         ) : query.isError ? (
-          <Alert variant="destructive">
+          <Alert variant="error">
             <AlertDescription>上游列表加载失败。</AlertDescription>
           </Alert>
         ) : (

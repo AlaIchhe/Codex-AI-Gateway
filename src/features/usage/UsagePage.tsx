@@ -4,13 +4,9 @@ import { useEffect, useMemo, useRef, useState } from "react"
 import { AnimatedCard } from "@/components/animated-card"
 import { UsageBreakdownChart } from "@/components/charts/UsageBreakdownChart"
 import { UsageChart } from "@/components/charts/UsageChart"
-import { BentoGrid } from "@/components/magicui/bento-grid"
-import { PageHeader } from "@/components/page-header"
-import { StatCard } from "@/components/stat-card"
-import { Button } from "@/components/ui/button"
-import { Input } from "@/components/ui/input"
-import { Label } from "@/components/ui/label"
-import { Overlay } from "@/components/ui/overlay"
+import { Button } from "@/components/coss/components/button"
+import { Input } from "@/components/coss/components/input"
+import { Label } from "@/components/coss/components/label"
 import {
   Table,
   TableBody,
@@ -18,7 +14,11 @@ import {
   TableHead,
   TableHeader,
   TableRow,
-} from "@/components/ui/table"
+} from "@/components/coss/components/table"
+import { Overlay } from "@/components/coss/overlay"
+import { BentoGrid } from "@/components/magicui/bento-grid"
+import { PageHeader } from "@/components/page-header"
+import { StatCard } from "@/components/stat-card"
 import { api, type UsageAttempt } from "@/lib/api"
 import { useOverlaySearch } from "@/lib/search-params"
 

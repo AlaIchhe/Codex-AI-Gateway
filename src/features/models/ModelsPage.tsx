@@ -3,9 +3,7 @@ import { useState } from "react"
 import { toast } from "sonner"
 
 import { AnimatedCard } from "@/components/animated-card"
-import { PageHeader } from "@/components/page-header"
-import { Button } from "@/components/ui/button"
-import { Overlay } from "@/components/ui/overlay"
+import { Button } from "@/components/coss/components/button"
 import {
   Table,
   TableBody,
@@ -13,7 +11,9 @@ import {
   TableHead,
   TableHeader,
   TableRow,
-} from "@/components/ui/table"
+} from "@/components/coss/components/table"
+import { Overlay } from "@/components/coss/overlay"
+import { PageHeader } from "@/components/page-header"
 import { api } from "@/lib/api"
 import { useOverlaySearch } from "@/lib/search-params"
 
