@@ -36,12 +36,21 @@ def attempts(
     request: Request,
     from_: str | None = None,
     to: str | None = None,
-) -> list[dict[str, Any]]:
+    limit: int = 50,
+    before: str | None = None,
+) -> dict[str, Any]:
+    """分页返回 attempts 审计（按时间倒序，游标为早于 before 的记录）。"""
     runtime = _runtime(request)
     events = runtime.usage_log.read_events()
     filtered = _filter_events(events, from_, to)
+    filtered.sort(key=lambda ev: ev.get("started_at") or "", reverse=True)
+    if before:
+        filtered = [ev for ev in filtered if (ev.get("started_at") or "") < before]
+    limit = max(1, min(limit, 200))
+    page = filtered[:limit]
+    next_cursor = page[-1].get("started_at") if len(filtered) > limit else None
     service = UsageReportingService(runtime.data_dir)
-    return service.list_attempts(filtered)
+    return {"items": service.list_attempts(page), "next_cursor": next_cursor}
 
 
 def _filter_events(events: list[dict[str, Any]], from_: str | None, to: str | None) -> list[dict[str, Any]]:

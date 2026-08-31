@@ -1,5 +1,5 @@
-import { useMutation, useQuery } from "@tanstack/react-query"
-import { useMemo, useState } from "react"
+import { useInfiniteQuery, useMutation, useQuery } from "@tanstack/react-query"
+import { useEffect, useMemo, useRef, useState } from "react"
 
 import { AnimatedCard } from "@/components/animated-card"
 import { UsageBreakdownChart } from "@/components/charts/UsageBreakdownChart"
@@ -41,10 +41,37 @@ export function UsagePage() {
     queryKey: ["usage-summary", groupBy],
     queryFn: () => api.listUsageSummary(groupBy),
   })
-  const attempts = useQuery({
-    queryKey: ["usage-attempts"],
-    queryFn: api.listUsageAttempts,
+  const attempts = useInfiniteQuery({
+    queryKey: ["usage-attempts", outcome, basis],
+    queryFn: ({ pageParam }) =>
+      api.listUsageAttempts({ limit: 50, before: pageParam }),
+    initialPageParam: undefined as string | undefined,
+    getNextPageParam: (last) => last.next_cursor ?? undefined,
   })
+  const loadMoreRef = useRef<HTMLTableRowElement | null>(null)
+  const allAttempts = useMemo(
+    () => attempts.data?.pages.flatMap((page) => page.items) ?? [],
+    [attempts.data],
+  )
+  useEffect(() => {
+    const node = loadMoreRef.current
+    if (!node) return
+    const observer = new IntersectionObserver((entries) => {
+      if (
+        entries[0]?.isIntersecting &&
+        attempts.hasNextPage &&
+        !attempts.isFetchingNextPage
+      ) {
+        void attempts.fetchNextPage()
+      }
+    })
+    observer.observe(node)
+    return () => observer.disconnect()
+  }, [
+    attempts.hasNextPage,
+    attempts.isFetchingNextPage,
+    attempts.fetchNextPage,
+  ])
   const save = useMutation({
     mutationFn: () => api.updateRetention(Number(retention)),
     onSuccess: () => setRetentionOpen(null),
@@ -66,7 +93,7 @@ export function UsagePage() {
     [rows],
   )
 
-  const filteredAttempts = (attempts.data ?? []).filter((attempt) => {
+  const filteredAttempts = allAttempts.filter((attempt) => {
     const haystack = [
       attempt.canonical_model_label,
       attempt.upstream_label,
@@ -279,13 +306,25 @@ export function UsagePage() {
                 </TableCell>
               </TableRow>
             ))}
-            {!filteredAttempts.length && (
+            {!filteredAttempts.length && !attempts.isLoading && (
               <TableRow>
                 <TableCell
                   colSpan={6}
                   className="text-center text-muted-foreground"
                 >
                   暂无匹配的用量记录。
+                </TableCell>
+              </TableRow>
+            )}
+            {attempts.hasNextPage && (
+              <TableRow ref={loadMoreRef}>
+                <TableCell
+                  colSpan={6}
+                  className="text-center text-muted-foreground"
+                >
+                  {attempts.isFetchingNextPage
+                    ? "加载中…"
+                    : "滚动到底部加载更多"}
                 </TableCell>
               </TableRow>
             )}

@@ -286,3 +286,29 @@
     @apply font-sans;
   }
 }
+
+/* 细主题化滚动条（webkit + firefox，dark/light 自适应） */
+@layer base {
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: var(--color-border) transparent;
+  }
+
+  ::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+  }
+
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+
+  ::-webkit-scrollbar-thumb {
+    border-radius: 9999px;
+    background-color: var(--color-border);
+  }
+
+  ::-webkit-scrollbar-thumb:hover {
+    background-color: var(--color-muted-foreground, var(--color-border));
+  }
+}

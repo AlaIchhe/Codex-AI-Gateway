@@ -1,9 +1,9 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import { useState } from "react"
+import { toast } from "sonner"
 
 import { AnimatedCard } from "@/components/animated-card"
 import { PageHeader } from "@/components/page-header"
-import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Button } from "@/components/ui/button"
 import { Overlay } from "@/components/ui/overlay"
 import {
@@ -22,8 +22,6 @@ export function ModelsPage() {
   const [priorityId, setPriorityId] = useOverlaySearch("priority")
   const [evidenceId, setEvidenceId] = useOverlaySearch("evidence")
   const [order, setOrder] = useState<string[]>([])
-  const [error, setError] = useState<string | null>(null)
-  const [notice, setNotice] = useState<string | null>(null)
   const upstreams = useQuery({
     queryKey: ["upstreams"],
     queryFn: api.listUpstreams,
@@ -38,8 +36,7 @@ export function ModelsPage() {
     void queryClient.invalidateQueries({ queryKey: ["models"] })
   }
   const success = (message: string) => {
-    setError(null)
-    setNotice(message)
+    toast.success(message)
   }
   const saveRouting = useMutation({
     mutationFn: ({ id, ids }: { id: string; ids: string[] }) =>
@@ -49,7 +46,7 @@ export function ModelsPage() {
       success("模型优先级已保存。")
       invalidate()
     },
-    onError: (e: Error) => setError(e.message),
+    onError: (e: Error) => toast.error(e.message),
   })
   const rows = models.data ?? []
   const selectedModel = rows.find((row) => row.id === priorityId)
@@ -78,21 +75,6 @@ export function ModelsPage() {
         title="模型"
         description="系统自动聚合已匹配的规范模型，不提供逐模型启用/禁用开关。"
       />
-      {error && (
-        <Alert variant="destructive" role="alert">
-          <AlertTitle>操作失败</AlertTitle>
-          <AlertDescription>{error}</AlertDescription>
-        </Alert>
-      )}
-      {notice && (
-        <div
-          role="status"
-          aria-live="polite"
-          className="rounded-md border border-emerald-200 bg-emerald-50 px-3 py-2 text-sm text-emerald-900 dark:border-emerald-900 dark:bg-emerald-950 dark:text-emerald-100"
-        >
-          {notice}
-        </div>
-      )}
       <AnimatedCard
         title="规范模型"
         description="可用上游数与优先级摘要来自上游聚合。"

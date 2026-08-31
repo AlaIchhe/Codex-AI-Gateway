@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request
@@ -107,7 +108,11 @@ async def patch_settings(request: Request, patch: SettingsPatch) -> SettingsView
     reopen = patch.codex_auto_integration_enabled is True
     runtime.state_store.mutate(apply)
     if reopen:
-        LocalCodexAutomationService().run_auto_maintenance(runtime, trigger="auto_maintenance.reenabled")
+        await asyncio.to_thread(
+            LocalCodexAutomationService().run_auto_maintenance,
+            runtime,
+            trigger="auto_maintenance.reenabled",
+        )
     return get_settings(request)
 
 
@@ -447,6 +452,17 @@ async def update_upstream(request: Request, upstream_id: str, payload: UpstreamU
     runtime.state_store.mutate(apply)
     if payload.api_credential:
         runtime.secret_store.set_secret(existing.auth_credential_ref, payload.api_credential)
+    status_only = (
+        payload.status is not None
+        and payload.name is None
+        and payload.base_url is None
+        and payload.default_headers is None
+        and not payload.api_credential
+    )
+    if status_only:
+        # 启用/禁用是纯状态切换：路由时本就跳过 disabled 上游，
+        # 无需重跑发现/探测/聚合 pipeline（避免秒级到分钟级阻塞）。
+        return _upstream_view(updated, runtime.state_store.read_state())
     refreshed = await _run_upstream_pipeline(runtime, updated)
     await _offerings(runtime, refreshed)
     await _maybe_aggregate(runtime)
@@ -482,10 +498,17 @@ async def probe(request: Request, upstream_id: str) -> dict[str, Any]:
 
 
 async def _offerings(runtime: Any, upstream: Upstream) -> list[Offering]:
-    """Legacy entry point - delegates to pipeline."""
-    await _run_upstream_pipeline(runtime, upstream)
+    """基于已刷新的 upstream 构建/刷新 offerings 并触发目录自动化。
+
+    注意：调用方必须已自行执行 _run_upstream_pipeline；
+    auto-maintenance 是同步阻塞代码，必须放入线程池，否则会卡死事件循环。
+    """
     await run_catalog_automation(runtime)
-    LocalCodexAutomationService().run_auto_maintenance(runtime, trigger='catalog.changed')
+    await asyncio.to_thread(
+        LocalCodexAutomationService().run_auto_maintenance,
+        runtime,
+        trigger="catalog.changed",
+    )
     return [o for o in runtime.state_store.read_state().offerings if o.upstream_id == upstream.id]
 
 async def _maybe_aggregate(runtime: Any) -> dict[str, int]:
@@ -694,4 +717,8 @@ def _token_view(token: GatewayToken, *, secret: str | None = None) -> GatewayTok
 
 async def _trigger_codex_if_configured(runtime: Any) -> None:
     if runtime.state_store.read_state().integration_profiles:
-        LocalCodexAutomationService().run_auto_maintenance(runtime, trigger="gateway_token.change")
+        await asyncio.to_thread(
+            LocalCodexAutomationService().run_auto_maintenance,
+            runtime,
+            trigger="gateway_token.change",
+        )

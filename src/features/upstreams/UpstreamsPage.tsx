@@ -7,12 +7,13 @@ import {
 } from "@dnd-kit/react"
 import { isSortable, useSortable } from "@dnd-kit/react/sortable"
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
-import { GripVertical } from "lucide-react"
+import { GripVertical, Loader2 } from "lucide-react"
 import type { PropsWithChildren } from "react"
 import { useEffect, useState } from "react"
+import { toast } from "sonner"
 import { AnimatedCard } from "@/components/animated-card"
 import { PageHeader } from "@/components/page-header"
-import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
+import { Alert, AlertDescription } from "@/components/ui/alert"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
@@ -87,7 +88,6 @@ export function UpstreamsPage() {
     api_credential: "",
   })
   const [error, setError] = useState<string | null>(null)
-  const [notice, setNotice] = useState<string | null>(null)
   const [globalOrder, setGlobalOrder] = useState<string[]>([])
   const [draggingId, setDraggingId] = useState<string | null>(null)
   const query = useQuery({
@@ -107,8 +107,7 @@ export function UpstreamsPage() {
     void queryClient.invalidateQueries({ queryKey: ["upstreams"] })
   }
   const success = (message: string) => {
-    setError(null)
-    setNotice(message)
+    toast.success(message)
   }
   const create = useMutation({
     mutationFn: api.createUpstream,
@@ -120,7 +119,7 @@ export function UpstreamsPage() {
       success("上游已创建并完成探测。")
       invalidate()
     },
-    onError: (e: Error) => setError(e.message),
+    onError: (e: Error) => toast.error(e.message),
   })
   const update = useMutation({
     mutationFn: ({ id, body }: { id: string; body: UpstreamUpdateValues }) =>
@@ -130,7 +129,7 @@ export function UpstreamsPage() {
       success("上游已保存。")
       invalidate()
     },
-    onError: (e: Error) => setError(e.message),
+    onError: (e: Error) => toast.error(e.message),
   })
   const updateStatus = useMutation({
     mutationFn: ({
@@ -144,7 +143,7 @@ export function UpstreamsPage() {
       success(variables.status === "enabled" ? "上游已启用。" : "上游已禁用。")
       invalidate()
     },
-    onError: (e: Error) => setError(e.message),
+    onError: (e: Error) => toast.error(e.message),
   })
   const remove = useMutation({
     mutationFn: api.deleteUpstream,
@@ -156,17 +155,7 @@ export function UpstreamsPage() {
       void queryClient.invalidateQueries({ queryKey: ["routing"] })
       void queryClient.invalidateQueries({ queryKey: ["models"] })
     },
-    onError: (e: Error) => setError(e.message),
-  })
-  const probe = useMutation({
-    mutationFn: api.probeUpstream,
-    onSuccess: (upstream) => {
-      success(upstream.protocol_probe_summary || "探测完成。")
-      invalidate()
-      void queryClient.invalidateQueries({ queryKey: ["upstream-offerings"] })
-      void queryClient.invalidateQueries({ queryKey: ["preset-discovery"] })
-    },
-    onError: (e: Error) => setError(e.message),
+    onError: (e: Error) => toast.error(e.message),
   })
   const routing = useQuery({
     queryKey: ["routing"],
@@ -193,7 +182,7 @@ export function UpstreamsPage() {
       success("全局上游顺序已保存。")
       void queryClient.invalidateQueries({ queryKey: ["routing"] })
     },
-    onError: (e: Error) => setError(e.message),
+    onError: (e: Error) => toast.error(e.message),
   })
   const editing = rows.find((row) => row.id === editId)
   const detail = rows.find((row) => row.id === detailId)
@@ -267,21 +256,6 @@ export function UpstreamsPage() {
           </Button>
         }
       />
-      {error && (
-        <Alert variant="destructive" role="alert">
-          <AlertTitle>操作失败</AlertTitle>
-          <AlertDescription>{error}</AlertDescription>
-        </Alert>
-      )}
-      {notice && (
-        <div
-          role="status"
-          aria-live="polite"
-          className="rounded-md border border-emerald-200 bg-emerald-50 px-3 py-2 text-sm text-emerald-900 dark:border-emerald-900 dark:bg-emerald-950 dark:text-emerald-100"
-        >
-          {notice}
-        </div>
-      )}
       <AnimatedCard
         title="上游列表"
         description="拖动行首手柄调整默认路由尝试顺序；系统不在此页面展示协议名称或确认状态。"
@@ -350,13 +324,6 @@ export function UpstreamsPage() {
                         <Button
                           size="sm"
                           variant="outline"
-                          onClick={() => probe.mutate(upstream.id)}
-                        >
-                          重新探测
-                        </Button>
-                        <Button
-                          size="sm"
-                          variant="outline"
                           onClick={() =>
                             openEdit(
                               upstream.id,
@@ -370,6 +337,10 @@ export function UpstreamsPage() {
                         <Button
                           size="sm"
                           variant="outline"
+                          disabled={
+                            updateStatus.isPending &&
+                            updateStatus.variables?.id === upstream.id
+                          }
                           onClick={() =>
                             updateStatus.mutate({
                               id: upstream.id,
@@ -380,13 +351,32 @@ export function UpstreamsPage() {
                             })
                           }
                         >
+                          {updateStatus.isPending &&
+                          updateStatus.variables?.id === upstream.id ? (
+                            <Loader2 className="size-4 animate-spin" />
+                          ) : null}
                           {upstream.status === "enabled" ? "禁用" : "启用"}
                         </Button>
                         <Button
                           size="sm"
                           variant="destructive"
-                          onClick={() => remove.mutate(upstream.id)}
+                          disabled={
+                            remove.isPending && remove.variables === upstream.id
+                          }
+                          onClick={() => {
+                            if (
+                              window.confirm(
+                                `确认删除上游「${upstream.name}」？该操作不可恢复。`,
+                              )
+                            ) {
+                              remove.mutate(upstream.id)
+                            }
+                          }}
                         >
+                          {remove.isPending &&
+                          remove.variables === upstream.id ? (
+                            <Loader2 className="size-4 animate-spin" />
+                          ) : null}
                           删除
                         </Button>
                       </TableCell>
