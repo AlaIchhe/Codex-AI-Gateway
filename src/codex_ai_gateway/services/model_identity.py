@@ -43,6 +43,7 @@ _DATE_MD = re.compile(r"[-:_.@+.]?(\d{2})(\d{2})$")
 # MM-DD 带分隔符形态（如 qwen3.6-plus-04-02），与 canonical_slug 的日期后缀形态一致。
 _DATE_MD_DASHED = re.compile(r"[-:_.@+.]?(\d{2})[-:_.@+.](\d{2})$")
 _SUFFIX_RE = re.compile(r"[-:_.@+.]?(?P<suffix>ga|preview|latest|free|batch|experimental|online|search|reasoning|thinking)$")
+_SUFFIX_CI = re.compile(r"[-:_.@+.]?(?P<suffix>ga|preview|latest|free|batch|experimental|online|search|reasoning|thinking)$", re.IGNORECASE)
 _SEPARATORS = str.maketrans({"/": "-", ":": "-", "_": "-", "@": "-", "+": "-"})
 
 
@@ -195,6 +196,24 @@ def _entry_created(model: dict[str, Any]) -> int | None:
     if isinstance(value, int | float) and not isinstance(value, bool):
         return int(value)
     return None
+
+
+def clean_display_name(raw_name: str) -> str:
+    """清洗 OpenRouter display name：去厂商前缀、日期/数字后缀、滚动别名后缀。"""
+    text = raw_name.strip()
+    if ": " in text:
+        text = text.split(": ", 1)[1]
+    while True:
+        stripped = False
+        for pattern in (_DATE_ISO, _DATE_LONG, _DATE_SHORT, _DATE_MD, _DATE_MD_DASHED, _SUFFIX_CI):
+            match = pattern.search(text)
+            if match:
+                text = text[: match.start()].rstrip(" -_.@+")
+                stripped = True
+                break
+        if not stripped:
+            break
+    return text.strip() or raw_name.strip()
 
 
 def build_standard_catalog(
@@ -369,7 +388,7 @@ def canonical_from_candidate(
     return CanonicalModel(
         id=uuid7(),
         openrouter_model_id=model_id,
-        display_name=str(candidate.get("name") or slug),
+        display_name=clean_display_name(str(candidate.get("name") or slug)),
         slug=slug,
         capability_baseline=candidate,
         status="unavailable",

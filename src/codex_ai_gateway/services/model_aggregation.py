@@ -11,6 +11,7 @@ from codex_ai_gateway.models.entities import (
     UpstreamStatus,
 )
 from codex_ai_gateway.services.model_identity import (
+    clean_display_name,
     MatchResult,
     build_standard_catalog,
     canonical_from_candidate,
@@ -91,8 +92,8 @@ async def aggregate_models(
                         canonical.slug = slug
                     canonical.openrouter_model_id = mapping.openrouter_model_id
                     canonical.capability_baseline = result.candidate
-                    canonical.display_name = str(
-                        result.candidate.get("name") or canonical.display_name
+                    canonical.display_name = clean_display_name(
+                        str(result.candidate.get("name") or canonical.display_name)
                     )
                     canonical.updated_at = now
             else:
