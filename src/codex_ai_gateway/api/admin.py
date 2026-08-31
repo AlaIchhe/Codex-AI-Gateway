@@ -710,6 +710,21 @@ async def delete_model_routing(request: Request, model_id: str) -> dict[str, Any
     return {"scope": "canonical_model", "canonical_model_id": model_id, "deleted": True}
 
 
+@router.delete("/routing/models")
+async def delete_all_model_routing(request: Request) -> dict[str, Any]:
+    """重置所有模型路由优先级：移除全部 canonical_model 自定义排序，回退到全局偏好。"""
+    runtime = _runtime(request)
+
+    def apply(state: Any) -> None:
+        state.routing_preferences = [
+            r for r in state.routing_preferences
+            if r.scope != RoutingScope.canonical_model
+        ]
+
+    runtime.state_store.mutate(apply)
+    return {"scope": "canonical_model", "deleted": "all"}
+
+
 @router.get("/gateway-token")
 async def get_gateway_token(request: Request) -> GatewayTokenView:
     state = _runtime(request).state_store.read_state()

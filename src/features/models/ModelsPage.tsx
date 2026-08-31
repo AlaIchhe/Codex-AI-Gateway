@@ -2,7 +2,7 @@ import { arrayMove } from "@dnd-kit/helpers"
 import { DragDropProvider, type DragEndEvent } from "@dnd-kit/react"
 import { isSortable, useSortable } from "@dnd-kit/react/sortable"
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
-import { GripVertical } from "lucide-react"
+import { GripVertical, RotateCcw } from "lucide-react"
 import { useState } from "react"
 import { toast } from "sonner"
 
@@ -21,6 +21,7 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/coss/components/table"
+import { Overlay } from "@/components/coss/overlay"
 import { PageHeader } from "@/components/page-header"
 import { api } from "@/lib/api"
 import { cn } from "@/lib/utils"
@@ -61,6 +62,7 @@ export function ModelsPage() {
   const queryClient = useQueryClient()
   const [order, setOrder] = useState<string[]>([])
   const [priorityModel, setPriorityModel] = useState<string | null>(null)
+  const [resetConfirmOpen, setResetConfirmOpen] = useState(false)
   const upstreams = useQuery({
     queryKey: ["upstreams"],
     queryFn: api.listUpstreams,
@@ -78,16 +80,19 @@ export function ModelsPage() {
     },
     onError: (e: Error) => toast.error(e.message),
   })
-  const resetRouting = useMutation({
-    mutationFn: (id: string) => api.deleteModelRouting(id),
+  const resetAllRouting = useMutation({
+    mutationFn: () => api.deleteAllModelRouting(),
     onSuccess: () => {
-      toast.success("模型优先级已重置为全局偏好。")
-      setPriorityModel(null)
+      toast.success("已重置所有模型优先级为全局偏好。")
+      setResetConfirmOpen(false)
       invalidate()
     },
     onError: (e: Error) => toast.error(e.message),
   })
   const rows = models.data ?? []
+  const hasCustomRouting = rows.some((m) =>
+    m.priority_summary.includes("自定义"),
+  )
 
   function openPriority(modelId: string, upstreamNames: string[]) {
     setOrder(
@@ -117,6 +122,17 @@ export function ModelsPage() {
       <PageHeader
         title="模型"
         description="系统自动聚合已匹配的规范模型，不提供逐模型启用/禁用开关。"
+        actions={
+          <Button
+            size="sm"
+            variant="outline"
+            disabled={resetAllRouting.isPending || !hasCustomRouting}
+            onClick={() => setResetConfirmOpen(true)}
+          >
+            <RotateCcw className="size-3.5" />
+            {resetAllRouting.isPending ? "重置中…" : "重置为全局优先级"}
+          </Button>
+        }
       />
       <AnimatedCard
         title="规范模型"
@@ -184,22 +200,6 @@ export function ModelsPage() {
                           )}
                         </ul>
                       </DragDropProvider>
-                      <div className="mt-3 border-t pt-2">
-                        <Button
-                          size="sm"
-                          variant="ghost"
-                          className="w-full text-xs text-muted-foreground hover:text-foreground"
-                          disabled={
-                            resetRouting.isPending ||
-                            !model.priority_summary.includes("自定义")
-                          }
-                          onClick={() => resetRouting.mutate(model.id)}
-                        >
-                          {resetRouting.isPending
-                            ? "重置中..."
-                            : "重置为全局优先级"}
-                        </Button>
-                      </div>
                     </PopoverContent>
                   </Popover>
                 </TableCell>
@@ -218,6 +218,32 @@ export function ModelsPage() {
           </TableBody>
         </Table>
       </AnimatedCard>
+      <Overlay
+        open={resetConfirmOpen}
+        onClose={() => setResetConfirmOpen(false)}
+        title="重置所有模型优先级"
+        variant="dialog"
+      >
+        <p className="text-sm text-muted-foreground">
+          将清除所有模型的自定义上游排序，全部回退到全局偏好。此操作不可撤销。
+        </p>
+        <div className="mt-4 flex justify-end gap-2">
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => setResetConfirmOpen(false)}
+          >
+            取消
+          </Button>
+          <Button
+            size="sm"
+            disabled={resetAllRouting.isPending}
+            onClick={() => resetAllRouting.mutate()}
+          >
+            {resetAllRouting.isPending ? "重置中…" : "确认重置"}
+          </Button>
+        </div>
+      </Overlay>
     </section>
   )
 }

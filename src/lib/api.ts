@@ -208,6 +208,10 @@ export const api = {
     request<unknown>(`/admin/routing/models/${id}`, {
       method: "DELETE",
     }),
+  deleteAllModelRouting: () =>
+    request<unknown>("/admin/routing/models", {
+      method: "DELETE",
+    }),
   getGatewayToken: () => request<GatewayTokenView>("/admin/gateway-token"),
   rotateGatewayToken: () =>
     request<GatewayTokenView>("/admin/gateway-token/rotate", {
