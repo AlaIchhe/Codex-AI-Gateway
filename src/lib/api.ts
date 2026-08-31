@@ -66,7 +66,11 @@ export type ModelSummary = {
 }
 
 export type ModelDetail = {
-  model: { id: string; display_name: string; openrouter_model_id: string | null }
+  model: {
+    id: string
+    display_name: string
+    openrouter_model_id: string | null
+  }
   identity_evidence: Array<Record<string, unknown>>
   catalog_candidates: Array<Record<string, unknown>>
   catalog_evidence: Array<Record<string, unknown>>
