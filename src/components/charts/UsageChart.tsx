@@ -5,6 +5,10 @@ export type ChartRow = {
   attempts: number
   provider_reported_input_tokens: number
   estimated_output_tokens: number
+  reasoning_tokens?: number
+  cache_read_tokens?: number
+  cost_minor_units?: number
+  currency?: string
 }
 
 export function UsageChart({ rows }: { rows: ChartRow[] }) {

@@ -9,6 +9,11 @@ import { toast } from "sonner"
 import { AnimatedCard } from "@/components/animated-card"
 import { Button } from "@/components/coss/components/button"
 import {
+  Popover,
+  PopoverContent,
+  PopoverTrigger,
+} from "@/components/coss/components/popover"
+import {
   Table,
   TableBody,
   TableCell,
@@ -56,9 +61,9 @@ function SortableItem({
 
 export function ModelsPage() {
   const queryClient = useQueryClient()
-  const [priorityId, setPriorityId] = useOverlaySearch("priority")
   const [evidenceId, setEvidenceId] = useOverlaySearch("evidence")
   const [order, setOrder] = useState<string[]>([])
+  const [priorityModel, setPriorityModel] = useState<string | null>(null)
   const upstreams = useQuery({
     queryKey: ["upstreams"],
     queryFn: api.listUpstreams,
@@ -76,14 +81,13 @@ export function ModelsPage() {
     mutationFn: ({ id, ids }: { id: string; ids: string[] }) =>
       api.putModelRouting(id, ids),
     onSuccess: () => {
-      setPriorityId(null)
+      setPriorityModel(null)
       toast.success("模型优先级已保存。")
       invalidate()
     },
     onError: (e: Error) => toast.error(e.message),
   })
   const rows = models.data ?? []
-  const selectedModel = rows.find((row) => row.id === priorityId)
 
   function openPriority(modelId: string, upstreamNames: string[]) {
     setOrder(
@@ -91,7 +95,7 @@ export function ModelsPage() {
         ?.filter((u) => upstreamNames.includes(u.name))
         .map((u) => u.id) ?? [],
     )
-    setPriorityId(modelId)
+    setPriorityModel(modelId)
   }
 
   function handleDragEnd(event: DragEndEvent) {
@@ -141,13 +145,68 @@ export function ModelsPage() {
                   >
                     证据
                   </Button>
-                  <Button
-                    size="sm"
-                    variant="outline"
-                    onClick={() => openPriority(model.id, model.upstream_names)}
+                  <Popover
+                    open={priorityModel === model.id}
+                    onOpenChange={(open: boolean) => {
+                      if (open) openPriority(model.id, model.upstream_names)
+                      else setPriorityModel(null)
+                    }}
                   >
-                    优先级
-                  </Button>
+                    <PopoverTrigger
+                      render={(props) => (
+                        <Button {...props} size="sm" variant="outline">
+                          优先级
+                        </Button>
+                      )}
+                    />
+                    <PopoverContent className="w-80" align="end">
+                      <p className="mb-2 text-sm font-medium">
+                        {model.display_name}
+                      </p>
+                      <p className="mb-3 text-xs text-muted-foreground">
+                        拖拽手柄调整上游尝试顺序。
+                      </p>
+                      <DragDropProvider onDragEnd={handleDragEnd}>
+                        <ul
+                          aria-label="上游优先级"
+                          className="max-h-64 space-y-2 overflow-y-auto"
+                        >
+                          {order.map((id, index) => {
+                            const upstream = upstreams.data?.find(
+                              (item) => item.id === id,
+                            )
+                            return (
+                              <SortableItem
+                                key={id}
+                                id={id}
+                                index={index}
+                                label={upstream?.name ?? id}
+                              />
+                            )
+                          })}
+                          {!order.length && (
+                            <li className="text-sm text-muted-foreground">
+                              暂无可排序上游。
+                            </li>
+                          )}
+                        </ul>
+                      </DragDropProvider>
+                      <Button
+                        className="mt-3 w-full"
+                        size="sm"
+                        disabled={saveRouting.isPending || !order.length}
+                        onClick={() =>
+                          priorityModel &&
+                          saveRouting.mutate({
+                            id: priorityModel,
+                            ids: order,
+                          })
+                        }
+                      >
+                        {saveRouting.isPending ? "保存中…" : "保存优先级"}
+                      </Button>
+                    </PopoverContent>
+                  </Popover>
                 </TableCell>
               </TableRow>
             ))}
@@ -164,45 +223,6 @@ export function ModelsPage() {
           </TableBody>
         </Table>
       </AnimatedCard>
-      <Overlay
-        open={Boolean(priorityId)}
-        onClose={() => setPriorityId(null)}
-        title={`优先级管理：${selectedModel?.display_name ?? ""}`}
-      >
-        <div className="space-y-4">
-          <p className="text-sm text-muted-foreground">
-            拖拽手柄调整模型的上游尝试顺序。
-          </p>
-          <DragDropProvider onDragEnd={handleDragEnd}>
-            <ul aria-label="上游优先级" className="space-y-2">
-              {order.map((id, index) => {
-                const upstream = upstreams.data?.find((item) => item.id === id)
-                return (
-                  <SortableItem
-                    key={id}
-                    id={id}
-                    index={index}
-                    label={upstream?.name ?? id}
-                  />
-                )
-              })}
-              {!order.length && (
-                <li className="text-sm text-muted-foreground">
-                  暂无可排序上游。
-                </li>
-              )}
-            </ul>
-          </DragDropProvider>
-          <Button
-            disabled={saveRouting.isPending || !order.length}
-            onClick={() =>
-              priorityId && saveRouting.mutate({ id: priorityId, ids: order })
-            }
-          >
-            {saveRouting.isPending ? "保存中…" : "保存优先级"}
-          </Button>
-        </div>
-      </Overlay>
       <Overlay
         open={Boolean(evidenceId)}
         onClose={() => setEvidenceId(null)}

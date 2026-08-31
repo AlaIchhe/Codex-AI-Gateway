@@ -66,7 +66,7 @@ export function DashboardShell() {
       />
 
       <div className="flex min-h-dvh">
-        <aside className="sticky top-0 hidden h-dvh w-64 shrink-0 flex-col overflow-hidden border-r bg-card/65 p-4 backdrop-blur-xl lg:flex">
+        <aside className="sticky top-0 hidden h-dvh w-64 shrink-0 flex-col overflow-hidden border-r bg-card/65 p-4  lg:flex">
           <Link to="/" className="mb-6 flex items-center gap-3 rounded-xl p-2">
             <span className="grid size-9 place-items-center rounded-xl bg-primary text-primary-foreground shadow-lg">
               <Network className="size-5" />
@@ -89,7 +89,7 @@ export function DashboardShell() {
         </aside>
 
         <div className="relative flex min-w-0 flex-1 flex-col">
-          <header className="sticky top-0 z-40 border-b bg-background/82 backdrop-blur-xl">
+          <header className="sticky top-0 z-40 border-b bg-background/82 ">
             <div className="mx-auto flex h-16 w-full max-w-7xl items-center justify-between gap-3 px-4">
               <div className="flex items-center gap-2">
                 <Button
@@ -122,7 +122,7 @@ export function DashboardShell() {
           </header>
 
           {mobileOpen ? (
-            <div className="border-b bg-background/92 px-4 py-3 backdrop-blur-xl lg:hidden">
+            <div className="border-b bg-background/92 px-4 py-3  lg:hidden">
               <NavLinks onNavigate={() => setMobileOpen(false)} />
             </div>
           ) : null}
@@ -131,7 +131,7 @@ export function DashboardShell() {
             <Outlet />
           </main>
 
-          <footer className="border-t bg-background/70 px-4 py-3 text-center text-xs text-muted-foreground backdrop-blur-xl">
+          <footer className="border-t bg-background/70 px-4 py-3 text-center text-xs text-muted-foreground ">
             无鉴权控制模式：管理端有意不设登录，请在可信网络内使用。
           </footer>
         </div>
