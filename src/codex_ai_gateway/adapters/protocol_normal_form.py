@@ -116,8 +116,14 @@ def _normalize_responses(body: dict[str, Any], model: str, stream: bool) -> Norm
             messages.append(NormalMessage(role="user", content=[{"type": "text", "text": item}]))
             continue
         if not isinstance(item, dict):
-            continue
+            raise UntranslatableCapabilityError(
+                f"input_item:{type(item).__name__}",
+                f"responses input item 必须是对象，收到 {type(item).__name__}",
+            )
         item_type = item.get("type")
+        if item_type is None and ("role" in item or "content" in item):
+            # 无 type 的 role/content 简写按 message 处理
+            item_type = "message"
         if item_type == "message":
             role = item.get("role", "user")
             content = _normalize_content(item.get("content"))
@@ -150,6 +156,12 @@ def _normalize_responses(body: dict[str, Any], model: str, stream: bool) -> Norm
         elif item_type == "reasoning":
             # 普通对话子集不支持 reasoning item 到 chat 的安全映射
             raise UntranslatableCapabilityError("reasoning_item")
+        else:
+            # 未识别的 item 类型显式报错，绝不静默丢弃（丢弃会导致空 messages 上游 400）
+            raise UntranslatableCapabilityError(
+                f"input_item:{item_type or 'unknown'}",
+                f"无法翻译 responses input item: type={item_type!r}",
+            )
 
     tools = _norm_tools(body.get("tools"))
     tool_choice = body.get("tool_choice")

@@ -124,6 +124,7 @@ class IntegrationState(str, Enum):
 
 
 class ProviderErrorType(str, Enum):
+    invalid_request = "invalid_request"
     authentication = "authentication"
     quota_budget = "quota_budget"
     rate_limit = "rate_limit"
@@ -452,3 +453,4 @@ class GatewaySettings(BaseModel):
     debug_capture_enabled: bool = False
     debug_capture_limited: bool = False
     listen_hint: str = "0.0.0.0:8787"
+

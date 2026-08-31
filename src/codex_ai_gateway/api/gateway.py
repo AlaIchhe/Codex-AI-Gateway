@@ -171,7 +171,7 @@ async def _attempt_with_fallback(
                 headers=_public_headers(request),
             )
             if result.status_code in FALLBACK_STATUSES:
-                mapped = _mapped_error(result.status_code, result.body)
+                mapped = _mapped_error(result.status_code, result.body, upstream=upstream)
                 runtime.state_store.mutate(
                     lambda state, upstream=upstream, result=result: _mark_upstream_failure(state, upstream, result.status_code)
                 )
@@ -179,7 +179,7 @@ async def _attempt_with_fallback(
                 last_error = mapped
                 continue
             if result.status_code >= 400:
-                mapped = _mapped_error(result.status_code, result.body)
+                mapped = _mapped_error(result.status_code, result.body, upstream=upstream)
                 _finalize(runtime, event, Outcome.failed, mapped=mapped, status_code=result.status_code)
                 return mapped_response(mapped)
             _finalize_success(runtime, event, result.body)
@@ -190,7 +190,7 @@ async def _attempt_with_fallback(
             )
         except Exception as exc:
             logger.warning("upstream attempt failed: %s", type(exc).__name__)
-            mapped = _mapped_error(502, b"", error=exc)
+            mapped = _mapped_error(502, b"", error=exc, upstream=upstream)
             runtime.state_store.mutate(lambda state, upstream=upstream: _mark_upstream_failure(state, upstream, None))
             _finalize(runtime, event, Outcome.failed, mapped=mapped, status_code=502, fallback_trigger="connection_failure")
             last_error = mapped
@@ -233,11 +233,18 @@ def _new_event(runtime: Runtime, canonical_id: str, offering: Any, upstream: Ups
     )
 
 
-def _mapped_error(status_code: int, body: bytes, *, error: Exception | None = None) -> GatewayError:
+def _mapped_error(
+    status_code: int,
+    body: bytes,
+    *,
+    error: Exception | None = None,
+    upstream: Any = None,
+) -> GatewayError:
     provider = map_provider_error(
         status_code,
         body=body,
         error_text=str(error) if error else None,
+        upstream_name=getattr(upstream, "name", None),
     )
     return GatewayError(
         error_type="provider_error",
@@ -280,7 +287,7 @@ async def _stream_response(
     if upstream_stream.status_code >= 400:
         error_body = await upstream_stream.read_error_body()
         await upstream_stream.aclose()
-        mapped = _mapped_error(upstream_stream.status_code, error_body)
+        mapped = _mapped_error(upstream_stream.status_code, error_body, upstream=upstream)
         _finalize(runtime, event, Outcome.failed, mapped=mapped, status_code=upstream_stream.status_code)
         return mapped_response(mapped)
 
@@ -324,7 +331,7 @@ async def _stream_response(
                 ))
             _finalize_success(runtime, event, b"", streaming=True)
         except Exception as exc:
-            _finalize(runtime, event, Outcome.failed if started else Outcome.interrupted, mapped=_mapped_error(502, b"", error=exc), status_code=502)
+            _finalize(runtime, event, Outcome.failed if started else Outcome.interrupted, mapped=_mapped_error(502, b"", error=exc, upstream=upstream), status_code=502)
             raise
         finally:
             await upstream_stream.aclose()
