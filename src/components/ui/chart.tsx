@@ -7,7 +7,6 @@ import { cn } from "@/lib/utils"
 // Format: { THEME_NAME: CSS_SELECTOR }
 const THEMES = { light: "", dark: ".dark" } as const
 
-const INITIAL_DIMENSION = { width: 320, height: 200 } as const
 type TooltipNameType = number | string
 
 export type ChartConfig = Record<
@@ -23,6 +22,11 @@ export type ChartConfig = Record<
 
 type ChartContextProps = {
   config: ChartConfig
+}
+
+type ChartSize = {
+  width: number
+  height: number
 }
 
 const ChartContext = React.createContext<ChartContextProps | null>(null)
@@ -42,24 +46,57 @@ function ChartContainer({
   className,
   children,
   config,
-  initialDimension = INITIAL_DIMENSION,
   ...props
 }: React.ComponentProps<"div"> & {
   config: ChartConfig
   children: React.ComponentProps<
     typeof RechartsPrimitive.ResponsiveContainer
   >["children"]
-  initialDimension?: {
-    width: number
-    height: number
-  }
 }) {
   const uniqueId = React.useId()
   const chartId = `chart-${id ?? uniqueId.replace(/:/g, "")}`
+  const [container, setContainer] = React.useState<HTMLDivElement | null>(null)
+  const [size, setSize] = React.useState<ChartSize | null>(null)
+
+  // Recharts treats a 0-sized context as "do not render", which can temporarily
+  // unmount chart children during route/data transitions. Measure the real box
+  // first and keep the last positive size if the card is briefly hidden.
+  React.useLayoutEffect(() => {
+    if (!container) return
+
+    let resizeFrame: number | null = null
+
+    const updateSize = () => {
+      const rect = container.getBoundingClientRect()
+      const width = Math.round(rect.width)
+      const height = Math.round(rect.height)
+
+      if (width <= 0 || height <= 0) return
+
+      setSize((previous) =>
+        previous?.width === width && previous?.height === height
+          ? previous
+          : { width, height },
+      )
+    }
+
+    updateSize()
+    const observer = new ResizeObserver(() => {
+      if (resizeFrame !== null) cancelAnimationFrame(resizeFrame)
+      resizeFrame = requestAnimationFrame(updateSize)
+    })
+    observer.observe(container)
+
+    return () => {
+      if (resizeFrame !== null) cancelAnimationFrame(resizeFrame)
+      observer.disconnect()
+    }
+  }, [container])
 
   return (
     <ChartContext.Provider value={{ config }}>
       <div
+        ref={setContainer}
         data-slot="chart"
         data-chart={chartId}
         className={cn(
@@ -69,11 +106,11 @@ function ChartContainer({
         {...props}
       >
         <ChartStyle id={chartId} config={config} />
-        <RechartsPrimitive.ResponsiveContainer
-          initialDimension={initialDimension}
-        >
-          {children}
-        </RechartsPrimitive.ResponsiveContainer>
+        {size ? (
+          <RechartsPrimitive.ResponsiveContainer initialDimension={size}>
+            {children}
+          </RechartsPrimitive.ResponsiveContainer>
+        ) : null}
       </div>
     </ChartContext.Provider>
   )

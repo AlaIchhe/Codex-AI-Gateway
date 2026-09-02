@@ -1,9 +1,5 @@
-import { lazy, type ReactNode, Suspense } from "react"
-
-const RechartsResponsive = lazy(async () => {
-  const mod = await import("recharts")
-  return { default: mod.ResponsiveContainer }
-})
+import type { ReactNode } from "react"
+import { ResponsiveContainer } from "recharts"
 
 export function ChartFrame({
   testId,
@@ -21,17 +17,9 @@ export function ChartFrame({
       role="img"
       aria-label={label}
     >
-      <Suspense
-        fallback={
-          <div className="flex h-full items-center justify-center text-sm text-muted-foreground">
-            图表加载中…
-          </div>
-        }
-      >
-        <RechartsResponsive width="100%" height="100%">
-          {children}
-        </RechartsResponsive>
-      </Suspense>
+      <ResponsiveContainer width="100%" height="100%">
+        {children}
+      </ResponsiveContainer>
     </div>
   )
 }
