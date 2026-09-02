@@ -71,13 +71,13 @@ PROBE_MODEL_BATCH_DELAY_SECONDS = 2.0
 
 
 def _probe_body(protocol: WireProtocol, model_id: str) -> dict[str, Any]:
-    """构造 max_output_tokens=1 的极简探测请求体。"""
+    """构造 max_output_tokens=16 的极简探测请求体。"""
     if protocol == WireProtocol.responses:
-        return {"model": model_id, "input": "hi", "max_output_tokens": 1}
+        return {"model": model_id, "input": "hi", "max_output_tokens": 16}
     return {
         "model": model_id,
         "messages": [{"role": "user", "content": "hi"}],
-        "max_tokens": 1,
+        "max_tokens": 16,
     }
 
 

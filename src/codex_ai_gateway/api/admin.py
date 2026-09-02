@@ -266,7 +266,8 @@ async def _run_upstream_pipeline(runtime: Any, upstream: Upstream) -> Upstream:
 
     # Phase 2: incremental diff - only probe new models
     existing_probe = dict(upstream.model_protocol_probe or {})
-    to_probe = [mid for mid in model_ids if mid not in existing_probe]
+    to_probe = [mid for mid in model_ids
+            if mid not in existing_probe or not existing_probe[mid]]
     removed = [mid for mid in existing_probe if mid not in set(model_ids)]
 
     # Phase 3: probe model protocols (batched)
