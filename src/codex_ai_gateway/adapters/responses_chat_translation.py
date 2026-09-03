@@ -54,14 +54,16 @@ def chat_request_from_normal(normal: NormalRequest, *, target_model: str) -> dic
 
 
 def _merge_and_prune_tool_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """规范化 Chat 消息列表，保证 assistant tool_calls 后紧跟 tool 响应。
+    """规范化 Chat 消息列表，保证 assistant tool_calls 与 tool 响应相邻。
 
     Responses 输入可能把文本和 tool call 拆成两个 assistant item，
     或者在带 tool_calls 的 assistant 消息后没有对应的 tool 响应。Chat
     Completions 要求 assistant tool_calls 消息必须紧随同轮 tool 响应，
     这里做两步处理：
-    1. 合并相邻 assistant 纯文本和 assistant tool_calls 为单条消息
-    2. 剪除缺少 tool 响应的 tool_calls（以及孤立 tool 消息）
+    1. 合并相邻 assistant 纯文本和 assistant tool_calls 为单条消息，
+       丢弃既无文本也无 tool_calls 的空 assistant 消息
+    2. 以 tool_calls 消息为锚点向前扫描，把夹在中间的 assistant 文本
+       并入锚点消息、收集 tool 响应，按 call_id 重建合法序列
     """
     # 1) 把相邻的 assistant 纯文本与 tool_calls 合并成单条
     merged: list[dict[str, Any]] = []
@@ -69,52 +71,63 @@ def _merge_and_prune_tool_messages(messages: list[dict[str, Any]]) -> list[dict[
         if msg.get("role") != "assistant":
             merged.append(msg)
             continue
-        content = msg.get("content")
+        content = msg.get("content") or None
         calls = msg.get("tool_calls")
         if calls and not content and merged and merged[-1].get("role") == "assistant":
             prev = merged[-1]
             if prev.get("content") and not prev.get("tool_calls"):
-                prev["tool_calls"] = calls
+                merged[-1] = {**prev, "tool_calls": calls}
                 continue
         if content and not calls and merged and merged[-1].get("role") == "assistant":
             prev = merged[-1]
             if prev.get("tool_calls") and not prev.get("content"):
-                prev["content"] = content
+                merged[-1] = {**prev, "content": content}
                 continue
+        if not calls and not content:
+            continue
         merged.append(msg)
 
-    # 扫描并剪除未被 tool 响应的 assistant tool_calls
+    # 以 tool_calls 为锚点重建序列：锚点之间夹带的 assistant 文本并入锚点，
+    # tool 响应只保留与保留下的 tool_calls 匹配的部分
     result: list[dict[str, Any]] = []
-    i = 0
-    while i < len(merged):
+    i, n = 0, len(merged)
+    while i < n:
         msg = merged[i]
         if msg.get("role") != "assistant" or not msg.get("tool_calls"):
+            if msg.get("role") == "tool":
+                # 前面没有任何 tool_calls 锚点可承接的孤立 tool 响应
+                i += 1
+                continue
             result.append(msg)
             i += 1
             continue
 
-        # 收集之后连续 tool 消息块
+        content = msg.get("content")
+        calls = list(msg["tool_calls"])
         j = i + 1
         tool_block: list[dict[str, Any]] = []
         responded_ids: set[str] = set()
-        while j < len(merged) and merged[j].get("role") == "tool":
-            tool_block.append(merged[j])
-            if merged[j].get("tool_call_id"):
-                responded_ids.add(merged[j]["tool_call_id"])
+        while j < n and merged[j].get("role") in ("assistant", "tool"):
+            nxt = merged[j]
+            if nxt.get("role") == "assistant":
+                if nxt.get("tool_calls"):
+                    calls.extend(nxt["tool_calls"])
+                if nxt.get("content"):
+                    content = (content or "") + str(nxt["content"])
+                j += 1
+                continue
+            tool_block.append(nxt)
+            if nxt.get("tool_call_id"):
+                responded_ids.add(nxt["tool_call_id"])
             j += 1
 
-        call_ids = {tc.get("id") for tc in msg["tool_calls"] if tc.get("id")}
-        missing = call_ids - responded_ids
-        kept_calls = [tc for tc in msg["tool_calls"] if tc.get("id") not in missing]
+        kept_calls = [tc for tc in calls if tc.get("id") and tc.get("id") in responded_ids]
 
         if keps := kept_calls:
-            new_msg = dict(msg)
-            new_msg["tool_calls"] = keps
-            result.append(new_msg)
+            result.append({"role": "assistant", "content": content, "tool_calls": keps})
         elif msg.get("content"):
-            result.append({"role": "assistant", "content": msg.get("content")})
+            result.append({"role": "assistant", "content": content})
 
-        # 只保留与被保留 tool_calls 匹配的 tool 响应
         kept_ids = {tc.get("id") for tc in kept_calls}
         result.extend(tm for tm in tool_block if tm.get("tool_call_id") in kept_ids)
         i = j

@@ -396,6 +396,7 @@ async def _stream_response(
     async def iterator() -> AsyncIterator[bytes]:
         started = False
         stream_initialized = False
+        message_started = False
         accumulated_text = ""
         accumulated_tool_calls: dict[int, dict[str, Any]] = {}
         last_chat_chunk: dict[str, Any] | None = None
@@ -453,13 +454,15 @@ async def _stream_response(
                         last_finish_reason = choice_zero["finish_reason"]
                     if not stream_initialized:
                         yield response_sse(response_created_event(model_label))
-                        for lifecycle_event in response_message_started_events():
-                            yield response_sse(lifecycle_event)
                         stream_initialized = True
 
                     translated = translate_chat_chunk_to_response_event(parsed)
                     if translated is not None:
                         if translated.get("type") == "response.output_text.delta":
+                            if not message_started:
+                                for lifecycle_event in response_message_started_events():
+                                    yield response_sse(lifecycle_event)
+                                message_started = True
                             accumulated_text += str(translated.get("delta", ""))
                         yield response_sse(translated)
 
@@ -506,17 +509,23 @@ async def _stream_response(
                     translated = translate_chat_chunk_to_response_event(parsed)
                     if translated is not None:
                         if translated.get("type") == "response.output_text.delta":
+                            if not message_started:
+                                for lifecycle_event in response_message_started_events():
+                                    yield response_sse(lifecycle_event)
+                                message_started = True
                             accumulated_text += str(translated.get("delta", ""))
                         yield response_sse(translated)
 
             if is_chat:
                 if not stream_initialized:
                     yield response_sse(response_created_event(model_label))
-                    for lifecycle_event in response_message_started_events():
-                        yield response_sse(lifecycle_event)
+                    stream_initialized = True
 
-                for done_ev in response_content_part_done_events(accumulated_text):
-                    yield response_sse(done_ev)
+                # 纯 tool call 回合不产生空 assistant message，
+                # 否则 Codex 回放历史时会在 tool_calls 与 tool 响应之间插入空消息
+                if message_started:
+                    for done_ev in response_content_part_done_events(accumulated_text):
+                        yield response_sse(done_ev)
 
                 # Send tool_call done events
                 if accumulated_tool_calls:
@@ -526,7 +535,8 @@ async def _stream_response(
                     ):
                         yield response_sse(tc_done)
 
-                yield response_sse(response_message_done_event(accumulated_text))
+                if message_started:
+                    yield response_sse(response_message_done_event(accumulated_text))
 
                 output_items: list[dict[str, Any]] = []
                 for i in sorted(accumulated_tool_calls):

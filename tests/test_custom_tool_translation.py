@@ -99,6 +99,24 @@ def test_prune_tool_calls_without_tool_response():
     assert pruned[2]["role"] == "user"
 
 
+def test_merge_drops_empty_assistant_between_tool_calls_and_response():
+    messages = [
+        {"role": "developer", "content": "instructions"},
+        {"role": "assistant", "content": None, "tool_calls": [{"id": "c1"}]},
+        {"role": "assistant", "content": ""},
+        {"role": "tool", "tool_call_id": "c1", "content": "done"},
+    ]
+    merged = _merge_and_prune_tool_messages(messages)
+    assert [m["role"] for m in merged] == ["developer", "assistant", "tool"]
+    assert merged[1]["tool_calls"] == [{"id": "c1"}]
+    assert merged[2]["tool_call_id"] == "c1"
+
+
+def test_merge_drops_standalone_empty_assistant():
+    merged = _merge_and_prune_tool_messages([{"role": "assistant", "content": ""}])
+    assert merged == []
+
+
 def test_custom_tool_missing_name_fails_closed():
     with pytest.raises(UntranslatableCapabilityError):
         normalize_request(
