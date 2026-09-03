@@ -158,6 +158,15 @@ def test_tool_call_chunk_without_content_translates_to_no_events():
     ) is None
 
 
+def test_content_chunk_translates_to_single_delta_event():
+    event = translate_chat_chunk_to_response_event(
+        {"choices": [{"delta": {"content": "hello"}}]}
+    )
+    assert event is not None
+    assert event["type"] == "response.output_text.delta"
+    assert event["delta"] == "hello"
+
+
 def _routing_state():
     now = datetime.now(UTC).isoformat()
     upstream = Upstream(
