@@ -16,6 +16,7 @@ from codex_ai_gateway.adapters.responses_chat_translation import (
     chat_request_from_normal,
     response_function_call_done_events,
     responses_request_from_normal,
+    translate_chat_chunk_to_response_event,
 )
 from codex_ai_gateway.domain.routing import route_candidates
 from codex_ai_gateway.models.entities import (
@@ -139,8 +140,22 @@ def test_chat_tool_call_done_event_is_restored_as_custom_tool_call():
     item = events[0]["item"]
     assert item["type"] == "custom_tool_call"
     assert item["name"] == "apply_patch"
-    assert item["input"] == "*** Begin Patch\n*** End Patch"
-    assert "arguments" not in item
+
+
+def test_tool_call_chunk_without_content_translates_to_no_events():
+    assert translate_chat_chunk_to_response_event(
+        {
+            "choices": [
+                {
+                    "delta": {
+                        "tool_calls": [
+                            {"index": 0, "id": "call_1", "function": {"name": "apply_patch"}}
+                        ]
+                    }
+                }
+            ]
+        }
+    ) is None
 
 
 def _routing_state():

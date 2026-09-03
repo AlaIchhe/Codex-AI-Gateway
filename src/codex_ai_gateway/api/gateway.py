@@ -450,7 +450,7 @@ async def _stream_response(
                             yield response_sse(lifecycle_event)
                         stream_initialized = True
 
-                    translated_list = translate_chat_chunk_to_response_event(parsed)
+                    translated_list = translate_chat_chunk_to_response_event(parsed) or []
                     for translated in translated_list:
                         if translated.get("type") == "response.output_text.delta":
                             accumulated_text += str(translated.get("delta", ""))
@@ -485,7 +485,7 @@ async def _stream_response(
 
             if is_chat:
                 for parsed in sse_buffer.flush():
-                    translated_list = translate_chat_chunk_to_response_event(parsed)
+                    translated_list = translate_chat_chunk_to_response_event(parsed) or []
                     for translated in translated_list:
                         if translated.get("type") == "response.output_text.delta":
                             accumulated_text += str(translated.get("delta", ""))
