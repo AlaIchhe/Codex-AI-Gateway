@@ -13,6 +13,7 @@ from codex_ai_gateway.adapters.protocol_normal_form import (
     normalize_request,
 )
 from codex_ai_gateway.adapters.responses_chat_translation import (
+    _merge_and_prune_tool_messages,
     chat_request_from_normal,
     response_completed_event,
     response_content_part_done_events,
@@ -52,6 +53,50 @@ def test_custom_tool_lowers_to_input_function():
     assert lowered["type"] == "function"
     assert lowered["function"]["name"] == "apply_patch"
     assert lowered["function"]["parameters"]["required"] == ["input"]
+
+
+def test_merge_split_assistant_content_and_tool_calls_for_chat():
+    messages = [
+        {"role": "assistant", "content": None, "tool_calls": [{"id": "c1"}]},
+        {"role": "assistant", "content": "text"},
+        {"role": "tool", "tool_call_id": "c1", "content": "done"},
+    ]
+    merged = _merge_and_prune_tool_messages(messages)
+    assert len(merged) == 2
+    assert merged[0]["role"] == "assistant"
+    assert merged[0]["content"] == "text"
+    assert merged[0]["tool_calls"] == [{"id": "c1"}]
+    assert merged[1]["role"] == "tool"
+
+    reversed_messages = [
+        {"role": "assistant", "content": "text"},
+        {"role": "assistant", "content": None, "tool_calls": [{"id": "c2"}]},
+        {"role": "tool", "tool_call_id": "c2", "content": "done"},
+    ]
+    merged_reversed = _merge_and_prune_tool_messages(reversed_messages)
+    assert len(merged_reversed) == 2
+    assert merged_reversed[0]["content"] == "text"
+    assert merged_reversed[0]["tool_calls"] == [{"id": "c2"}]
+
+
+def test_prune_tool_calls_without_tool_response():
+    messages = [
+        {
+            "role": "assistant",
+            "content": "text",
+            "tool_calls": [
+                {"id": "c1", "function": {"name": "shell", "arguments": "{}"}},
+                {"id": "c2", "function": {"name": "apply_patch", "arguments": "{}"}},
+            ],
+        },
+        {"role": "tool", "tool_call_id": "c1", "content": "done"},
+        {"role": "user", "content": "continue"},
+    ]
+    pruned = _merge_and_prune_tool_messages(messages)
+    assert len(pruned) == 3
+    assert [tc["id"] for tc in pruned[0]["tool_calls"]] == ["c1"]
+    assert pruned[1]["tool_call_id"] == "c1"
+    assert pruned[2]["role"] == "user"
 
 
 def test_custom_tool_missing_name_fails_closed():

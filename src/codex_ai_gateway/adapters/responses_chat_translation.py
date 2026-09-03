@@ -14,9 +14,10 @@ def chat_request_from_normal(normal: NormalRequest, *, target_model: str) -> dic
     messages = []
     if normal.extra.get("instructions"):
         messages.append({"role": "system", "content": str(normal.extra["instructions"])})
+    raw_messages: list[dict[str, Any]] = []
     for msg in normal.messages:
         if msg.role == "tool":
-            messages.append(
+            raw_messages.append(
                 {
                     "role": "tool",
                     "tool_call_id": msg.tool_call_id,
@@ -24,7 +25,7 @@ def chat_request_from_normal(normal: NormalRequest, *, target_model: str) -> dic
                 }
             )
         elif msg.tool_calls:
-            messages.append(
+            raw_messages.append(
                 {
                     "role": msg.role,
                     "content": _concat_parts(msg.content) or None,
@@ -33,7 +34,8 @@ def chat_request_from_normal(normal: NormalRequest, *, target_model: str) -> dic
             )
         else:
             chat_role = "system" if msg.role == "developer" else msg.role
-            messages.append({"role": chat_role, "content": _concat_parts(msg.content)})
+            raw_messages.append({"role": chat_role, "content": _concat_parts(msg.content)})
+    messages = _merge_and_prune_tool_messages(raw_messages)
     body: dict[str, Any] = {
         "model": target_model,
         "messages": messages,
@@ -49,6 +51,75 @@ def chat_request_from_normal(normal: NormalRequest, *, target_model: str) -> dic
     if normal.tool_choice is not None:
         body["tool_choice"] = normal.tool_choice
     return body
+
+
+def _merge_and_prune_tool_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """规范化 Chat 消息列表，保证 assistant tool_calls 后紧跟 tool 响应。
+
+    Responses 输入可能把文本和 tool call 拆成两个 assistant item，
+    或者在带 tool_calls 的 assistant 消息后没有对应的 tool 响应。Chat
+    Completions 要求 assistant tool_calls 消息必须紧随同轮 tool 响应，
+    这里做两步处理：
+    1. 合并相邻 assistant 纯文本和 assistant tool_calls 为单条消息
+    2. 剪除缺少 tool 响应的 tool_calls（以及孤立 tool 消息）
+    """
+    # 1) 把相邻的 assistant 纯文本与 tool_calls 合并成单条
+    merged: list[dict[str, Any]] = []
+    for msg in messages:
+        if msg.get("role") != "assistant":
+            merged.append(msg)
+            continue
+        content = msg.get("content")
+        calls = msg.get("tool_calls")
+        if calls and not content and merged and merged[-1].get("role") == "assistant":
+            prev = merged[-1]
+            if prev.get("content") and not prev.get("tool_calls"):
+                prev["tool_calls"] = calls
+                continue
+        if content and not calls and merged and merged[-1].get("role") == "assistant":
+            prev = merged[-1]
+            if prev.get("tool_calls") and not prev.get("content"):
+                prev["content"] = content
+                continue
+        merged.append(msg)
+
+    # 扫描并剪除未被 tool 响应的 assistant tool_calls
+    result: list[dict[str, Any]] = []
+    i = 0
+    while i < len(merged):
+        msg = merged[i]
+        if msg.get("role") != "assistant" or not msg.get("tool_calls"):
+            result.append(msg)
+            i += 1
+            continue
+
+        # 收集之后连续 tool 消息块
+        j = i + 1
+        tool_block: list[dict[str, Any]] = []
+        responded_ids: set[str] = set()
+        while j < len(merged) and merged[j].get("role") == "tool":
+            tool_block.append(merged[j])
+            if merged[j].get("tool_call_id"):
+                responded_ids.add(merged[j]["tool_call_id"])
+            j += 1
+
+        call_ids = {tc.get("id") for tc in msg["tool_calls"] if tc.get("id")}
+        missing = call_ids - responded_ids
+        kept_calls = [tc for tc in msg["tool_calls"] if tc.get("id") not in missing]
+
+        if keps := kept_calls:
+            new_msg = dict(msg)
+            new_msg["tool_calls"] = keps
+            result.append(new_msg)
+        elif msg.get("content"):
+            result.append({"role": "assistant", "content": msg.get("content")})
+
+        # 只保留与被保留 tool_calls 匹配的 tool 响应
+        kept_ids = {tc.get("id") for tc in kept_calls}
+        result.extend(tm for tm in tool_block if tm.get("tool_call_id") in kept_ids)
+        i = j
+
+    return result
 
 
 def responses_request_from_normal(normal: NormalRequest, *, target_model: str) -> dict[str, Any]:
