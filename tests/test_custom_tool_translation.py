@@ -1,0 +1,172 @@
+"""Responses custom tool 降级到 Chat function 的双向映射测试。"""
+
+from __future__ import annotations
+
+from datetime import UTC, datetime
+from types import SimpleNamespace
+
+import pytest
+
+from codex_ai_gateway.adapters.protocol_normal_form import (
+    UntranslatableCapabilityError,
+    normalize_request,
+)
+from codex_ai_gateway.adapters.responses_chat_translation import (
+    chat_request_from_normal,
+    response_function_call_done_events,
+    responses_request_from_normal,
+)
+from codex_ai_gateway.domain.routing import route_candidates
+from codex_ai_gateway.models.entities import (
+    CanonicalModel,
+    Offering,
+    OfferingStatus,
+    RoutingPreference,
+    RoutingScope,
+    Upstream,
+    UpstreamStatus,
+    WireProtocol,
+)
+
+
+def test_custom_tool_lowers_to_input_function():
+    normal = normalize_request(
+        inbound_protocol="responses",
+        body={
+            "model": "mimo-v2.5-pro",
+            "input": "hi",
+            "tools": [
+                {"type": "function", "name": "shell", "parameters": {"type": "object"}},
+                {"type": "custom", "name": "apply_patch", "description": "Patch files."},
+            ],
+        },
+    )
+    assert normal.custom_tool_names == {"apply_patch"}
+    assert normal.tools[0]["type"] == "function"
+    lowered = normal.tools[1]
+    assert lowered["type"] == "function"
+    assert lowered["function"]["name"] == "apply_patch"
+    assert lowered["function"]["parameters"]["required"] == ["input"]
+
+
+def test_custom_tool_missing_name_fails_closed():
+    with pytest.raises(UntranslatableCapabilityError):
+        normalize_request(
+            inbound_protocol="responses",
+            body={"model": "m", "tools": [{"type": "custom"}]},
+        )
+
+
+def test_custom_call_history_round_trips_through_chat_arguments():
+    normal = normalize_request(
+        inbound_protocol="responses",
+        body={
+            "model": "m",
+            "input": [
+                {
+                    "type": "custom_tool_call",
+                    "call_id": "call_1",
+                    "name": "apply_patch",
+                    "input": "*** Begin Patch\n*** End Patch",
+                },
+                {"type": "custom_tool_call_output", "call_id": "call_1", "output": "done"},
+            ],
+            "tools": [{"type": "custom", "name": "apply_patch"}],
+        },
+    )
+    assert normal.messages[0].tool_calls[0]["function"]["name"] == "apply_patch"
+    chat = chat_request_from_normal(normal, target_model="upstream-mimo")
+    assert '"input"' in chat["messages"][0]["tool_calls"][0]["function"]["arguments"]
+    assert chat["messages"][1]["role"] == "tool"
+    assert chat["messages"][1]["tool_call_id"] == "call_1"
+
+    responses = responses_request_from_normal(normal, target_model="client-mimo")
+    assert responses["input"][0]["type"] == "custom_tool_call"
+    assert responses["input"][0]["input"] == "*** Begin Patch\n*** End Patch"
+    assert responses["tools"][0]["type"] == "custom"
+
+
+def test_chat_tool_call_done_event_is_restored_as_custom_tool_call():
+    events = response_function_call_done_events(
+        [
+            {
+                "index": 0,
+                "id": "call_1",
+                "function": {
+                    "name": "apply_patch",
+                    "arguments": '{"input":"*** Begin Patch\\n*** End Patch"}',
+                },
+            }
+        ],
+        custom_tool_names={"apply_patch"},
+    )
+    item = events[0]["item"]
+    assert item["type"] == "custom_tool_call"
+    assert item["name"] == "apply_patch"
+    assert item["input"] == "*** Begin Patch\n*** End Patch"
+    assert "arguments" not in item
+
+
+def _routing_state():
+    now = datetime.now(UTC).isoformat()
+    upstream = Upstream(
+        id="upstream-1",
+        name="TokenDance",
+        base_url="https://example.test/v1",
+        auth_credential_ref="test",
+        status=UpstreamStatus.enabled,
+        created_at=now,
+        updated_at=now,
+    )
+    canonical = CanonicalModel(
+        id="canonical-1",
+        display_name="MiMo",
+        slug="mimo",
+        status="available",
+        first_matched_at=now,
+        updated_at=now,
+    )
+    responses_offering = Offering(
+        id="offering-responses",
+        upstream_id=upstream.id,
+        provider_model_id="mimo-v2.5-pro",
+        wire_protocol=WireProtocol.responses,
+        display_name="MiMo Responses",
+        status=OfferingStatus.approved,
+        canonical_model_id=canonical.id,
+        discovered_at=now,
+        updated_at=now,
+    )
+    chat_offering = Offering(
+        id="offering-chat",
+        upstream_id=upstream.id,
+        provider_model_id="mimo-v2.5-pro",
+        wire_protocol=WireProtocol.chat_completions,
+        display_name="MiMo Chat",
+        status=OfferingStatus.approved,
+        canonical_model_id=canonical.id,
+        discovered_at=now,
+        updated_at=now,
+    )
+    state = SimpleNamespace(
+        upstreams=[upstream],
+        canonical_models=[canonical],
+        offerings=[responses_offering, chat_offering],
+        routing_preferences=[
+            RoutingPreference(
+                id="pref-1",
+                scope=RoutingScope.global_preference,
+                ordered_upstream_ids=[upstream.id],
+                updated_at=now,
+            )
+        ],
+    )
+    return state, canonical
+
+
+def test_route_candidates_prefers_chat_when_request_has_custom_tool():
+    state, canonical = _routing_state()
+    assert route_candidates(state, canonical)[0][2] == WireProtocol.responses
+    assert route_candidates(state, canonical, prefer_chat=True)[0][2] == (
+        WireProtocol.chat_completions
+    )

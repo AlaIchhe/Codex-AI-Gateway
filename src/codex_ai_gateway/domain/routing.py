@@ -1,4 +1,4 @@
-""""规范模型路由与备用上游顺序。"""
+""" "规范模型路由与备用上游顺序。"""
 
 from __future__ import annotations
 
@@ -61,7 +61,7 @@ def resolve_canonical_model(state: Any, model: str) -> CanonicalModel:
 
 
 def route_candidates(
-    state: Any, canonical: CanonicalModel
+    state: Any, canonical: CanonicalModel, *, prefer_chat: bool = False
 ) -> list[tuple[Offering, Upstream, WireProtocol]]:
     """按生效优先级返回已确认 offering/upstream 候选。"""
     enabled = {u.id: u for u in _enabled_upstreams(state)}
@@ -92,10 +92,20 @@ def route_candidates(
             and o.upstream_id == upstream.id
         ]
         if any(o.wire_protocol == WireProtocol.responses for o in candidates):
-            offering = next(o for o in candidates if o.wire_protocol == WireProtocol.responses)
-            responses_first.append((offering, upstream, WireProtocol.responses))
+            responses_offering = next(
+                (o for o in candidates if o.wire_protocol == WireProtocol.responses), None
+            )
+            chat_offering = next(
+                (o for o in candidates if o.wire_protocol == WireProtocol.chat_completions), None
+            )
+            if prefer_chat and chat_offering is not None:
+                responses_first.append((chat_offering, upstream, WireProtocol.chat_completions))
+            elif responses_offering is not None:
+                responses_first.append((responses_offering, upstream, WireProtocol.responses))
             continue
         if any(o.wire_protocol == WireProtocol.chat_completions for o in candidates):
-            offering = next(o for o in candidates if o.wire_protocol == WireProtocol.chat_completions)
+            offering = next(
+                o for o in candidates if o.wire_protocol == WireProtocol.chat_completions
+            )
             responses_first.append((offering, upstream, WireProtocol.chat_completions))
     return responses_first

@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import json
 from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Any
@@ -40,6 +41,7 @@ class NormalRequest:
     tools: list[dict[str, Any]] = field(default_factory=list)
     tool_choice: Any = None
     extra: dict[str, Any] = field(default_factory=dict)
+    custom_tool_names: set[str] = field(default_factory=set)
 
 
 def _reject_hosted_tools(body: dict[str, Any]) -> None:
@@ -105,7 +107,11 @@ def _normalize_responses(body: dict[str, Any], model: str, stream: bool) -> Norm
     # input 可以是 string 或 list of items
     if isinstance(raw_input, str):
         items: list[Any] = [
-            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": raw_input}]}
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": raw_input}],
+            }
         ]
     elif isinstance(raw_input, list):
         items = raw_input
@@ -145,7 +151,35 @@ def _normalize_responses(body: dict[str, Any], model: str, stream: bool) -> Norm
                     ],
                 )
             )
+        elif item_type == "custom_tool_call":
+            input_text = item.get("input")
+            messages.append(
+                NormalMessage(
+                    role="assistant",
+                    name=item.get("name"),
+                    tool_calls=[
+                        {
+                            "id": item.get("call_id") or item.get("id"),
+                            "type": "function",
+                            "function": {
+                                "name": item.get("name"),
+                                "arguments": json.dumps(
+                                    {"input": input_text if isinstance(input_text, str) else ""}
+                                ),
+                            },
+                        }
+                    ],
+                )
+            )
         elif item_type == "function_call_output":
+            messages.append(
+                NormalMessage(
+                    role="tool",
+                    tool_call_id=item.get("call_id") or item.get("id"),
+                    content=[{"type": "text", "text": str(item.get("output", ""))}],
+                )
+            )
+        elif item_type == "custom_tool_call_output":
             messages.append(
                 NormalMessage(
                     role="tool",
@@ -163,7 +197,7 @@ def _normalize_responses(body: dict[str, Any], model: str, stream: bool) -> Norm
                 f"无法翻译 responses input item: type={item_type!r}",
             )
 
-    tools = _norm_tools(body.get("tools"))
+    tools, custom_tool_names = _norm_tools(body.get("tools"))
     tool_choice = body.get("tool_choice")
     sampling = _extract_sampling(body, responses=True)
     return NormalRequest(
@@ -174,6 +208,7 @@ def _normalize_responses(body: dict[str, Any], model: str, stream: bool) -> Norm
         tools=tools,
         tool_choice=tool_choice,
         extra={"instructions": body.get("instructions")},
+        custom_tool_names=custom_tool_names,
     )
 
 
@@ -194,7 +229,7 @@ def _normalize_chat(body: dict[str, Any], model: str, stream: bool) -> NormalReq
                 name=msg.get("name"),
             )
         )
-    tools = _norm_tools(body.get("tools"))
+    tools, custom_tool_names = _norm_tools(body.get("tools"))
     sampling = _extract_sampling(body, responses=False)
     return NormalRequest(
         model=model,
@@ -204,13 +239,15 @@ def _normalize_chat(body: dict[str, Any], model: str, stream: bool) -> NormalReq
         tools=tools,
         tool_choice=body.get("tool_choice"),
         extra={},
+        custom_tool_names=custom_tool_names,
     )
 
 
-def _norm_tools(tools: Any) -> list[dict[str, Any]]:
+def _norm_tools(tools: Any) -> tuple[list[dict[str, Any]], set[str]]:
     if not isinstance(tools, list):
-        return []
+        return [], set()
     result: list[dict[str, Any]] = []
+    custom_names: set[str] = set()
     for tool in tools:
         if not isinstance(tool, dict):
             continue
@@ -229,7 +266,39 @@ def _norm_tools(tools: Any) -> list[dict[str, Any]]:
                     },
                 }
             )
-    return result
+        elif tool.get("type") == "custom":
+            name = tool.get("name")
+            if not isinstance(name, str) or not name:
+                raise UntranslatableCapabilityError("custom_tool", "custom tool 缺少 name。")
+            custom_names.add(name)
+            description = str(tool.get("description") or "").strip()
+            input_description = (
+                "Raw apply_patch input. Begin exactly with `*** Begin Patch` and use the standard patch envelope."
+                if name == "apply_patch"
+                else "Raw freeform input for this custom tool."
+            )
+            if description:
+                description = f"{description}\n\nThis is a FREEFORM tool. Put only the raw tool input in `input`; do not wrap it in JSON or markdown."
+            else:
+                description = f"FREEFORM custom tool: {name}. Put only the raw tool input in `input`; do not wrap it in JSON or markdown."
+            result.append(
+                {
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "description": description,
+                        "parameters": {
+                            "type": "object",
+                            "additionalProperties": False,
+                            "properties": {
+                                "input": {"type": "string", "description": input_description}
+                            },
+                            "required": ["input"],
+                        },
+                    },
+                }
+            )
+    return result, custom_names
 
 
 def _extract_sampling(body: dict[str, Any], *, responses: bool) -> dict[str, Any]:

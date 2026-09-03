@@ -66,14 +66,29 @@ def responses_request_from_normal(normal: NormalRequest, *, target_model: str) -
         elif msg.tool_calls:
             for tc in msg.tool_calls:
                 fn = tc.get("function", {})
-                items.append(
-                    {
-                        "type": "function_call",
-                        "call_id": tc.get("id"),
-                        "name": fn.get("name"),
-                        "arguments": fn.get("arguments"),
-                    }
-                )
+                if fn.get("name") in normal.custom_tool_names:
+                    try:
+                        arguments = json.loads(fn.get("arguments") or "{}")
+                    except (TypeError, json.JSONDecodeError):
+                        arguments = {}
+                    input_text = arguments.get("input") if isinstance(arguments, dict) else ""
+                    items.append(
+                        {
+                            "type": "custom_tool_call",
+                            "call_id": tc.get("id"),
+                            "name": fn.get("name"),
+                            "input": input_text if isinstance(input_text, str) else "",
+                        }
+                    )
+                else:
+                    items.append(
+                        {
+                            "type": "function_call",
+                            "call_id": tc.get("id"),
+                            "name": fn.get("name"),
+                            "arguments": fn.get("arguments"),
+                        }
+                    )
         else:
             items.append(
                 {
@@ -93,16 +108,23 @@ def responses_request_from_normal(normal: NormalRequest, *, target_model: str) -
         else:
             body[key] = value
     if normal.tools:
-        body["tools"] = [
-            {
-                "type": "function",
-                "name": tool["function"].get("name"),
-                "description": tool["function"].get("description"),
-                "parameters": tool["function"].get("parameters"),
-                "strict": tool["function"].get("strict"),
-            }
-            for tool in normal.tools
-        ]
+        body["tools"] = []
+        for tool in normal.tools:
+            fn = tool["function"]
+            if fn.get("name") in normal.custom_tool_names:
+                body["tools"].append(
+                    {"type": "custom", "name": fn.get("name"), "description": fn.get("description")}
+                )
+            else:
+                body["tools"].append(
+                    {
+                        "type": "function",
+                        "name": fn.get("name"),
+                        "description": fn.get("description"),
+                        "parameters": fn.get("parameters"),
+                        "strict": fn.get("strict"),
+                    }
+                )
     if normal.tool_choice is not None:
         body["tool_choice"] = normal.tool_choice
     return body
@@ -225,23 +247,31 @@ def response_message_started_events() -> list[dict[str, Any]]:
     ]
 
 
-def response_function_call_done_events(tool_calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def response_function_call_done_events(
+    tool_calls: list[dict[str, Any]], *, custom_tool_names: set[str] | None = None
+) -> list[dict[str, Any]]:
     """把累积的 Chat tool_calls 完成态转为 Responses function_call done 事件。"""
     events: list[dict[str, Any]] = []
     for tc in tool_calls:
         fn = tc.get("function") or {}
-        events.append({
-            "type": "response.output_item.done",
-            "output_index": (tc.get("index") or 0) + 1,
-            "item": {
-                "id": tc.get("id") or f"call_{tc.get('index', 0)}",
+        call_id = tc.get("id") or f"call_{tc.get('index', 0)}"
+        name = fn.get("name") or ""
+        if name in (custom_tool_names or set()):
+            item = _custom_tool_call_item(call_id, name, fn.get("arguments") or "")
+        else:
+            item = {
                 "type": "function_call",
-                "call_id": tc.get("id") or f"call_{tc.get('index', 0)}",
-                "name": fn.get("name") or "",
+                "call_id": call_id,
+                "name": name,
                 "arguments": fn.get("arguments") or "",
-                "status": "completed",
-            },
-        })
+            }
+        events.append(
+            {
+                "type": "response.output_item.done",
+                "output_index": (tc.get("index") or 0) + 1,
+                "item": item,
+            }
+        )
     return events
 
 
@@ -327,6 +357,7 @@ def response_envelope_from_chat_completion(
     chat_completion: dict[str, Any],
     *,
     requested_model: str,
+    custom_tool_names: set[str] | None = None,
 ) -> dict[str, Any]:
     """把非流式 Chat Completions 信封转换回 Responses 信封。"""
     choices = chat_completion.get("choices") or []
@@ -338,16 +369,23 @@ def response_envelope_from_chat_completion(
     tool_calls = message.get("tool_calls") or []
     for tool_call in tool_calls:
         function = tool_call.get("function") or {}
-        output_items.append(
-            {
-                "type": "function_call",
-                "id": tool_call.get("id"),
-                "call_id": tool_call.get("id"),
-                "name": function.get("name"),
-                "arguments": function.get("arguments"),
-                "status": "completed",
-            }
-        )
+        if function.get("name") in (custom_tool_names or set()):
+            output_items.append(
+                _custom_tool_call_item(
+                    tool_call.get("id"), function.get("name"), function.get("arguments") or ""
+                )
+            )
+        else:
+            output_items.append(
+                {
+                    "type": "function_call",
+                    "id": tool_call.get("id"),
+                    "call_id": tool_call.get("id"),
+                    "name": function.get("name"),
+                    "arguments": function.get("arguments"),
+                    "status": "completed",
+                }
+            )
     content_text = message.get("content")
     if content_text:
         output_items.append(
@@ -395,3 +433,20 @@ def response_envelope_from_chat_completion(
         },
     }
     return envelope
+
+
+def _custom_tool_call_item(call_id: Any, name: str, arguments: str) -> dict[str, Any]:
+    """把降级层使用的 {input: string} 调用还原为 Responses custom item。"""
+    try:
+        parsed = json.loads(arguments)
+    except (TypeError, json.JSONDecodeError):
+        parsed = {}
+    input_value = parsed.get("input") if isinstance(parsed, dict) else ""
+    return {
+        "id": call_id,
+        "type": "custom_tool_call",
+        "call_id": call_id,
+        "name": name,
+        "input": input_value if isinstance(input_value, str) else "",
+        "status": "completed",
+    }
