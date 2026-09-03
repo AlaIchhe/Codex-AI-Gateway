@@ -21,12 +21,14 @@ from codex_ai_gateway.adapters.protocol_normal_form import (
 from codex_ai_gateway.adapters.responses_chat_translation import (
     chat_request_from_normal,
     response_completed_event,
+    response_content_part_done_events,
     response_created_event,
     response_failed_event,
     response_function_call_done_events,
     response_message_done_event,
     response_message_started_events,
     response_sse,
+    response_tool_call_started_event,
     translate_chat_chunk_to_response_event,
 )
 from codex_ai_gateway.adapters.responses_passthrough import ResponsesPassthrough
@@ -397,6 +399,8 @@ async def _stream_response(
         accumulated_text = ""
         accumulated_tool_calls: dict[int, dict[str, Any]] = {}
         last_chat_chunk: dict[str, Any] | None = None
+        last_finish_reason: str | None = None
+        emitted_tool_starts: set[int] = set()
         sse_buffer = SSEFrameBuffer()
         responses_passthrough = ResponsesPassthrough()
         READ_TIMEOUT = 15  # seconds per tick → keepalive or error
@@ -444,6 +448,9 @@ async def _stream_response(
                 events = sse_buffer.feed(chunk)
                 for parsed in events:
                     last_chat_chunk = parsed
+                    choice_zero = (parsed.get("choices") or [{}])[0]
+                    if choice_zero.get("finish_reason"):
+                        last_finish_reason = choice_zero["finish_reason"]
                     if not stream_initialized:
                         yield response_sse(response_created_event(model_label))
                         for lifecycle_event in response_message_started_events():
@@ -462,6 +469,17 @@ async def _stream_response(
                     ) or []
                     for tc in tc_list:
                         tc_index = tc.get("index", 0)
+                        if tc_index not in emitted_tool_starts:
+                            fn_preview = tc.get("function") or {}
+                            if tc.get("id") or fn_preview.get("name"):
+                                call_id = tc.get("id") or f"call_{tc_index}"
+                                is_custom = (fn_preview.get("name") or "") in (custom_tool_names or set())
+                                yield response_sse(
+                                    response_tool_call_started_event(
+                                        tc_index, call_id, fn_preview.get("name") or "", is_custom=is_custom
+                                    )
+                                )
+                                emitted_tool_starts.add(tc_index)
                         existing = accumulated_tool_calls.setdefault(
                             tc_index,
                             {
@@ -497,6 +515,9 @@ async def _stream_response(
                     for lifecycle_event in response_message_started_events():
                         yield response_sse(lifecycle_event)
 
+                for done_ev in response_content_part_done_events(accumulated_text):
+                    yield response_sse(done_ev)
+
                 # Send tool_call done events
                 if accumulated_tool_calls:
                     for tc_done in response_function_call_done_events(
@@ -506,9 +527,49 @@ async def _stream_response(
                         yield response_sse(tc_done)
 
                 yield response_sse(response_message_done_event(accumulated_text))
+
+                output_items: list[dict[str, Any]] = []
+                for i in sorted(accumulated_tool_calls):
+                    tc = accumulated_tool_calls[i]
+                    fn = tc.get("function") or {}
+                    call_id = tc.get("id") or f"call_{i}"
+                    if fn.get("name") in (custom_tool_names or set()):
+                        try:
+                            parsed_args = json.loads(fn.get("arguments") or "{}")
+                        except (TypeError, json.JSONDecodeError):
+                            parsed_args = {}
+                        inp = parsed_args.get("input") if isinstance(parsed_args, dict) else ""
+                        output_items.append({
+                            "id": call_id,
+                            "type": "custom_tool_call",
+                            "call_id": call_id,
+                            "name": fn.get("name") or "",
+                            "input": inp if isinstance(inp, str) else "",
+                            "status": "completed",
+                        })
+                    else:
+                        output_items.append({
+                            "id": call_id,
+                            "type": "function_call",
+                            "call_id": call_id,
+                            "name": fn.get("name") or "",
+                            "arguments": fn.get("arguments") or "",
+                            "status": "completed",
+                        })
+                if accumulated_text:
+                    output_items.append({
+                        "id": "msg_placeholder",
+                        "type": "message",
+                        "status": "completed",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": accumulated_text, "annotations": []}],
+                    })
+
                 yield response_sse(
                     response_completed_event(
                         model=model_label,
+                        finish_reason=last_finish_reason,
+                        output=output_items,
                         usage=(last_chat_chunk or {}).get("usage"),
                     )
                 )

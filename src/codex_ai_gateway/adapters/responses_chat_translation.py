@@ -247,6 +247,46 @@ def response_message_started_events() -> list[dict[str, Any]]:
     ]
 
 
+def response_tool_call_started_event(
+    tc_index: int, call_id: str, name: str, *, is_custom: bool
+) -> dict[str, Any]:
+    """流式期间 tool call 首次出现时的 output_item.added 事件。"""
+    item: dict[str, Any] = {
+        "id": call_id,
+        "type": "custom_tool_call" if is_custom else "function_call",
+        "call_id": call_id,
+        "name": name,
+        "status": "in_progress",
+    }
+    if not is_custom:
+        item["arguments"] = ""
+    return {
+        "type": "response.output_item.added",
+        "output_index": tc_index + 1,
+        "item": item,
+    }
+
+
+def response_content_part_done_events(text: str) -> list[dict[str, Any]]:
+    """消息流结束时的 output_text.done + content_part.done 事件对。"""
+    return [
+        {
+            "type": "response.output_text.done",
+            "item_id": "msg_placeholder",
+            "output_index": 0,
+            "content_index": 0,
+            "text": text,
+        },
+        {
+            "type": "response.content_part.done",
+            "item_id": "msg_placeholder",
+            "output_index": 0,
+            "content_index": 0,
+            "part": {"type": "output_text", "text": text, "annotations": []},
+        },
+    ]
+
+
 def response_function_call_done_events(
     tool_calls: list[dict[str, Any]], *, custom_tool_names: set[str] | None = None
 ) -> list[dict[str, Any]]:
@@ -311,6 +351,7 @@ def response_completed_event(
     model: str,
     completion_id: str | None = None,
     finish_reason: str | None = None,
+    output: list[dict[str, Any]] | None = None,
     usage: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     provider_usage = usage or {}
@@ -320,6 +361,7 @@ def response_completed_event(
         "response": {
             "id": completion_id or "resp_placeholder",
             "object": "response",
+            "output": output or [],
             "model": model,
             "status": status,
             "error": None,

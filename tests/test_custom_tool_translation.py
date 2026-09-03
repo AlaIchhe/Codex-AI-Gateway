@@ -14,7 +14,10 @@ from codex_ai_gateway.adapters.protocol_normal_form import (
 )
 from codex_ai_gateway.adapters.responses_chat_translation import (
     chat_request_from_normal,
+    response_completed_event,
+    response_content_part_done_events,
     response_function_call_done_events,
+    response_tool_call_started_event,
     responses_request_from_normal,
     translate_chat_chunk_to_response_event,
 )
@@ -165,6 +168,43 @@ def test_content_chunk_translates_to_single_delta_event():
     assert event is not None
     assert event["type"] == "response.output_text.delta"
     assert event["delta"] == "hello"
+
+
+def test_tool_call_started_event_emitted_for_new_tool_call():
+    event = response_tool_call_started_event(0, "call_1", "apply_patch", is_custom=True)
+    assert event["type"] == "response.output_item.added"
+    assert event["output_index"] == 1
+    assert event["item"]["type"] == "custom_tool_call"
+    assert event["item"]["status"] == "in_progress"
+
+    event_fn = response_tool_call_started_event(0, "call_2", "shell", is_custom=False)
+    assert event_fn["item"]["type"] == "function_call"
+    assert event_fn["item"]["arguments"] == ""
+
+
+def test_content_part_done_events_include_text_done_and_part_done():
+    events = response_content_part_done_events("hello world")
+    assert events[0]["type"] == "response.output_text.done"
+    assert events[0]["text"] == "hello world"
+    assert events[1]["type"] == "response.content_part.done"
+    assert events[1]["part"]["text"] == "hello world"
+
+
+def test_response_completed_event_includes_output_and_finish_reason():
+    output = [{"type": "function_call", "call_id": "c1", "name": "shell", "arguments": "{}"}]
+    event = response_completed_event(
+        model="mimo",
+        finish_reason="tool_calls",
+        output=output,
+        usage={"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+    )
+    assert event["response"]["output"] == output
+    assert event["response"]["status"] == "completed"
+
+    event_incomplete = response_completed_event(
+        model="mimo", finish_reason="length", output=[], usage={}
+    )
+    assert event_incomplete["response"]["status"] == "incomplete"
 
 
 def _routing_state():
