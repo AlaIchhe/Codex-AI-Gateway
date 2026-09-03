@@ -13,6 +13,7 @@ from fastapi.responses import Response, StreamingResponse
 
 from codex_ai_gateway.adapters.protocol_normal_form import (
     UntranslatableCapabilityError,
+    disable_unsupported_web_search,
     ensure_prefill_continuation,
     normalize_request,
     validate_translatable,
@@ -193,7 +194,7 @@ async def _attempt_with_fallback(
                 )
                 custom_tool_names = normal.custom_tool_names
             else:
-                chat_body = ensure_prefill_continuation(body)
+                chat_body = disable_unsupported_web_search(ensure_prefill_continuation(body))
             streaming = bool(body.get("stream"))
             if streaming:
                 return await _stream_response(

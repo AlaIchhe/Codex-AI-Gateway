@@ -348,3 +348,24 @@ def ensure_prefill_continuation(body: dict[str, Any]) -> dict[str, Any]:
         },
     ]
     return patched
+
+
+def disable_unsupported_web_search(body: dict[str, Any]) -> dict[str, Any]:
+    """移除 Responses 透传请求中的 hosted web_search。
+
+    Codex 会依据 fallback model metadata 自动注入 web_search。若当前 Responses
+    上游尚未支持该 hosted tool，继续透传只会把请求推入必然失败的状态。
+    """
+    tools = body.get("tools")
+    if not isinstance(tools, list) or not any(
+        isinstance(tool, dict) and tool.get("type") == "web_search" for tool in tools
+    ):
+        return body
+    return {
+        **body,
+        "tools": [
+            tool
+            for tool in tools
+            if not (isinstance(tool, dict) and tool.get("type") == "web_search")
+        ],
+    }

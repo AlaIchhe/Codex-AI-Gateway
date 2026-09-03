@@ -9,6 +9,7 @@ import pytest
 
 from codex_ai_gateway.adapters.protocol_normal_form import (
     UntranslatableCapabilityError,
+    disable_unsupported_web_search,
     normalize_request,
 )
 from codex_ai_gateway.adapters.responses_chat_translation import (
@@ -73,6 +74,15 @@ def test_web_search_tool_is_disabled_for_chat_degradation():
     assert [tool["function"]["name"] for tool in normal.tools] == ["shell", "apply_patch"]
     chat = chat_request_from_normal(normal, target_model="upstream-mimo")
     assert chat["tools"] == normal.tools
+
+
+def test_web_search_tool_is_disabled_for_responses_passthrough():
+    body = {
+        "model": "mimo-v2.5-pro",
+        "input": "hi",
+        "tools": [{"type": "web_search"}, {"type": "function", "name": "shell"}],
+    }
+    assert disable_unsupported_web_search(body)["tools"] == [{"type": "function", "name": "shell"}]
 
 
 def test_other_hosted_tools_still_fail_closed():
