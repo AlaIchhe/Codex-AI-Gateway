@@ -57,6 +57,32 @@ def test_custom_tool_missing_name_fails_closed():
         )
 
 
+def test_web_search_tool_is_disabled_for_chat_degradation():
+    normal = normalize_request(
+        inbound_protocol="responses",
+        body={
+            "model": "mimo-v2.5-pro",
+            "input": "hi",
+            "tools": [
+                {"type": "web_search"},
+                {"type": "function", "name": "shell", "parameters": {"type": "object"}},
+                {"type": "custom", "name": "apply_patch"},
+            ],
+        },
+    )
+    assert [tool["function"]["name"] for tool in normal.tools] == ["shell", "apply_patch"]
+    chat = chat_request_from_normal(normal, target_model="upstream-mimo")
+    assert chat["tools"] == normal.tools
+
+
+def test_other_hosted_tools_still_fail_closed():
+    with pytest.raises(UntranslatableCapabilityError):
+        normalize_request(
+            inbound_protocol="responses",
+            body={"model": "m", "input": "hi", "tools": [{"type": "code_execution"}]},
+        )
+
+
 def test_custom_call_history_round_trips_through_chat_arguments():
     normal = normalize_request(
         inbound_protocol="responses",

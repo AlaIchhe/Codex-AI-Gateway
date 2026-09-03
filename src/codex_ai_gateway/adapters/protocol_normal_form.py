@@ -51,7 +51,6 @@ def _reject_hosted_tools(body: dict[str, Any]) -> None:
     if isinstance(tools, list):
         for tool in tools:
             if isinstance(tool, dict) and tool.get("type") in {
-                "web_search",
                 "computer_use",
                 "file_search",
                 "code_execution",
@@ -253,6 +252,10 @@ def _norm_tools(tools: Any) -> tuple[list[dict[str, Any]], set[str]]:
             continue
         if "function" in tool:
             result.append(deepcopy(tool))
+        elif tool.get("type") == "web_search":
+            # Chat Completions 无法承载 Responses hosted web_search；
+            # 对降级上游显式禁用该工具，避免上游 400。
+            continue
         elif tool.get("type") == "function":
             # Responses 风格：name/parameters 直接位于顶层
             result.append(
