@@ -500,7 +500,6 @@ def response_completed_event(
     output: list[dict[str, Any]] | None = None,
     usage: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    provider_usage = usage or {}
     status = "incomplete" if finish_reason == "length" else "completed"
     return {
         "type": "response.completed",
