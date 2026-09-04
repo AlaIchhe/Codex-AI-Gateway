@@ -50,6 +50,12 @@ def chat_request_from_normal(normal: NormalRequest, *, target_model: str) -> dic
         body["tools"] = normal.tools
     if normal.tool_choice is not None:
         body["tool_choice"] = normal.tool_choice
+    if normal.stream:
+        # Codex 只认 response.completed 里的 usage 作为计费/终止依据，
+        # 上游不带 stream_options.include_usage 时流末尾不会回传 usage。
+        stream_options = dict(body.get("stream_options") or {})
+        stream_options["include_usage"] = True
+        body["stream_options"] = stream_options
     return body
 
 
@@ -430,6 +436,62 @@ def response_failed_event(model: str, error_message: str) -> dict[str, Any]:
     }
 
 
+def _coerce_token_count(value: Any) -> int:
+    """Codex 将 usage 数值字段解析为 i64，null/字符串必须兜底为 0。"""
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return 0
+
+
+def responses_usage_from_chat_usage(provider_usage: dict[str, Any] | None) -> dict[str, Any]:
+    """Chat usage -> Responses usage，缺省数值与 details 子对象一律补零。
+
+    Codex 的 ResponseCompleted 解析把数值字段和
+    input_tokens_details.cached_tokens / output_tokens_details.reasoning_tokens
+    当作必填，透传 null 或缺 details 会导致 invalid type 崩溃。
+    """
+    usage = provider_usage if isinstance(provider_usage, dict) else {}
+
+    def first_present(*keys: str) -> Any:
+        for key in keys:
+            value = usage.get(key)
+            if value is not None:
+                return value
+        return None
+
+    prompt_tokens = first_present("prompt_tokens", "input_tokens", "promptTokenCount")
+    completion_tokens = first_present(
+        "completion_tokens", "output_tokens", "completionTokenCount"
+    )
+    total_tokens = first_present("total_tokens", "totalTokenCount")
+    if total_tokens is None:
+        total_tokens = (prompt_tokens or 0) + (completion_tokens or 0)
+    prompt_details = (
+        usage.get("prompt_tokens_details")
+        or usage.get("input_tokens_details")
+        or {}
+    )
+    completion_details = (
+        usage.get("completion_tokens_details")
+        or usage.get("output_tokens_details")
+        or {}
+    )
+    return {
+        "input_tokens": _coerce_token_count(prompt_tokens),
+        "output_tokens": _coerce_token_count(completion_tokens),
+        "total_tokens": _coerce_token_count(total_tokens),
+        "input_tokens_details": {
+            "cached_tokens": _coerce_token_count(prompt_details.get("cached_tokens")),
+        },
+        "output_tokens_details": {
+            "reasoning_tokens": _coerce_token_count(
+                completion_details.get("reasoning_tokens")
+            ),
+        },
+    }
+
+
 def response_completed_event(
     *,
     model: str,
@@ -452,11 +514,7 @@ def response_completed_event(
             "incomplete_details": (
                 {"reason": "max_output_tokens"} if status == "incomplete" else None
             ),
-            "usage": {
-                "input_tokens": provider_usage.get("prompt_tokens"),
-                "output_tokens": provider_usage.get("completion_tokens"),
-                "total_tokens": provider_usage.get("total_tokens"),
-            },
+            "usage": responses_usage_from_chat_usage(usage),
         },
     }
 
@@ -530,9 +588,6 @@ def response_envelope_from_chat_completion(
             }
         )
 
-    usage = chat_completion.get("usage") or {}
-    prompt_details = usage.get("prompt_tokens_details") or {}
-    completion_details = usage.get("completion_tokens_details") or {}
     status = "incomplete" if finish_reason == "length" else "completed"
     envelope: dict[str, Any] = {
         "id": chat_completion.get("id"),
@@ -546,17 +601,7 @@ def response_envelope_from_chat_completion(
         "tools": chat_completion.get("tools", []),
         "error": None,
         "incomplete_details": ({"reason": "max_output_tokens"} if status == "incomplete" else None),
-        "usage": {
-            "input_tokens": usage.get("prompt_tokens"),
-            "output_tokens": usage.get("completion_tokens"),
-            "total_tokens": usage.get("total_tokens"),
-            "input_tokens_details": {
-                "cached_tokens": prompt_details.get("cached_tokens", 0),
-            },
-            "output_tokens_details": {
-                "reasoning_tokens": completion_details.get("reasoning_tokens"),
-            },
-        },
+        "usage": responses_usage_from_chat_usage(chat_completion.get("usage")),
     }
     return envelope
 

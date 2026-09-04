@@ -399,7 +399,7 @@ async def _stream_response(
         message_started = False
         accumulated_text = ""
         accumulated_tool_calls: dict[int, dict[str, Any]] = {}
-        last_chat_chunk: dict[str, Any] | None = None
+        last_usage: dict[str, Any] | None = None
         last_finish_reason: str | None = None
         emitted_tool_starts: set[int] = set()
         sse_buffer = SSEFrameBuffer()
@@ -448,7 +448,11 @@ async def _stream_response(
                 # Chat 协议：SSE 解析 + 翻译
                 events = sse_buffer.feed(chunk)
                 for parsed in events:
-                    last_chat_chunk = parsed
+                    chunk_usage = parsed.get("usage")
+                    if isinstance(chunk_usage, dict):
+                        # 只保留非 null 的 usage：多数上游中途 chunk 为 null，
+                        # 仅最后一个 chunk（include_usage 生效时）携带真实值
+                        last_usage = chunk_usage
                     choice_zero = (parsed.get("choices") or [{}])[0]
                     if choice_zero.get("finish_reason"):
                         last_finish_reason = choice_zero["finish_reason"]
@@ -506,6 +510,9 @@ async def _stream_response(
 
             if is_chat:
                 for parsed in sse_buffer.flush():
+                    chunk_usage = parsed.get("usage")
+                    if isinstance(chunk_usage, dict):
+                        last_usage = chunk_usage
                     translated = translate_chat_chunk_to_response_event(parsed)
                     if translated is not None:
                         if translated.get("type") == "response.output_text.delta":
@@ -520,6 +527,22 @@ async def _stream_response(
                 if not stream_initialized:
                     yield response_sse(response_created_event(model_label))
                     stream_initialized = True
+
+                if last_finish_reason is None:
+                    # 上游流在 finish_reason 之前结束（典型为中途断开）。
+                    # 伪装成 completed 会让 Codex 误认为回答完整，按失败收尾。
+                    error_msg = "上游流式响应在 finish_reason 之前中断，无法保证回答完整。"
+                    _finalize(
+                        runtime,
+                        event,
+                        Outcome.failed,
+                        mapped=_mapped_error(
+                            502, b"", error=RuntimeError(error_msg), upstream=upstream
+                        ),
+                        status_code=502,
+                    )
+                    yield response_sse(response_failed_event(model_label, error_msg))
+                    return
 
                 # 纯 tool call 回合不产生空 assistant message，
                 # 否则 Codex 回放历史时会在 tool_calls 与 tool 响应之间插入空消息
@@ -537,6 +560,7 @@ async def _stream_response(
 
                 if message_started:
                     yield response_sse(response_message_done_event(accumulated_text))
+
 
                 output_items: list[dict[str, Any]] = []
                 for i in sorted(accumulated_tool_calls):
@@ -580,7 +604,7 @@ async def _stream_response(
                         model=model_label,
                         finish_reason=last_finish_reason,
                         output=output_items,
-                        usage=(last_chat_chunk or {}).get("usage"),
+                        usage=last_usage,
                     )
                 )
 
@@ -598,7 +622,9 @@ async def _stream_response(
             if started and stream_initialized:
                 try:
                     yield response_sse(response_failed_event(model_label, error_msg))
-                    yield response_sse(response_completed_event(model=model_label, usage=None))
+                    yield response_sse(
+                        response_completed_event(model=model_label, usage=last_usage)
+                    )
                 except Exception:
                     pass
             raise
