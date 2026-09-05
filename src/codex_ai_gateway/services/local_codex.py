@@ -300,8 +300,18 @@ class LocalCodexAutomationService:
 
         writer = LocalCodexService(runtime.data_dir)
         gateway_token = runtime.secret_store.get_secret("gateway:token")
-        if not gateway_token:
-            from codex_ai_gateway.services.gateway_token import create_gateway_token
+        from codex_ai_gateway.services.gateway_token import (
+            create_gateway_token,
+            verify_gateway_token,
+        )
+        if not gateway_token or (
+            verify_gateway_token(
+                gateway_token, runtime.state_store.read_state().gateway_tokens, runtime.signing_key
+            )
+            is None
+        ):
+            # secret 缺失或与 state 记录不一致（如 state 被重置）：
+            # 重新签发并同步两侧，否则写入 config.toml 的 token 会被数据面 401。
             token, raw = create_gateway_token(runtime.signing_key)
             runtime.secret_store.set_secret("gateway:token", raw)
             runtime.state_store.mutate(lambda state: state.gateway_tokens.append(token))
