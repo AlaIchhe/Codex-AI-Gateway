@@ -84,6 +84,41 @@ export type RoutingPreference = {
   updated_at: string
 }
 
+export type CodexMcpServer = {
+  name: string
+  transport: "stdio" | "url"
+  command: string | null
+  args: string[]
+  url: string | null
+  env_keys: string[]
+}
+
+export type CodexMcpServersView = {
+  config_path: string
+  exists: boolean
+  servers: CodexMcpServer[]
+  plugin_servers: Array<{
+    plugin_id: string
+    plugin_enabled: boolean
+    servers: CodexMcpServer[]
+  }>
+}
+
+export type CodexSkill = {
+  id: string
+  name: string
+  description: string | null
+  is_symlink: boolean
+  path: string
+}
+
+export type CodexSkillsView = {
+  codex_home: string
+  skills_dir: string
+  exists: boolean
+  skills: CodexSkill[]
+}
+
 export type CodexPluginCatalogEntry = {
   plugin_id: string
   name: string
@@ -232,6 +267,25 @@ export const api = {
       `/admin/codex/plugin-marketplaces/${encodeURIComponent(name)}`,
       { method: "DELETE" },
     ),
+  listCodexMcpServers: () =>
+    request<CodexMcpServersView>("/admin/codex/mcp-servers"),
+  upsertCodexMcpServer: (body: {
+    name: string
+    command?: string
+    args?: string[]
+    url?: string
+    env?: Record<string, string>
+  }) =>
+    request<CodexMcpServersView>("/admin/codex/mcp-servers", {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  deleteCodexMcpServer: (name: string) =>
+    request<CodexMcpServersView>(
+      `/admin/codex/mcp-servers/${encodeURIComponent(name)}`,
+      { method: "DELETE" },
+    ),
+  listCodexSkills: () => request<CodexSkillsView>("/admin/codex/skills"),
   listUpstreams: () => request<Upstream[]>("/admin/upstreams"),
   listPresets: () => request<PresetProvider[]>("/admin/presets"),
   createUpstream: (body: UpstreamCreatePayload) =>

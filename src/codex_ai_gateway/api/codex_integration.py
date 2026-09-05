@@ -8,6 +8,13 @@ from typing import Any
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import FileResponse
 
+from codex_ai_gateway.integrations.codex_context import (
+    CodexContextError,
+    delete_mcp_server,
+    list_mcp_servers,
+    list_skills,
+    upsert_mcp_server,
+)
 from codex_ai_gateway.integrations.codex_plugin_marketplace import (
     CodexPluginMarketplaceError,
     list_plugin_marketplaces,
@@ -25,6 +32,7 @@ from codex_ai_gateway.models.entities import (
 from codex_ai_gateway.models.schemas import (
     ApplyRequest,
     MarketplaceRegisterRequest,
+    McpServerUpsertRequest,
     PluginToggleRequest,
     ProfileCreate,
     ProfilePreviewRequest,
@@ -158,6 +166,59 @@ def delete_marketplace(request: Request, name: str) -> dict[str, Any]:
         return remove_marketplace(profile.config_path, name=name)
     except CodexPluginMarketplaceError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get("/mcp-servers")
+def get_mcp_servers(request: Request) -> dict[str, Any]:
+    runtime = _runtime(request)
+    state = runtime.state_store.read_state()
+    profile = next((p for p in state.integration_profiles if p.config_path), None)
+    if profile is None:
+        raise HTTPException(status_code=404, detail="本地 Codex profile 不存在")
+    return list_mcp_servers(profile.config_path)
+
+
+@router.post("/mcp-servers")
+def post_mcp_server(request: Request, payload: McpServerUpsertRequest) -> dict[str, Any]:
+    runtime = _runtime(request)
+    state = runtime.state_store.read_state()
+    profile = next((p for p in state.integration_profiles if p.config_path), None)
+    if profile is None:
+        raise HTTPException(status_code=404, detail="本地 Codex profile 不存在")
+    try:
+        return upsert_mcp_server(
+            profile.config_path,
+            name=payload.name,
+            command=payload.command,
+            args=payload.args,
+            url=payload.url,
+            env=payload.env,
+        )
+    except CodexContextError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.delete("/mcp-servers/{name}")
+def delete_mcp(name: str, request: Request) -> dict[str, Any]:
+    runtime = _runtime(request)
+    state = runtime.state_store.read_state()
+    profile = next((p for p in state.integration_profiles if p.config_path), None)
+    if profile is None:
+        raise HTTPException(status_code=404, detail="本地 Codex profile 不存在")
+    try:
+        return delete_mcp_server(profile.config_path, name=name)
+    except CodexContextError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.get("/skills")
+def get_skills(request: Request) -> dict[str, Any]:
+    runtime = _runtime(request)
+    state = runtime.state_store.read_state()
+    profile = next((p for p in state.integration_profiles if p.codex_home), None)
+    if profile is None:
+        raise HTTPException(status_code=404, detail="本地 Codex profile 不存在")
+    return list_skills(profile.codex_home)
 
 
 @router.get("/profiles")

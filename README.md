@@ -139,9 +139,12 @@ Authorization: Bearer <gateway-token>
 点，并在 schema、连通性、启动配置检查失败时自动回滚。目录发布变更会触发
 preview → apply → 校验，无需人工确认。
 
-## 7. Codex 插件管理
+## 7. Codex 插件与上下文
 
-管理界面的“插件”页用于维护本机 Codex 的本地插件市场：
+管理界面的“插件”页通过 segmented control 分为 插件 / MCP / 技能 三个子页
+（`/codex-plugins`、`/codex-plugins/mcp`、`/codex-plugins/skills`）。
+
+### 插件
 
 - 注册本地 marketplace 目录（必须包含 `.agents/plugins/marketplace.json` 或 `.claude-plugin/marketplace.json`）；
 - 以卡片浏览每个市场的插件目录：展示 `.codex-plugin/plugin.json` 中的
@@ -154,6 +157,18 @@ preview → apply → 校验，无需人工确认。
   `GET /admin/codex/plugin-marketplaces/{marketplace}/plugins/{plugin}/icon`
   提供（仅限市场目录内的图片文件）；
 - 移除 marketplace 注册项（不删除本地插件文件）。
+
+### MCP
+
+- 列出 config.toml 中 `[mcp_servers]` 的直连注册项（stdio / 远程 URL、
+  命令与参数、环境变量键名），与 Codex 内 `/mcp` 面板对应；
+- 支持新增、编辑与删除 MCP 服务器（远程 URL 与本地命令二选一）；
+- 只读展示已启用插件通过自身 `.mcp.json` 捆绑的 MCP 服务器。
+
+### 技能
+
+- 只读列出本机 `$CODEX_HOME/skills` 目录，解析每个技能 SKILL.md 的
+  name / description frontmatter，并标记符号链接（插件或外部工具提供）。
 
 所有变更都会通过 `tomlkit` 保留 `config.toml` 中其他键、注释与顺序，并使用原子写入。
 

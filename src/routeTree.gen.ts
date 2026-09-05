@@ -14,6 +14,9 @@ import { Route as CodexPluginsRouteImport } from './routes/codex-plugins'
 import { Route as ModelsRouteImport } from './routes/models'
 import { Route as UpstreamsRouteImport } from './routes/upstreams'
 import { Route as UsageRouteImport } from './routes/usage'
+import { Route as CodexPluginsIndexRouteImport } from './routes/codex-plugins/index'
+import { Route as CodexPluginsMcpRouteImport } from './routes/codex-plugins/mcp'
+import { Route as CodexPluginsSkillsRouteImport } from './routes/codex-plugins/skills'
 
 const IndexRoute = IndexRouteImport.update({
   id: '/',
@@ -40,40 +43,87 @@ const UsageRoute = UsageRouteImport.update({
   path: '/usage',
   getParentRoute: () => rootRouteImport,
 } as any)
+const CodexPluginsIndexRoute = CodexPluginsIndexRouteImport.update({
+  id: '/',
+  path: '/',
+  getParentRoute: () => CodexPluginsRoute,
+} as any)
+const CodexPluginsMcpRoute = CodexPluginsMcpRouteImport.update({
+  id: '/mcp',
+  path: '/mcp',
+  getParentRoute: () => CodexPluginsRoute,
+} as any)
+const CodexPluginsSkillsRoute = CodexPluginsSkillsRouteImport.update({
+  id: '/skills',
+  path: '/skills',
+  getParentRoute: () => CodexPluginsRoute,
+} as any)
 
 export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
-  '/codex-plugins': typeof CodexPluginsRoute
+  '/codex-plugins': typeof CodexPluginsRouteWithChildren
   '/models': typeof ModelsRoute
   '/upstreams': typeof UpstreamsRoute
   '/usage': typeof UsageRoute
+  '/codex-plugins/mcp': typeof CodexPluginsMcpRoute
+  '/codex-plugins/skills': typeof CodexPluginsSkillsRoute
+  '/codex-plugins/': typeof CodexPluginsIndexRoute
 }
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
-  '/codex-plugins': typeof CodexPluginsRoute
   '/models': typeof ModelsRoute
   '/upstreams': typeof UpstreamsRoute
   '/usage': typeof UsageRoute
+  '/codex-plugins/mcp': typeof CodexPluginsMcpRoute
+  '/codex-plugins/skills': typeof CodexPluginsSkillsRoute
+  '/codex-plugins': typeof CodexPluginsIndexRoute
 }
 export interface FileRoutesById {
   __root__: typeof rootRouteImport
   '/': typeof IndexRoute
-  '/codex-plugins': typeof CodexPluginsRoute
+  '/codex-plugins': typeof CodexPluginsRouteWithChildren
   '/models': typeof ModelsRoute
   '/upstreams': typeof UpstreamsRoute
   '/usage': typeof UsageRoute
+  '/codex-plugins/mcp': typeof CodexPluginsMcpRoute
+  '/codex-plugins/skills': typeof CodexPluginsSkillsRoute
+  '/codex-plugins/': typeof CodexPluginsIndexRoute
 }
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
-  fullPaths: '/' | '/codex-plugins' | '/models' | '/upstreams' | '/usage'
+  fullPaths:
+    | '/'
+    | '/codex-plugins'
+    | '/models'
+    | '/upstreams'
+    | '/usage'
+    | '/codex-plugins/mcp'
+    | '/codex-plugins/skills'
+    | '/codex-plugins/'
   fileRoutesByTo: FileRoutesByTo
-  to: '/' | '/codex-plugins' | '/models' | '/upstreams' | '/usage'
-  id: '__root__' | '/' | '/codex-plugins' | '/models' | '/upstreams' | '/usage'
+  to:
+    | '/'
+    | '/models'
+    | '/upstreams'
+    | '/usage'
+    | '/codex-plugins/mcp'
+    | '/codex-plugins/skills'
+    | '/codex-plugins'
+  id:
+    | '__root__'
+    | '/'
+    | '/codex-plugins'
+    | '/models'
+    | '/upstreams'
+    | '/usage'
+    | '/codex-plugins/mcp'
+    | '/codex-plugins/skills'
+    | '/codex-plugins/'
   fileRoutesById: FileRoutesById
 }
 export interface RootRouteChildren {
   IndexRoute: typeof IndexRoute
-  CodexPluginsRoute: typeof CodexPluginsRoute
+  CodexPluginsRoute: typeof CodexPluginsRouteWithChildren
   ModelsRoute: typeof ModelsRoute
   UpstreamsRoute: typeof UpstreamsRoute
   UsageRoute: typeof UsageRoute
@@ -116,12 +166,49 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof UsageRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/codex-plugins/': {
+      id: '/codex-plugins/'
+      path: '/'
+      fullPath: '/codex-plugins/'
+      preLoaderRoute: typeof CodexPluginsIndexRouteImport
+      parentRoute: typeof CodexPluginsRoute
+    }
+    '/codex-plugins/mcp': {
+      id: '/codex-plugins/mcp'
+      path: '/mcp'
+      fullPath: '/codex-plugins/mcp'
+      preLoaderRoute: typeof CodexPluginsMcpRouteImport
+      parentRoute: typeof CodexPluginsRoute
+    }
+    '/codex-plugins/skills': {
+      id: '/codex-plugins/skills'
+      path: '/skills'
+      fullPath: '/codex-plugins/skills'
+      preLoaderRoute: typeof CodexPluginsSkillsRouteImport
+      parentRoute: typeof CodexPluginsRoute
+    }
   }
 }
 
+interface CodexPluginsRouteChildren {
+  CodexPluginsMcpRoute: typeof CodexPluginsMcpRoute
+  CodexPluginsSkillsRoute: typeof CodexPluginsSkillsRoute
+  CodexPluginsIndexRoute: typeof CodexPluginsIndexRoute
+}
+
+const CodexPluginsRouteChildren: CodexPluginsRouteChildren = {
+  CodexPluginsMcpRoute: CodexPluginsMcpRoute,
+  CodexPluginsSkillsRoute: CodexPluginsSkillsRoute,
+  CodexPluginsIndexRoute: CodexPluginsIndexRoute,
+}
+
+const CodexPluginsRouteWithChildren = CodexPluginsRoute._addFileChildren(
+  CodexPluginsRouteChildren,
+)
+
 const rootRouteChildren: RootRouteChildren = {
   IndexRoute: IndexRoute,
-  CodexPluginsRoute: CodexPluginsRoute,
+  CodexPluginsRoute: CodexPluginsRouteWithChildren,
   ModelsRoute: ModelsRoute,
   UpstreamsRoute: UpstreamsRoute,
   UsageRoute: UsageRoute,

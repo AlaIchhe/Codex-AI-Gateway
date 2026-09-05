@@ -150,6 +150,14 @@ class PluginToggleRequest(BaseModel):
     enabled: bool
 
 
+class McpServerUpsertRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
+    command: str | None = None
+    args: list[str] = Field(default_factory=list, max_length=64)
+    url: str | None = None
+    env: dict[str, str] = Field(default_factory=dict, max_length=32)
+
+
 class ApplyRequest(BaseModel):
     revision_id: str
     fingerprint: dict[str, Any]

@@ -26,7 +26,6 @@ import {
 import { Input } from "@/components/coss/components/input"
 import { Label } from "@/components/coss/components/label"
 import { Switch } from "@/components/coss/components/switch"
-import { PageHeader } from "@/components/page-header"
 import {
   api,
   type CodexPluginCatalogEntry,
@@ -339,7 +338,7 @@ function MarketplaceSection({
   )
 }
 
-export function CodexPluginsPage() {
+export function CodexPluginsSubPage() {
   const queryClient = useQueryClient()
   const [name, setName] = useState("")
   const [source, setSource] = useState("")
@@ -430,12 +429,7 @@ export function CodexPluginsPage() {
     data?.plugins.filter((plugin) => !plugin.marketplace_registered) ?? []
 
   return (
-    <section aria-labelledby="codex-plugins-heading" className="space-y-4">
-      <PageHeader
-        title="Codex 插件管理"
-        description="浏览本地插件市场目录并启用插件，配置写入本机 Codex config.toml。"
-      />
-
+    <>
       <AnimatedCard
         title="注册本地插件市场"
         description="source 必须包含 .agents/plugins/marketplace.json 或 .claude-plugin/marketplace.json。"
@@ -599,6 +593,6 @@ export function CodexPluginsPage() {
           配置文件：{data.config_path}
         </p>
       ) : null}
-    </section>
+    </>
   )
 }
