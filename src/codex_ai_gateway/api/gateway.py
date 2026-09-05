@@ -25,6 +25,7 @@ from codex_ai_gateway.adapters.responses_chat_translation import (
     response_created_event,
     response_failed_event,
     response_function_call_done_events,
+    restore_namespace_tool_name,
     response_message_done_event,
     response_message_started_events,
     response_sse,
@@ -188,6 +189,7 @@ async def _attempt_with_fallback(
         runtime.usage_log.create_pending(event)
         try:
             custom_tool_names: set[str] = set()
+            namespace_tool_aliases: dict[str, dict[str, str]] = {}
             if protocol == WireProtocol.chat_completions:
                 normal = normalize_request(inbound_protocol="responses", body=body)
                 validate_translatable(normal)
@@ -195,6 +197,7 @@ async def _attempt_with_fallback(
                     normal, target_model=offering.provider_model_id
                 )
                 custom_tool_names = normal.custom_tool_names
+                namespace_tool_aliases = normal.namespace_tool_aliases
             else:
                 chat_body = disable_unsupported_web_search(ensure_prefill_continuation(body))
             streaming = bool(body.get("stream"))
@@ -208,6 +211,7 @@ async def _attempt_with_fallback(
                     protocol,
                     offering,
                     custom_tool_names=custom_tool_names,
+                    namespace_tool_aliases=namespace_tool_aliases,
                 )
             result = await runtime.upstream_client.request(
                 upstream,
@@ -361,6 +365,7 @@ async def _stream_response(
     offering: Any,
     *,
     custom_tool_names: set[str] | None = None,
+    namespace_tool_aliases: dict[str, dict[str, str]] | None = None,
 ) -> Response:
     path = "/chat/completions" if protocol == WireProtocol.chat_completions else "/responses"
     upstream_stream = await runtime.upstream_client.open_stream(
@@ -483,7 +488,11 @@ async def _stream_response(
                                 is_custom = (fn_preview.get("name") or "") in (custom_tool_names or set())
                                 yield response_sse(
                                     response_tool_call_started_event(
-                                        tc_index, call_id, fn_preview.get("name") or "", is_custom=is_custom
+                                        tc_index,
+                                        call_id,
+                                        fn_preview.get("name") or "",
+                                        is_custom=is_custom,
+                                        namespace_tool_aliases=namespace_tool_aliases,
                                     )
                                 )
                                 emitted_tool_starts.add(tc_index)
@@ -555,6 +564,7 @@ async def _stream_response(
                     for tc_done in response_function_call_done_events(
                         [accumulated_tool_calls[i] for i in sorted(accumulated_tool_calls)],
                         custom_tool_names=custom_tool_names,
+                        namespace_tool_aliases=namespace_tool_aliases,
                     ):
                         yield response_sse(tc_done)
 
@@ -573,23 +583,35 @@ async def _stream_response(
                         except (TypeError, json.JSONDecodeError):
                             parsed_args = {}
                         inp = parsed_args.get("input") if isinstance(parsed_args, dict) else ""
-                        output_items.append({
+                        custom_restored, custom_ns = restore_namespace_tool_name(
+                            fn.get("name") or "", namespace_tool_aliases
+                        )
+                        custom_item = {
                             "id": call_id,
                             "type": "custom_tool_call",
                             "call_id": call_id,
-                            "name": fn.get("name") or "",
+                            "name": custom_restored,
                             "input": inp if isinstance(inp, str) else "",
                             "status": "completed",
-                        })
+                        }
+                        if custom_ns is not None:
+                            custom_item["namespace"] = custom_ns
+                        output_items.append(custom_item)
                     else:
-                        output_items.append({
+                        restored_name, restored_ns = restore_namespace_tool_name(
+                            fn.get("name") or "", namespace_tool_aliases
+                        )
+                        restored_item = {
                             "id": call_id,
                             "type": "function_call",
                             "call_id": call_id,
-                            "name": fn.get("name") or "",
+                            "name": restored_name,
                             "arguments": fn.get("arguments") or "",
                             "status": "completed",
-                        })
+                        }
+                        if restored_ns is not None:
+                            restored_item["namespace"] = restored_ns
+                        output_items.append(restored_item)
                 if accumulated_text:
                     output_items.append({
                         "id": "msg_placeholder",

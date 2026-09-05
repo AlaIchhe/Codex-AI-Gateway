@@ -337,17 +337,35 @@ def response_message_started_events() -> list[dict[str, Any]]:
     ]
 
 
+def restore_namespace_tool_name(
+    name: str, aliases: dict[str, dict[str, str]] | None
+) -> tuple[str, str | None]:
+    """把上游平铺的 ns__tool 名称还原为 (子工具名, namespace)。"""
+    alias = (aliases or {}).get(name)
+    if not alias:
+        return name, None
+    return str(alias.get("name") or name), str(alias.get("namespace") or "") or None
+
+
 def response_tool_call_started_event(
-    tc_index: int, call_id: str, name: str, *, is_custom: bool
+    tc_index: int,
+    call_id: str,
+    name: str,
+    *,
+    is_custom: bool,
+    namespace_tool_aliases: dict[str, dict[str, str]] | None = None,
 ) -> dict[str, Any]:
     """流式期间 tool call 首次出现时的 output_item.added 事件。"""
+    restored_name, namespace = restore_namespace_tool_name(name, namespace_tool_aliases)
     item: dict[str, Any] = {
         "id": call_id,
         "type": "custom_tool_call" if is_custom else "function_call",
         "call_id": call_id,
-        "name": name,
+        "name": restored_name,
         "status": "in_progress",
     }
+    if namespace is not None:
+        item["namespace"] = namespace
     if not is_custom:
         item["arguments"] = ""
     return {
@@ -378,7 +396,10 @@ def response_content_part_done_events(text: str) -> list[dict[str, Any]]:
 
 
 def response_function_call_done_events(
-    tool_calls: list[dict[str, Any]], *, custom_tool_names: set[str] | None = None
+    tool_calls: list[dict[str, Any]],
+    *,
+    custom_tool_names: set[str] | None = None,
+    namespace_tool_aliases: dict[str, dict[str, str]] | None = None,
 ) -> list[dict[str, Any]]:
     """把累积的 Chat tool_calls 完成态转为 Responses function_call done 事件。"""
     events: list[dict[str, Any]] = []
@@ -388,13 +409,20 @@ def response_function_call_done_events(
         name = fn.get("name") or ""
         if name in (custom_tool_names or set()):
             item = _custom_tool_call_item(call_id, name, fn.get("arguments") or "")
+            restored_name, namespace = restore_namespace_tool_name(name, namespace_tool_aliases)
+            item["name"] = restored_name
+            if namespace is not None:
+                item["namespace"] = namespace
         else:
+            restored_name, namespace = restore_namespace_tool_name(name, namespace_tool_aliases)
             item = {
                 "type": "function_call",
                 "call_id": call_id,
-                "name": name,
+                "name": restored_name,
                 "arguments": fn.get("arguments") or "",
             }
+            if namespace is not None:
+                item["namespace"] = namespace
         events.append(
             {
                 "type": "response.output_item.done",

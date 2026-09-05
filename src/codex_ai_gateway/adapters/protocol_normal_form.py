@@ -42,6 +42,7 @@ class NormalRequest:
     tool_choice: Any = None
     extra: dict[str, Any] = field(default_factory=dict)
     custom_tool_names: set[str] = field(default_factory=set)
+    namespace_tool_aliases: dict[str, dict[str, str]] = field(default_factory=dict)
 
 
 def _reject_hosted_tools(body: dict[str, Any]) -> None:
@@ -196,8 +197,8 @@ def _normalize_responses(body: dict[str, Any], model: str, stream: bool) -> Norm
                 f"无法翻译 responses input item: type={item_type!r}",
             )
 
-    tools, custom_tool_names = _norm_tools(body.get("tools"))
-    tool_choice = body.get("tool_choice")
+    tools, custom_tool_names, aliases = _norm_tools(body.get("tools"))
+    tool_choice = _normalize_tool_choice(body.get("tool_choice"), tools, aliases)
     sampling = _extract_sampling(body, responses=True)
     return NormalRequest(
         model=model,
@@ -208,6 +209,7 @@ def _normalize_responses(body: dict[str, Any], model: str, stream: bool) -> Norm
         tool_choice=tool_choice,
         extra={"instructions": body.get("instructions")},
         custom_tool_names=custom_tool_names,
+        namespace_tool_aliases=aliases,
     )
 
 
@@ -228,7 +230,7 @@ def _normalize_chat(body: dict[str, Any], model: str, stream: bool) -> NormalReq
                 name=msg.get("name"),
             )
         )
-    tools, custom_tool_names = _norm_tools(body.get("tools"))
+    tools, custom_tool_names, aliases = _norm_tools(body.get("tools"))
     sampling = _extract_sampling(body, responses=False)
     return NormalRequest(
         model=model,
@@ -239,19 +241,87 @@ def _normalize_chat(body: dict[str, Any], model: str, stream: bool) -> NormalReq
         tool_choice=body.get("tool_choice"),
         extra={},
         custom_tool_names=custom_tool_names,
+        namespace_tool_aliases=aliases,
     )
 
 
-def _norm_tools(tools: Any) -> tuple[list[dict[str, Any]], set[str]]:
+def _flat_tool_name(namespace: str, name: str) -> str:
+    if namespace.endswith("__") or name.startswith("__"):
+        return f"{namespace}{name}"
+    return f"{namespace}__{name}"
+
+
+def _representable_name(value: Any) -> bool:
+    if not isinstance(value, str) or not value:
+        return False
+    return all(ord(ch) > 31 and ord(ch) != 127 for ch in value)
+
+
+def _custom_tool_to_chat(name: str, description: Any) -> dict[str, Any]:
+    description = str(description or "").strip()
+    input_description = (
+        "Raw apply_patch input. Begin exactly with `*** Begin Patch` and use the standard patch envelope."
+        if name == "apply_patch"
+        else "Raw freeform input for this custom tool."
+    )
+    if description:
+        description = f"{description}\n\nThis is a FREEFORM tool. Put only the raw tool input in `input`; do not wrap it in JSON or markdown."
+    else:
+        description = f"FREEFORM custom tool: {name}. Put only the raw tool input in `input`; do not wrap it in JSON or markdown."
+    return {
+        "type": "function",
+        "function": {
+            "name": name,
+            "description": description,
+            "parameters": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "input": {"type": "string", "description": input_description}
+                },
+                "required": ["input"],
+            },
+        },
+    }
+
+
+def _normalize_tool_choice(
+    tool_choice: Any, tools: list[dict[str, Any]], aliases: dict[str, dict[str, str]]
+) -> Any:
+    """把 Responses namespace 风格 tool_choice 选择器降级为 Chat 形状。"""
+    if not isinstance(tool_choice, dict):
+        return tool_choice
+    if tool_choice.get("type") == "function" and isinstance(tool_choice.get("namespace"), str):
+        name = tool_choice.get("name")
+        if not _representable_name(name):
+            raise UntranslatableCapabilityError(
+                "tool_choice", "tool_choice namespace 选择器缺少有效 name。"
+            )
+        wire = _flat_tool_name(tool_choice["namespace"], name)
+        known = {t["function"]["name"] for t in tools}
+        if wire not in aliases and wire not in known:
+            raise UntranslatableCapabilityError(
+                "tool_choice", f"tool_choice 引用了未声明的工具: {wire}"
+            )
+        return {"type": "function", "function": {"name": wire}}
+    return tool_choice
+
+
+def _norm_tools(tools: Any) -> tuple[list[dict[str, Any]], set[str], dict[str, dict[str, str]]]:
     if not isinstance(tools, list):
-        return [], set()
+        return [], set(), {}
     result: list[dict[str, Any]] = []
     custom_names: set[str] = set()
+    aliases: dict[str, dict[str, str]] = {}
+    seen_names: set[str] = set()
     for tool in tools:
         if not isinstance(tool, dict):
             continue
         if "function" in tool:
             result.append(deepcopy(tool))
+            name = (tool.get("function") or {}).get("name")
+            if isinstance(name, str) and name:
+                seen_names.add(name)
         elif tool.get("type") == "web_search":
             # Chat Completions 无法承载 Responses hosted web_search；
             # 对降级上游显式禁用该工具，避免上游 400。
@@ -269,39 +339,64 @@ def _norm_tools(tools: Any) -> tuple[list[dict[str, Any]], set[str]]:
                     },
                 }
             )
+            name = tool.get("name")
+            if isinstance(name, str) and name:
+                seen_names.add(name)
         elif tool.get("type") == "custom":
             name = tool.get("name")
             if not isinstance(name, str) or not name:
                 raise UntranslatableCapabilityError("custom_tool", "custom tool 缺少 name。")
             custom_names.add(name)
-            description = str(tool.get("description") or "").strip()
-            input_description = (
-                "Raw apply_patch input. Begin exactly with `*** Begin Patch` and use the standard patch envelope."
-                if name == "apply_patch"
-                else "Raw freeform input for this custom tool."
-            )
-            if description:
-                description = f"{description}\n\nThis is a FREEFORM tool. Put only the raw tool input in `input`; do not wrap it in JSON or markdown."
-            else:
-                description = f"FREEFORM custom tool: {name}. Put only the raw tool input in `input`; do not wrap it in JSON or markdown."
-            result.append(
-                {
-                    "type": "function",
-                    "function": {
-                        "name": name,
-                        "description": description,
-                        "parameters": {
-                            "type": "object",
-                            "additionalProperties": False,
-                            "properties": {
-                                "input": {"type": "string", "description": input_description}
+            seen_names.add(name)
+            result.append(_custom_tool_to_chat(name, tool.get("description")))
+        elif tool.get("type") == "namespace":
+            # Codex MCP/子代理工具：namespace 组展开为 Chat 平铺 function 工具。
+            ns = tool.get("name")
+            children = tool.get("tools")
+            if not _representable_name(ns) or not isinstance(children, list):
+                raise UntranslatableCapabilityError(
+                    "namespace_tool", "namespace 工具缺少有效的 name 或 tools 列表。"
+                )
+            ns_desc = str(tool.get("description") or "").strip()
+            for child in children:
+                if not isinstance(child, dict) or child.get("type") == "namespace":
+                    raise UntranslatableCapabilityError(
+                        "namespace_tool", "namespace 不支持嵌套子工具。"
+                    )
+                child_name = child.get("name")
+                if not _representable_name(child_name):
+                    raise UntranslatableCapabilityError(
+                        "namespace_tool", "namespace 子工具缺少有效 name。"
+                    )
+                wire = _flat_tool_name(ns, child_name)
+                if wire in seen_names:
+                    raise UntranslatableCapabilityError(
+                        "namespace_tool_collision", f"namespace 工具展开后名称冲突: {wire}"
+                    )
+                seen_names.add(wire)
+                kind = child.get("type") if child.get("type") in {"function", "custom"} else "function"
+                aliases[wire] = {"namespace": ns, "name": child_name, "kind": kind}
+                description = "\n\n".join(
+                    part
+                    for part in (ns_desc, str(child.get("description") or "").strip())
+                    if part
+                )
+                if kind == "custom":
+                    custom_names.add(wire)
+                    result.append(_custom_tool_to_chat(wire, description))
+                else:
+                    result.append(
+                        {
+                            "type": "function",
+                            "function": {
+                                "name": wire,
+                                "description": description or None,
+                                "parameters": child.get("parameters"),
+                                "strict": child.get("strict"),
                             },
-                            "required": ["input"],
-                        },
-                    },
-                }
-            )
-    return result, custom_names
+                        }
+                    )
+    return result, custom_names, aliases
 
 
 def _extract_sampling(body: dict[str, Any], *, responses: bool) -> dict[str, Any]:
