@@ -84,6 +84,27 @@ export type RoutingPreference = {
   updated_at: string
 }
 
+export type CodexPluginMarketplace = {
+  name: string
+  source_type: string
+  source: string | null
+  manifest_path: string | null
+  manifest_valid: boolean
+  plugin_count: number
+  plugins: Array<Record<string, unknown>>
+}
+
+export type CodexPluginMarketplacesView = {
+  config_path: string
+  exists: boolean
+  marketplaces: CodexPluginMarketplace[]
+  plugins: Array<{
+    plugin_id: string
+    enabled: boolean
+    config: Record<string, unknown>
+  }>
+}
+
 export type GatewayTokenView = {
   id: string
   status: string
@@ -166,6 +187,27 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 }
 
 export const api = {
+  listCodexPluginMarketplaces: () =>
+    request<CodexPluginMarketplacesView>("/admin/codex/plugin-marketplaces"),
+  registerCodexPluginMarketplace: (body: {
+    name: string
+    source: string
+    default_enabled?: boolean
+  }) =>
+    request<CodexPluginMarketplacesView>("/admin/codex/plugin-marketplaces", {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  toggleCodexPlugin: (body: { plugin_id: string; enabled: boolean }) =>
+    request<CodexPluginMarketplacesView>("/admin/codex/plugins/toggle", {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  removeCodexPluginMarketplace: (name: string) =>
+    request<CodexPluginMarketplacesView>(
+      `/admin/codex/plugin-marketplaces/${encodeURIComponent(name)}`,
+      { method: "DELETE" },
+    ),
   listUpstreams: () => request<Upstream[]>("/admin/upstreams"),
   listPresets: () => request<PresetProvider[]>("/admin/presets"),
   createUpstream: (body: UpstreamCreatePayload) =>

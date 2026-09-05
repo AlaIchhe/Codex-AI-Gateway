@@ -10,6 +10,7 @@
 
 import { Route as rootRouteImport } from './routes/__root'
 import { Route as IndexRouteImport } from './routes/index'
+import { Route as CodexPluginsRouteImport } from './routes/codex-plugins'
 import { Route as ModelsRouteImport } from './routes/models'
 import { Route as UpstreamsRouteImport } from './routes/upstreams'
 import { Route as UsageRouteImport } from './routes/usage'
@@ -17,6 +18,11 @@ import { Route as UsageRouteImport } from './routes/usage'
 const IndexRoute = IndexRouteImport.update({
   id: '/',
   path: '/',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const CodexPluginsRoute = CodexPluginsRouteImport.update({
+  id: '/codex-plugins',
+  path: '/codex-plugins',
   getParentRoute: () => rootRouteImport,
 } as any)
 const ModelsRoute = ModelsRouteImport.update({
@@ -37,12 +43,14 @@ const UsageRoute = UsageRouteImport.update({
 
 export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
+  '/codex-plugins': typeof CodexPluginsRoute
   '/models': typeof ModelsRoute
   '/upstreams': typeof UpstreamsRoute
   '/usage': typeof UsageRoute
 }
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
+  '/codex-plugins': typeof CodexPluginsRoute
   '/models': typeof ModelsRoute
   '/upstreams': typeof UpstreamsRoute
   '/usage': typeof UsageRoute
@@ -50,20 +58,22 @@ export interface FileRoutesByTo {
 export interface FileRoutesById {
   __root__: typeof rootRouteImport
   '/': typeof IndexRoute
+  '/codex-plugins': typeof CodexPluginsRoute
   '/models': typeof ModelsRoute
   '/upstreams': typeof UpstreamsRoute
   '/usage': typeof UsageRoute
 }
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
-  fullPaths: '/' | '/models' | '/upstreams' | '/usage'
+  fullPaths: '/' | '/codex-plugins' | '/models' | '/upstreams' | '/usage'
   fileRoutesByTo: FileRoutesByTo
-  to: '/' | '/models' | '/upstreams' | '/usage'
-  id: '__root__' | '/' | '/models' | '/upstreams' | '/usage'
+  to: '/' | '/codex-plugins' | '/models' | '/upstreams' | '/usage'
+  id: '__root__' | '/' | '/codex-plugins' | '/models' | '/upstreams' | '/usage'
   fileRoutesById: FileRoutesById
 }
 export interface RootRouteChildren {
   IndexRoute: typeof IndexRoute
+  CodexPluginsRoute: typeof CodexPluginsRoute
   ModelsRoute: typeof ModelsRoute
   UpstreamsRoute: typeof UpstreamsRoute
   UsageRoute: typeof UsageRoute
@@ -76,6 +86,13 @@ declare module '@tanstack/react-router' {
       path: '/'
       fullPath: '/'
       preLoaderRoute: typeof IndexRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/codex-plugins': {
+      id: '/codex-plugins'
+      path: '/codex-plugins'
+      fullPath: '/codex-plugins'
+      preLoaderRoute: typeof CodexPluginsRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/models': {
@@ -104,6 +121,7 @@ declare module '@tanstack/react-router' {
 
 const rootRouteChildren: RootRouteChildren = {
   IndexRoute: IndexRoute,
+  CodexPluginsRoute: CodexPluginsRoute,
   ModelsRoute: ModelsRoute,
   UpstreamsRoute: UpstreamsRoute,
   UsageRoute: UsageRoute,

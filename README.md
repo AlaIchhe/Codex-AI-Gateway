@@ -139,7 +139,18 @@ Authorization: Bearer <gateway-token>
 点，并在 schema、连通性、启动配置检查失败时自动回滚。目录发布变更会触发
 preview → apply → 校验，无需人工确认。
 
-## 7. 用量与脱敏
+## 7. Codex 插件管理
+
+管理界面的“插件”页用于维护本机 Codex 的本地插件市场：
+
+- 注册本地 marketplace 目录（必须包含 `.agents/plugins/marketplace.json` 或 `.claude-plugin/marketplace.json`）；
+- 查看 marketplace 和插件启用状态；
+- 启用 / 禁用 `plugin-name@marketplace-name`；
+- 移除 marketplace 注册项（不删除本地插件文件）。
+
+所有变更都会通过 `tomlkit` 保留 `config.toml` 中其他键、注释与顺序，并使用原子写入。
+
+## 8. 用量与脱敏
 
 "用量"页展示 attempt 级结果、上游归属、协议、token 类别与成本口径。
 provider 上报用量优先于本地估算；没有 provider 用量的记录标记为

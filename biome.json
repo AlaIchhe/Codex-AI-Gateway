@@ -14,7 +14,8 @@
       "!**/.specify",
       "!**/.agents",
       "!**/artifacts",
-      "!**/e2e-artifacts"
+      "!**/e2e-artifacts",
+      "!reference-repos"
     ]
   },
   "formatter": {

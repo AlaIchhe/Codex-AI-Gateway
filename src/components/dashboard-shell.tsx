@@ -1,5 +1,13 @@
 import { Link, Outlet } from "@tanstack/react-router"
-import { BarChart3, Boxes, Menu, Network, ShieldAlert, X } from "lucide-react"
+import {
+  BarChart3,
+  Boxes,
+  Menu,
+  Network,
+  Package,
+  ShieldAlert,
+  X,
+} from "lucide-react"
 import { useState } from "react"
 import { Button } from "@/components/coss/components/button"
 import { AnimatedGridPattern } from "@/components/magicui/animated-grid-pattern"
@@ -12,6 +20,7 @@ const navigation = [
   { to: "/", label: "总览", icon: Boxes },
   { to: "/upstreams", label: "上游", icon: Network },
   { to: "/models", label: "模型", icon: ShieldAlert },
+  { to: "/codex-plugins", label: "插件", icon: Package },
   { to: "/usage", label: "用量", icon: BarChart3 },
 ] as const
 

@@ -69,6 +69,10 @@ def create_app(
     async def models_page() -> HTMLResponse:
         return _index_response(frontend_dist)
 
+    @app.get("/codex-plugins", include_in_schema=False)
+    async def codex_plugins_page() -> HTMLResponse:
+        return _index_response(frontend_dist)
+
     @app.get("/usage", include_in_schema=False)
     async def usage_page() -> HTMLResponse:
         return _index_response(frontend_dist)

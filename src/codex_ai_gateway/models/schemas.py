@@ -139,6 +139,17 @@ class ProfilePreviewRequest(BaseModel):
     revision_id: str | None = None
 
 
+class MarketplaceRegisterRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=80)
+    source: str
+    default_enabled: bool = False
+
+
+class PluginToggleRequest(BaseModel):
+    plugin_id: str = Field(min_length=1, max_length=160)
+    enabled: bool
+
+
 class ApplyRequest(BaseModel):
     revision_id: str
     fingerprint: dict[str, Any]

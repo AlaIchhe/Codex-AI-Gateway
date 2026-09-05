@@ -7,6 +7,13 @@ from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request
 
+from codex_ai_gateway.integrations.codex_plugin_marketplace import (
+    CodexPluginMarketplaceError,
+    list_plugin_marketplaces,
+    register_local_marketplace,
+    remove_marketplace,
+    set_plugin_enabled,
+)
 from codex_ai_gateway.integrations.codex_writer import resolve_config_path, resolve_profile_path
 from codex_ai_gateway.models.entities import (
     IntegrationProfile,
@@ -15,6 +22,8 @@ from codex_ai_gateway.models.entities import (
 )
 from codex_ai_gateway.models.schemas import (
     ApplyRequest,
+    MarketplaceRegisterRequest,
+    PluginToggleRequest,
     ProfileCreate,
     ProfilePreviewRequest,
     SettingsPatch,
@@ -68,6 +77,67 @@ def patch_local_integration(request: Request, patch: SettingsPatch) -> SettingsV
         codex_auto_integration_enabled=state.settings.codex_auto_integration_enabled,
         secret_backend_available=secret_ok,
     )
+
+
+@router.get("/plugin-marketplaces")
+def get_plugin_marketplaces(request: Request) -> dict[str, Any]:
+    runtime = _runtime(request)
+    state = runtime.state_store.read_state()
+    profile = next((p for p in state.integration_profiles if p.config_path), None)
+    if profile is None:
+        raise HTTPException(status_code=404, detail="本地 Codex profile 不存在")
+    return list_plugin_marketplaces(profile.config_path)
+
+
+@router.post("/plugin-marketplaces")
+def post_register_marketplace(
+    request: Request,
+    payload: MarketplaceRegisterRequest,
+) -> dict[str, Any]:
+    runtime = _runtime(request)
+    state = runtime.state_store.read_state()
+    profile = next((p for p in state.integration_profiles if p.config_path), None)
+    if profile is None:
+        raise HTTPException(status_code=404, detail="本地 Codex profile 不存在")
+    try:
+        return register_local_marketplace(
+            profile.config_path,
+            name=payload.name,
+            source=payload.source,
+            default_enabled=payload.default_enabled,
+        )
+    except CodexPluginMarketplaceError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/plugins/toggle")
+def post_toggle_plugin(request: Request, payload: PluginToggleRequest) -> dict[str, Any]:
+    runtime = _runtime(request)
+    state = runtime.state_store.read_state()
+    profile = next((p for p in state.integration_profiles if p.config_path), None)
+    if profile is None:
+        raise HTTPException(status_code=404, detail="本地 Codex profile 不存在")
+    try:
+        return set_plugin_enabled(
+            profile.config_path,
+            plugin_id=payload.plugin_id,
+            enabled=payload.enabled,
+        )
+    except CodexPluginMarketplaceError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.delete("/plugin-marketplaces/{name}")
+def delete_marketplace(request: Request, name: str) -> dict[str, Any]:
+    runtime = _runtime(request)
+    state = runtime.state_store.read_state()
+    profile = next((p for p in state.integration_profiles if p.config_path), None)
+    if profile is None:
+        raise HTTPException(status_code=404, detail="本地 Codex profile 不存在")
+    try:
+        return remove_marketplace(profile.config_path, name=name)
+    except CodexPluginMarketplaceError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @router.get("/profiles")

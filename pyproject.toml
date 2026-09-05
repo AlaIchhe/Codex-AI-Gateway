@@ -34,7 +34,7 @@ packages = ["src/codex_ai_gateway"]
 [tool.ruff]
 line-length = 100
 target-version = "py312"
-exclude = [".venv", "build", "dist"]
+exclude = [".venv", "build", "dist", "reference-repos"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]
@@ -42,3 +42,6 @@ ignore = ["E501"]
 
 [tool.ruff.format]
 quote-style = "double"
+
+[tool.pytest.ini_options]
+norecursedirs = ["reference-repos"]
