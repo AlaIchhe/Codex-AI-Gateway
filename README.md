@@ -153,6 +153,9 @@ preview → apply → 校验，无需人工确认。
 - 目录中的插件（含尚未写入 config.toml 的）都可直接启用 / 禁用
   `plugin-name@marketplace-name`；manifest 变更后遗留的插件配置标记为
   “已失效”，仅允许禁用；
+- git 市场（`source_type = "git"`，由 Codex 自行注册）按克隆约定解析到
+  `$CODEX_HOME/.tmp/marketplaces/<市场名>`，同样可浏览与开关；尚未拉取时
+  显示等待提示，不会建议移除；
 - 插件图标通过只读端点
   `GET /admin/codex/plugin-marketplaces/{marketplace}/plugins/{plugin}/icon`
   提供（仅限市场目录内的图片文件）；
@@ -167,8 +170,10 @@ preview → apply → 校验，无需人工确认。
 
 ### 技能
 
-- 只读列出本机 `$CODEX_HOME/skills` 目录，解析每个技能 SKILL.md 的
-  name / description frontmatter，并标记符号链接（插件或外部工具提供）。
+- 列出本机 `$CODEX_HOME/skills` 目录，解析每个技能 SKILL.md 的
+  name / description frontmatter，并标记符号链接（插件或外部工具提供）；
+- 支持新增技能（生成 SKILL.md 骨架）与删除；删除符号链接技能只摘链，
+  不删目标内容。
 
 所有变更都会通过 `tomlkit` 保留 `config.toml` 中其他键、注释与顺序，并使用原子写入。
 
