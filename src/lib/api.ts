@@ -84,6 +84,28 @@ export type RoutingPreference = {
   updated_at: string
 }
 
+export type CodexPluginCatalogEntry = {
+  plugin_id: string
+  name: string
+  configured: boolean
+  enabled: boolean
+  stale: boolean
+  has_metadata: boolean
+  display_name: string | null
+  description: string | null
+  long_description: string | null
+  category: string | null
+  version: string | null
+  author: string | null
+  developer_name: string | null
+  keywords: string[]
+  capabilities: string[]
+  homepage: string | null
+  repository: string | null
+  brand_color: string | null
+  icon_url: string | null
+}
+
 export type CodexPluginMarketplace = {
   name: string
   source_type: string
@@ -92,6 +114,7 @@ export type CodexPluginMarketplace = {
   manifest_valid: boolean
   plugin_count: number
   plugins: Array<Record<string, unknown>>
+  catalog: CodexPluginCatalogEntry[]
 }
 
 export type CodexPluginMarketplacesView = {
@@ -102,6 +125,7 @@ export type CodexPluginMarketplacesView = {
     plugin_id: string
     enabled: boolean
     config: Record<string, unknown>
+    marketplace_registered: boolean
   }>
 }
 

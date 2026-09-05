@@ -144,8 +144,15 @@ preview → apply → 校验，无需人工确认。
 管理界面的“插件”页用于维护本机 Codex 的本地插件市场：
 
 - 注册本地 marketplace 目录（必须包含 `.agents/plugins/marketplace.json` 或 `.claude-plugin/marketplace.json`）；
-- 查看 marketplace 和插件启用状态；
-- 启用 / 禁用 `plugin-name@marketplace-name`；
+- 以卡片浏览每个市场的插件目录：展示 `.codex-plugin/plugin.json` 中的
+  displayName、描述、分类、版本、作者、能力标签与本地图标，支持搜索与
+  分类筛选；
+- 目录中的插件（含尚未写入 config.toml 的）都可直接启用 / 禁用
+  `plugin-name@marketplace-name`；manifest 变更后遗留的插件配置标记为
+  “已失效”，仅允许禁用；
+- 插件图标通过只读端点
+  `GET /admin/codex/plugin-marketplaces/{marketplace}/plugins/{plugin}/icon`
+  提供（仅限市场目录内的图片文件）；
 - 移除 marketplace 注册项（不删除本地插件文件）。
 
 所有变更都会通过 `tomlkit` 保留 `config.toml` 中其他键、注释与顺序，并使用原子写入。

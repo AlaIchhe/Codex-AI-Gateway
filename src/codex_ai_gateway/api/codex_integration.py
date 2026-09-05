@@ -6,12 +6,14 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request
+from fastapi.responses import FileResponse
 
 from codex_ai_gateway.integrations.codex_plugin_marketplace import (
     CodexPluginMarketplaceError,
     list_plugin_marketplaces,
     register_local_marketplace,
     remove_marketplace,
+    resolve_plugin_icon,
     set_plugin_enabled,
 )
 from codex_ai_gateway.integrations.codex_writer import resolve_config_path, resolve_profile_path
@@ -125,6 +127,24 @@ def post_toggle_plugin(request: Request, payload: PluginToggleRequest) -> dict[s
         )
     except CodexPluginMarketplaceError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get("/plugin-marketplaces/{name}/plugins/{plugin_name}/icon")
+def get_plugin_icon(request: Request, name: str, plugin_name: str) -> FileResponse:
+    runtime = _runtime(request)
+    state = runtime.state_store.read_state()
+    profile = next((p for p in state.integration_profiles if p.config_path), None)
+    if profile is None:
+        raise HTTPException(status_code=404, detail="本地 Codex profile 不存在")
+    try:
+        icon_path, media_type = resolve_plugin_icon(
+            profile.config_path,
+            marketplace_name=name,
+            plugin_name=plugin_name,
+        )
+    except CodexPluginMarketplaceError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return FileResponse(icon_path, media_type=media_type)
 
 
 @router.delete("/plugin-marketplaces/{name}")

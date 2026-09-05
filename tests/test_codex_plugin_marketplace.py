@@ -10,6 +10,7 @@ from codex_ai_gateway.integrations.codex_plugin_marketplace import (
     list_plugin_marketplaces,
     register_local_marketplace,
     remove_marketplace,
+    resolve_plugin_icon,
     set_plugin_enabled,
 )
 
@@ -29,6 +30,40 @@ def _make_marketplace(tmp_path: Path) -> Path:
         ),
         encoding="utf-8",
     )
+    return root
+
+
+def _make_rich_marketplace(tmp_path: Path) -> Path:
+    root = _make_marketplace(tmp_path)
+    plugin_dir = root / "plugins" / "demo-plugin"
+    manifest_dir = plugin_dir / ".codex-plugin"
+    manifest_dir.mkdir(parents=True)
+    (manifest_dir / "plugin.json").write_text(
+        json.dumps(
+            {
+                "name": "demo-plugin",
+                "version": "0.1.0",
+                "description": "顶层描述",
+                "author": {"name": "Ada"},
+                "homepage": "https://example.com",
+                "keywords": ["demo", "test"],
+                "interface": {
+                    "displayName": "Demo Plugin",
+                    "shortDescription": "一句话简介",
+                    "longDescription": "很长的介绍。",
+                    "developerName": "Ada",
+                    "category": "Developer Tools",
+                    "capabilities": ["MCP", "Read"],
+                    "brandColor": "#226DB4",
+                    "logo": "./assets/logo.png",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    assets = plugin_dir / "assets"
+    assets.mkdir()
+    (assets / "logo.png").write_bytes(b"\x89PNG\r\n\x1a\n")
     return root
 
 
@@ -69,6 +104,44 @@ def test_toggle_plugin_requires_registered_marketplace(tmp_path: Path) -> None:
         raise AssertionError("expected CodexPluginMarketplaceError")
 
 
+def test_toggle_allows_official_openai_marketplace(tmp_path: Path) -> None:
+    """Codex 官方内置市场（openai-*）不由网关注册，但其插件必须可以开关。"""
+    config_path = tmp_path / "config.toml"
+    root = _make_rich_marketplace(tmp_path)
+    doc = tomlkit.document()
+    market = tomlkit.table()
+    market["source_type"] = "local"
+    market["source"] = str(root)
+    doc["marketplaces"] = tomlkit.table()
+    doc["marketplaces"]["openai-bundled"] = market
+    config_path.write_text(tomlkit.dumps(doc), encoding="utf-8")
+    # 手工改写 manifest 名称以匹配官方市场名
+    manifest_path = root / ".agents" / "plugins" / "marketplace.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["name"] = "openai-bundled"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    result = set_plugin_enabled(
+        config_path,
+        plugin_id="demo-plugin@openai-bundled",
+        enabled=True,
+    )
+
+    assert result["plugins"][0]["plugin_id"] == "demo-plugin@openai-bundled"
+    assert result["plugins"][0]["enabled"] is True
+
+    try:
+        register_local_marketplace(
+            config_path,
+            name="openai-copy",
+            source=str(root),
+        )
+    except CodexPluginMarketplaceError as exc:
+        assert "保留名" in str(exc)
+    else:
+        raise AssertionError("expected CodexPluginMarketplaceError")
+
+
 def test_remove_marketplace_removes_only_matching_plugins(tmp_path: Path) -> None:
     config_path = tmp_path / "config.toml"
     root = _make_marketplace(tmp_path)
@@ -97,3 +170,124 @@ def test_list_preserves_existing_config(tmp_path: Path) -> None:
 
     assert "model_providers" in tomlkit.parse(config_path.read_text(encoding="utf-8"))
     assert view["exists"] is True
+
+
+def test_catalog_merges_manifest_and_config_state(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.toml"
+    root = _make_rich_marketplace(tmp_path)
+
+    view = register_local_marketplace(config_path, name="team-curated", source=str(root))
+
+    catalog = view["marketplaces"][0]["catalog"]
+    assert len(catalog) == 1
+    entry = catalog[0]
+    assert entry["plugin_id"] == "demo-plugin@team-curated"
+    assert entry["configured"] is False
+    assert entry["enabled"] is False
+    assert entry["stale"] is False
+    assert entry["has_metadata"] is True
+    assert entry["display_name"] == "Demo Plugin"
+    assert entry["description"] == "一句话简介"
+    assert entry["long_description"] == "很长的介绍。"
+    assert entry["category"] == "Developer Tools"
+    assert entry["version"] == "0.1.0"
+    assert entry["author"] == "Ada"
+    assert entry["keywords"] == ["demo", "test"]
+    assert entry["capabilities"] == ["MCP", "Read"]
+    assert entry["icon_url"] == (
+        "/admin/codex/plugin-marketplaces/team-curated/plugins/demo-plugin/icon"
+    )
+
+
+def test_enable_unconfigured_plugin_from_catalog(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.toml"
+    root = _make_rich_marketplace(tmp_path)
+    register_local_marketplace(config_path, name="team-curated", source=str(root))
+
+    set_plugin_enabled(
+        config_path,
+        plugin_id="demo-plugin@team-curated",
+        enabled=True,
+    )
+
+    view = list_plugin_marketplaces(config_path)
+    entry = view["marketplaces"][0]["catalog"][0]
+    assert entry["configured"] is True
+    assert entry["enabled"] is True
+
+
+def test_stale_plugin_shown_and_disable_only(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.toml"
+    root = _make_rich_marketplace(tmp_path)
+    register_local_marketplace(config_path, name="team-curated", source=str(root))
+    doc = tomlkit.parse(config_path.read_text(encoding="utf-8"))
+    doc["plugins"] = tomlkit.table()
+    doc["plugins"]["ghost-plugin@team-curated"] = {"enabled": True}
+    config_path.write_text(tomlkit.dumps(doc), encoding="utf-8")
+
+    view = list_plugin_marketplaces(config_path)
+    catalog = {entry["name"]: entry for entry in view["marketplaces"][0]["catalog"]}
+    assert catalog["ghost-plugin"]["stale"] is True
+    assert catalog["ghost-plugin"]["enabled"] is True
+    assert catalog["ghost-plugin"]["has_metadata"] is False
+
+    set_plugin_enabled(
+        config_path,
+        plugin_id="ghost-plugin@team-curated",
+        enabled=False,
+    )
+    view = list_plugin_marketplaces(config_path)
+    ghost = {
+        entry["name"]: entry for entry in view["marketplaces"][0]["catalog"]
+    }["ghost-plugin"]
+    assert ghost["enabled"] is False
+
+    try:
+        set_plugin_enabled(
+            config_path,
+            plugin_id="ghost-plugin@team-curated",
+            enabled=True,
+        )
+    except CodexPluginMarketplaceError as exc:
+        assert "plugin 不存在" in str(exc)
+    else:
+        raise AssertionError("expected CodexPluginMarketplaceError")
+
+
+def test_resolve_plugin_icon_returns_file(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.toml"
+    root = _make_rich_marketplace(tmp_path)
+    register_local_marketplace(config_path, name="team-curated", source=str(root))
+
+    icon_path, media_type = resolve_plugin_icon(
+        config_path,
+        marketplace_name="team-curated",
+        plugin_name="demo-plugin",
+    )
+
+    assert icon_path.name == "logo.png"
+    assert media_type == "image/png"
+
+
+def test_resolve_plugin_icon_rejects_escape_and_missing(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.toml"
+    root = _make_marketplace(tmp_path)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "logo.png").write_bytes(b"\x89PNG\r\n\x1a\n")
+    manifest_path = root / ".agents" / "plugins" / "marketplace.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["plugins"][0]["source"] = {"source": "local", "path": "../../outside"}
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    register_local_marketplace(config_path, name="team-curated", source=str(root))
+
+    try:
+        resolve_plugin_icon(
+            config_path,
+            marketplace_name="team-curated",
+            plugin_name="demo-plugin",
+        )
+    except CodexPluginMarketplaceError as exc:
+        assert "图标" in str(exc) or "不存在" in str(exc)
+    else:
+        raise AssertionError("expected CodexPluginMarketplaceError")
