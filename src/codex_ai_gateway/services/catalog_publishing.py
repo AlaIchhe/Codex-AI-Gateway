@@ -819,6 +819,17 @@ OFFICIAL_MODEL_INFO_REQUIRED = [
     "priority",
     "support_verbosity",
     "truncation_policy",
+    "additional_speed_tiers",
+    "availability_nux",
+    "default_reasoning_summary",
+    "effective_context_window_percent",
+    "max_context_window",
+    "service_tiers",
+    "supports_image_detail_original",
+    "supports_parallel_tool_calls",
+    "supports_reasoning_summaries",
+    "supports_search_tool",
+    "upgrade",
 ]
 
 OFFICIAL_MODEL_INFO_FORBIDDEN = {"provider", "base_url", "env_key", "id", "name", "model_id"}
@@ -896,6 +907,9 @@ def _official_model_info(info: dict[str, Any]) -> dict[str, Any]:
     context_window = int(info.get("context_window") or 128000)
     if context_window <= 0:
         raise ValueError(f"发布条目 {slug} 的 context_window 必须为正整数")
+    # Codex CLI 0.147+ 的 ModelInfo serde 要求以下布尔/标量字段必须存在，
+    # 缺失会导致 load_catalog_json 直接拒绝整个目录（E2E 实测）。
+    supports_reasoning_summaries = any(item != "none" for item in levels)
     return {
         "slug": slug,
         "display_name": str(info.get("name") or slug),
@@ -914,9 +928,20 @@ def _official_model_info(info: dict[str, Any]) -> dict[str, Any]:
         "web_search_tool_type": "text",
         "truncation_policy": {"mode": "tokens", "limit": 10000},
         "context_window": context_window,
+        "max_context_window": context_window,
+        "effective_context_window_percent": 95,
         "input_modalities": _codex_supported_modalities(info.get("input_modalities") or ["text"]),
         "experimental_supported_tools": [],
         "base_instructions": str(info.get("base_instructions") or DEFAULT_BASE_INSTRUCTIONS),
+        "additional_speed_tiers": [],
+        "service_tiers": [],
+        "availability_nux": None,
+        "upgrade": None,
+        "default_reasoning_summary": "none",
+        "supports_reasoning_summaries": supports_reasoning_summaries,
+        "supports_parallel_tool_calls": False,
+        "supports_image_detail_original": False,
+        "supports_search_tool": False,
     }
 
 
