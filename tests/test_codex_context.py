@@ -7,7 +7,9 @@ import pytest
 
 from codex_ai_gateway.integrations.codex_context import (
     CodexContextError,
+    create_skill,
     delete_mcp_server,
+    delete_skill,
     list_mcp_servers,
     list_skills,
     upsert_mcp_server,
@@ -139,3 +141,36 @@ def test_list_skills_missing_dir(tmp_path: Path) -> None:
     view = list_skills(tmp_path)
     assert view["exists"] is False
     assert view["skills"] == []
+
+
+def test_skill_create_and_delete_roundtrip(tmp_path: Path) -> None:
+    view = create_skill(
+        tmp_path, skill_id="demo-skill", name="Demo", description="演示技能"
+    )
+    assert [skill["id"] for skill in view["skills"]] == ["demo-skill"]
+    assert view["skills"][0]["name"] == "Demo"
+    assert view["skills"][0]["description"] == "演示技能"
+
+    skill_md = tmp_path / "skills" / "demo-skill" / "SKILL.md"
+    text = skill_md.read_text(encoding="utf-8")
+    assert text.startswith("---\nname: Demo\ndescription: 演示技能\n---\n")
+
+    with pytest.raises(CodexContextError, match="已存在"):
+        create_skill(tmp_path, skill_id="demo-skill")
+
+    view = delete_skill(tmp_path, skill_id="demo-skill")
+    assert view["skills"] == []
+
+    with pytest.raises(CodexContextError, match="不存在"):
+        delete_skill(tmp_path, skill_id="demo-skill")
+
+
+def test_skill_delete_rejects_non_skill_dir(tmp_path: Path) -> None:
+    plain = tmp_path / "skills" / "plain"
+    plain.mkdir(parents=True)
+
+    with pytest.raises(CodexContextError, match="缺少 SKILL.md"):
+        delete_skill(tmp_path, skill_id="plain")
+
+    with pytest.raises(CodexContextError, match="技能 ID"):
+        create_skill(tmp_path, skill_id="bad id")

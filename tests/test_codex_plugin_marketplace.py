@@ -291,3 +291,62 @@ def test_resolve_plugin_icon_rejects_escape_and_missing(tmp_path: Path) -> None:
         assert "图标" in str(exc) or "不存在" in str(exc)
     else:
         raise AssertionError("expected CodexPluginMarketplaceError")
+
+
+def test_git_marketplace_resolves_from_codex_clone(tmp_path: Path) -> None:
+    import shutil
+
+    codex_home = tmp_path / ".codex"
+    config_path = codex_home / "config.toml"
+    root = _make_rich_marketplace(tmp_path)
+    clone = codex_home / ".tmp" / "marketplaces" / "ars"
+    shutil.copytree(root, clone)
+    manifest_path = clone / ".agents" / "plugins" / "marketplace.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["name"] = "ars"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    doc = tomlkit.document()
+    market = tomlkit.table()
+    market["source_type"] = "git"
+    market["source"] = "https://github.com/example/ars.git"
+    doc["marketplaces"] = tomlkit.table()
+    doc["marketplaces"]["ars"] = market
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(tomlkit.dumps(doc), encoding="utf-8")
+
+    view = list_plugin_marketplaces(config_path)
+    market_view = view["marketplaces"][0]
+    assert market_view["manifest_valid"] is True
+    assert market_view["resolved_source"] == str(clone)
+    assert market_view["catalog"][0]["display_name"] == "Demo Plugin"
+    assert market_view["catalog"][0]["icon_url"] is not None
+
+    set_plugin_enabled(config_path, plugin_id="demo-plugin@ars", enabled=True)
+    view = list_plugin_marketplaces(config_path)
+    assert view["marketplaces"][0]["catalog"][0]["configured"] is True
+    assert view["marketplaces"][0]["catalog"][0]["enabled"] is True
+
+    icon_path, media_type = resolve_plugin_icon(
+        config_path, marketplace_name="ars", plugin_name="demo-plugin"
+    )
+    assert icon_path.name == "logo.png"
+    assert media_type == "image/png"
+
+
+def test_git_marketplace_without_clone_reports_unresolved(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.toml"
+    doc = tomlkit.document()
+    market = tomlkit.table()
+    market["source_type"] = "git"
+    market["source"] = "https://github.com/example/y.git"
+    doc["marketplaces"] = tomlkit.table()
+    doc["marketplaces"]["y"] = market
+    config_path.write_text(tomlkit.dumps(doc), encoding="utf-8")
+
+    view = list_plugin_marketplaces(config_path)
+
+    market_view = view["marketplaces"][0]
+    assert market_view["manifest_valid"] is False
+    assert market_view["resolved_source"] is None
+    assert market_view["catalog"] == []

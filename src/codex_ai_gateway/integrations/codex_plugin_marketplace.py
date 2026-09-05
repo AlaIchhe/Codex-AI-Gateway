@@ -91,20 +91,48 @@ def _validate_new_marketplace_name(name: str) -> str:
     return value
 
 
+def _marketplace_clone_dir(config_path: Path, marketplace_name: str) -> Path:
+    """Codex 对 git 市场的克隆约定位置：$CODEX_HOME/.tmp/marketplaces/<市场名>。"""
+    return config_path.parent / ".tmp" / "marketplaces" / marketplace_name
+
+
+def _resolve_marketplace_source(
+    item: Any, marketplace_name: str, codex_home: Path
+) -> Path | None:
+    """把 config 条目解析为磁盘上的市场根目录；解析失败返回 None。
+
+    - local：source 即路径；
+    - git：Codex 克隆约定目录（Codex 桌面端/CLI 负责拉取）；
+    - 其他来源暂不支持。
+    """
+    if not isinstance(item, dict):
+        return None
+    source_type = str(item.get("source_type", ""))
+    source = item.get("source")
+    if source_type == "local" and source:
+        return Path(str(source))
+    if source_type == "git":
+        clone_dir = codex_home / ".tmp" / "marketplaces" / marketplace_name
+        return clone_dir if clone_dir.is_dir() else None
+    return None
+
+
 def _configured_marketplaces(doc: tomlkit.TOMLDocument, config_path: Path) -> list[dict[str, Any]]:
     marketplaces: list[dict[str, Any]] = []
     table = doc.get("marketplaces")
     if not isinstance(table, dict):
         return marketplaces
+    codex_home = config_path.parent
     for name, item in table.items():
+        resolved = _resolve_marketplace_source(item, str(name), codex_home)
+        manifest = _manifest_path(resolved) if resolved else None
         source = item.get("source") if isinstance(item, dict) else None
-        source_path = Path(str(source)) if source else None
-        manifest = _manifest_path(source_path) if source_path else None
         marketplaces.append(
             {
                 "name": str(name),
                 "source_type": str(item.get("source_type", "")) if isinstance(item, dict) else "",
                 "source": str(source) if source else None,
+                "resolved_source": str(resolved) if resolved else None,
                 "manifest_path": str(manifest) if manifest else None,
                 "manifest_valid": manifest is not None,
                 "plugin_count": 0,
@@ -112,7 +140,6 @@ def _configured_marketplaces(doc: tomlkit.TOMLDocument, config_path: Path) -> li
                 "catalog": [],
             }
         )
-    del config_path
     return marketplaces
 
 
@@ -134,15 +161,26 @@ def _plugin_rows(doc: tomlkit.TOMLDocument) -> list[dict[str, Any]]:
 
 
 def _marketplace_by_name(
-    doc: tomlkit.TOMLDocument, marketplace_name: str
+    doc: tomlkit.TOMLDocument, marketplace_name: str, codex_home: Path | None = None
 ) -> tuple[dict[Any, Any], Path]:
     marketplaces = doc.get("marketplaces")
     if not isinstance(marketplaces, dict) or marketplace_name not in marketplaces:
         raise CodexPluginMarketplaceError(f"marketplace 不存在: {marketplace_name}")
     item = marketplaces[marketplace_name]
-    if not isinstance(item, dict) or item.get("source_type") != "local" or not item.get("source"):
-        raise CodexPluginMarketplaceError("只支持 source_type = 'local' 的插件市场")
-    return item, Path(str(item["source"]))
+    if not isinstance(item, dict):
+        raise CodexPluginMarketplaceError("只支持 local / git 插件市场")
+    home = codex_home if codex_home is not None else Path.cwd()
+    resolved = _resolve_marketplace_source(item, marketplace_name, home)
+    if resolved is None:
+        source_type = str(item.get("source_type", ""))
+        if source_type == "git":
+            raise CodexPluginMarketplaceError(
+                "git 市场尚未被 Codex 拉取到本地缓存（.tmp/marketplaces），无法操作"
+            )
+        raise CodexPluginMarketplaceError(
+            f"不支持的市场来源（source_type = {source_type or '未知'}）"
+        )
+    return item, resolved
 
 
 def _plugin_dir_for(root: Path, entry: dict[str, Any]) -> Path | None:
@@ -316,9 +354,9 @@ def list_plugin_marketplaces(config_path: str | Path) -> dict[str, Any]:
         table_key = str(marketplace["name"])
         marketplace_names = {table_key}
         manifest_names: set[str] = set()
-        if marketplace["manifest_valid"] and marketplace["source"]:
+        if marketplace["manifest_valid"] and marketplace["resolved_source"]:
             try:
-                manifest = _load_manifest(Path(marketplace["source"]))
+                manifest = _load_manifest(Path(marketplace["resolved_source"]))
                 plugins = manifest.get("plugins", [])
                 manifest_name = str(manifest["name"])
                 marketplace_names.add(manifest_name)
@@ -335,8 +373,8 @@ def list_plugin_marketplaces(config_path: str | Path) -> dict[str, Any]:
             if isinstance(item, dict) and item.get("name")
         }
         catalog: list[dict[str, Any]] = []
-        if marketplace["manifest_valid"] and marketplace["source"]:
-            root = Path(str(marketplace["source"]))
+        if marketplace["manifest_valid"] and marketplace["resolved_source"]:
+            root = Path(str(marketplace["resolved_source"]))
             catalog = [
                 _catalog_entry(root, entry, rows_by_id, str(marketplace["name"]))
                 for entry in marketplace["plugins"]
@@ -415,7 +453,9 @@ def set_plugin_enabled(config_path: str | Path, *, plugin_id: str, enabled: bool
     if not _PLUGIN_NAME_RE.fullmatch(plugin_name):
         raise CodexPluginMarketplaceError("plugin 名称包含非法字符")
     doc = _parse_config(path)
-    _marketplace_item, marketplace_source = _marketplace_by_name(doc, marketplace_name)
+    _marketplace_item, marketplace_source = _marketplace_by_name(
+        doc, marketplace_name, codex_home=path.parent
+    )
     manifest = _load_manifest(marketplace_source)
     available = {
         plugin.get("name")
@@ -444,8 +484,11 @@ def resolve_plugin_icon(
     value = plugin_name.strip()
     if not _PLUGIN_NAME_RE.fullmatch(value):
         raise CodexPluginMarketplaceError("plugin 名称包含非法字符")
-    doc = _parse_config(Path(config_path))
-    _marketplace_item, marketplace_source = _marketplace_by_name(doc, marketplace_name)
+    path = Path(config_path)
+    doc = _parse_config(path)
+    _marketplace_item, marketplace_source = _marketplace_by_name(
+        doc, marketplace_name, codex_home=path.parent
+    )
     root = marketplace_source
     manifest = _load_manifest(root)
     entry = next(

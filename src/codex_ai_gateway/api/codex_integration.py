@@ -10,7 +10,9 @@ from fastapi.responses import FileResponse
 
 from codex_ai_gateway.integrations.codex_context import (
     CodexContextError,
+    create_skill,
     delete_mcp_server,
+    delete_skill,
     list_mcp_servers,
     list_skills,
     upsert_mcp_server,
@@ -38,6 +40,7 @@ from codex_ai_gateway.models.schemas import (
     ProfilePreviewRequest,
     SettingsPatch,
     SettingsView,
+    SkillCreateRequest,
 )
 from codex_ai_gateway.runtime import Runtime
 from codex_ai_gateway.services.local_codex import (
@@ -219,6 +222,37 @@ def get_skills(request: Request) -> dict[str, Any]:
     if profile is None:
         raise HTTPException(status_code=404, detail="本地 Codex profile 不存在")
     return list_skills(profile.codex_home)
+
+
+@router.post("/skills")
+def post_skill(request: Request, payload: SkillCreateRequest) -> dict[str, Any]:
+    runtime = _runtime(request)
+    state = runtime.state_store.read_state()
+    profile = next((p for p in state.integration_profiles if p.codex_home), None)
+    if profile is None:
+        raise HTTPException(status_code=404, detail="本地 Codex profile 不存在")
+    try:
+        return create_skill(
+            profile.codex_home,
+            skill_id=payload.skill_id,
+            name=payload.name,
+            description=payload.description,
+        )
+    except CodexContextError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.delete("/skills/{skill_id}")
+def delete_skill_route(request: Request, skill_id: str) -> dict[str, Any]:
+    runtime = _runtime(request)
+    state = runtime.state_store.read_state()
+    profile = next((p for p in state.integration_profiles if p.codex_home), None)
+    if profile is None:
+        raise HTTPException(status_code=404, detail="本地 Codex profile 不存在")
+    try:
+        return delete_skill(profile.codex_home, skill_id=skill_id)
+    except CodexContextError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
 @router.get("/profiles")

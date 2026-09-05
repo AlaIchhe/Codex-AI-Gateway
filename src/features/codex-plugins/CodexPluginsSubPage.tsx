@@ -313,11 +313,21 @@ function MarketplaceSection({
       </CardHeader>
       <CardContent className="space-y-3">
         {!marketplace.manifest_valid ? (
-          <Alert variant="warning">
-            <AlertDescription>
-              market manifest 无效或路径不可用，建议移除后重新注册。
-            </AlertDescription>
-          </Alert>
+          marketplace.source_type === "git" ? (
+            <Alert variant="info">
+              <AlertDescription>
+                git 市场：manifest 需由 Codex 拉取到本地缓存（
+                ~/.codex/.tmp/marketplaces/{marketplace.name}
+                ）后才能浏览；不会影响 Codex 内的正常使用。
+              </AlertDescription>
+            </Alert>
+          ) : (
+            <Alert variant="warning">
+              <AlertDescription>
+                market manifest 无效或路径不可用，建议移除后重新注册。
+              </AlertDescription>
+            </Alert>
+          )
         ) : marketplace.catalog.length ? (
           <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
             {marketplace.catalog.map((entry) => (

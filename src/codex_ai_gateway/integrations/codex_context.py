@@ -115,14 +115,14 @@ def list_mcp_servers(config_path: str | Path) -> dict[str, Any]:
 
     plugin_servers: list[dict[str, Any]] = []
     for marketplace in _configured_marketplaces(doc, path):
-        if not (marketplace["manifest_valid"] and marketplace["source"]):
+        if not (marketplace["manifest_valid"] and marketplace["resolved_source"]):
             continue
         try:
-            manifest = _load_manifest(Path(marketplace["source"]))
+            manifest = _load_manifest(Path(marketplace["resolved_source"]))
         except CodexPluginMarketplaceError:
             continue
         marketplace_name = str(manifest["name"])
-        root = Path(str(marketplace["source"]))
+        root = Path(str(marketplace["resolved_source"]))
         for entry in manifest.get("plugins", []):
             if not isinstance(entry, dict) or not entry.get("name"):
                 continue
@@ -257,3 +257,60 @@ def list_skills(codex_home: str | Path) -> dict[str, Any]:
         "exists": skills_dir.is_dir(),
         "skills": skills,
     }
+
+
+def _validate_skill_id(skill_id: str) -> str:
+    value = skill_id.strip()
+    if not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9._-]*", value):
+        raise CodexContextError("技能 ID 只能包含字母、数字、点、连字符和下划线")
+    return value
+
+
+def create_skill(
+    codex_home: str | Path,
+    *,
+    skill_id: str,
+    name: str | None = None,
+    description: str | None = None,
+) -> dict[str, Any]:
+    """新建技能目录与 SKILL.md（frontmatter 最小骨架）。"""
+    value = _validate_skill_id(skill_id)
+    skills_dir = Path(codex_home) / "skills"
+    skill_dir = skills_dir / value
+    if skill_dir.exists() or skill_dir.is_symlink():
+        raise CodexContextError(f"技能已存在: {value}")
+    clean_name = " ".join((name or "").split()) or value
+    clean_description = " ".join((description or "").split())
+    frontmatter = f"---\nname: {clean_name}\n"
+    if clean_description:
+        frontmatter += f"description: {clean_description}\n"
+    frontmatter += "---\n"
+    try:
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            f"{frontmatter}\n# {clean_name}\n", encoding="utf-8"
+        )
+    except OSError as exc:
+        raise CodexContextError(f"技能目录创建失败: {exc}") from exc
+    return list_skills(codex_home)
+
+
+def delete_skill(codex_home: str | Path, *, skill_id: str) -> dict[str, Any]:
+    """删除技能目录；符号链接只摘链不删目标。"""
+    import shutil
+
+    value = _validate_skill_id(skill_id)
+    skills_dir = (Path(codex_home) / "skills").resolve()
+    skill_dir = skills_dir / value
+    if not skill_dir.exists() and not skill_dir.is_symlink():
+        raise CodexContextError(f"技能不存在: {value}")
+    try:
+        if skill_dir.is_symlink() or skill_dir.is_junction():
+            skill_dir.unlink()
+        else:
+            if not (skill_dir / "SKILL.md").is_file():
+                raise CodexContextError(f"目录不是技能（缺少 SKILL.md）: {value}")
+            shutil.rmtree(skill_dir)
+    except OSError as exc:
+        raise CodexContextError(f"技能删除失败: {exc}") from exc
+    return list_skills(codex_home)

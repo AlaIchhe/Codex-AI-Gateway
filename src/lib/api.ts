@@ -145,6 +145,7 @@ export type CodexPluginMarketplace = {
   name: string
   source_type: string
   source: string | null
+  resolved_source: string | null
   manifest_path: string | null
   manifest_valid: boolean
   plugin_count: number
@@ -286,6 +287,20 @@ export const api = {
       { method: "DELETE" },
     ),
   listCodexSkills: () => request<CodexSkillsView>("/admin/codex/skills"),
+  createCodexSkill: (body: {
+    skill_id: string
+    name?: string
+    description?: string
+  }) =>
+    request<CodexSkillsView>("/admin/codex/skills", {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  deleteCodexSkill: (skillId: string) =>
+    request<CodexSkillsView>(
+      `/admin/codex/skills/${encodeURIComponent(skillId)}`,
+      { method: "DELETE" },
+    ),
   listUpstreams: () => request<Upstream[]>("/admin/upstreams"),
   listPresets: () => request<PresetProvider[]>("/admin/presets"),
   createUpstream: (body: UpstreamCreatePayload) =>
