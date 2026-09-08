@@ -113,3 +113,30 @@ def test_prefill_continuation_noop_for_string_input():
 def test_prefill_continuation_noop_without_input():
     body = {"model": "m"}
     assert ensure_prefill_continuation(body) is body
+
+
+def test_503_model_not_found_maps_to_model_unavailable():
+    body = json.dumps(
+        {
+            "error": {
+                "code": "model_not_found",
+                "message": "No available channel for model gpt-5.4-mini",
+            }
+        }
+    )
+    mapped = map_provider_error(503, body=body, upstream_name="MaoLao")
+    assert mapped["error_mapping_code"] == "provider_model_unavailable"
+    assert mapped["provider_error_type"] == "model_permission"
+    assert "[MaoLao]" in mapped["message"]
+
+
+def test_503_without_model_code_stays_upstream_fault():
+    body = json.dumps({"error": {"code": "server_overloaded"}})
+    mapped = map_provider_error(503, body=body, upstream_name="A")
+    assert mapped["error_mapping_code"] == "provider_upstream_fault"
+
+
+def test_503_no_available_channel_code_maps_to_model_unavailable():
+    body = json.dumps({"error": {"type": "no_available_channel"}})
+    mapped = map_provider_error(503, body=body, upstream_name="A")
+    assert mapped["error_mapping_code"] == "provider_model_unavailable"

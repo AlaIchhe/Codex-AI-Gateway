@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from typing import Any
 
 from codex_ai_gateway.models.entities import ProviderErrorType
@@ -22,6 +23,35 @@ def _body_text(body: bytes | str | None) -> str:
     return (body.decode("utf-8", errors="ignore") if isinstance(body, bytes) else body).strip()
 
 
+_MODEL_UNAVAILABLE_CODES = {
+    "model_not_found",
+    "model_not_available",
+    "model_unavailable",
+    "no_available_channel",
+    "no_available_channels",
+}
+
+
+def _provider_error_code(body: bytes | str | None) -> str | None:
+    """从上游响应体中提取 error.code / error.type。"""
+    text = _body_text(body)
+    if not text:
+        return None
+    try:
+        payload = json.loads(text)
+    except ValueError:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    error = payload.get("error")
+    if isinstance(error, dict):
+        for key in ("code", "type"):
+            value = error.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip().lower()
+    return None
+
+
 def map_provider_error(
     status_code: int,
     *,
@@ -36,6 +66,12 @@ def map_provider_error(
     """
     text = _body_text(body)
     prefix = f"[{upstream_name}] " if upstream_name else ""
+    provider_code = _provider_error_code(body)
+    model_unavailable = provider_code in _MODEL_UNAVAILABLE_CODES or (
+        provider_code is not None
+        and "model" in provider_code
+        and ("not_found" in provider_code or "unavailable" in provider_code)
+    )
     if status_code == 401 or status_code == 403:
         error_type = ProviderErrorType.authentication
         code = "provider_authentication_failed"
@@ -48,6 +84,10 @@ def map_provider_error(
         error_type = ProviderErrorType.rate_limit
         code = "provider_rate_limited"
         message = f"{prefix}上游已限流，请稍后重试。"
+    elif model_unavailable:
+        error_type = ProviderErrorType.model_permission
+        code = "provider_model_unavailable"
+        message = f"{prefix}上游不支持该模型或已下线。"
     elif status_code == 404:
         error_type = ProviderErrorType.model_permission
         code = "provider_model_unavailable"

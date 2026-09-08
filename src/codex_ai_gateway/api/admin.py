@@ -59,6 +59,7 @@ from codex_ai_gateway.services.presets import (
 from codex_ai_gateway.services.upstreams import (
     build_preset_offerings,
     discover_offerings,
+    fetch_upstream_models,
     probe_model_protocols,
 )
 from codex_ai_gateway.util import utc_now, uuid7
@@ -245,6 +246,7 @@ async def _run_upstream_pipeline(runtime: Any, upstream: Upstream) -> Upstream:
     credential = runtime.secret_store.get_secret(upstream.auth_credential_ref) or ""
 
     # Phase 1: discover model IDs
+    upstream_models: list[dict[str, Any]] | None = None
     if upstream.kind == UpstreamKind.preset:
         preset = get_preset_provider(upstream.preset_id or "")
         discovery = await discover_preset(preset)
@@ -253,18 +255,22 @@ async def _run_upstream_pipeline(runtime: Any, upstream: Upstream) -> Upstream:
         model_ids = discovery.model_ids
     else:
         import httpx
-        try:
-            async with httpx.AsyncClient(timeout=10) as client:
-                resp = await client.get(
-                    f"{upstream.base_url.rstrip('/')}/models",
-                    headers={"Authorization": f"Bearer {credential}"},
-                )
-                resp.raise_for_status()
-                data = resp.json()
-            model_ids = [item["id"] for item in data.get("data", []) if isinstance(item, dict) and item.get("id")]
-        except Exception:
-            model_ids = []
 
+        try:
+            upstream_models = await fetch_upstream_models(upstream, credential)
+        except httpx.HTTPStatusError as exc:
+            return _update_upstream_health(
+                runtime,
+                upstream,
+                f"探测失败：模型列表 HTTP {exc.response.status_code}",
+            )
+        except (httpx.HTTPError, ValueError) as exc:
+            detail = str(exc).strip()
+            message = f"探测失败：{type(exc).__name__}"
+            if detail:
+                message += f"（{detail}）"
+            return _update_upstream_health(runtime, upstream, message[:200])
+        model_ids = [str(item["id"]) for item in upstream_models]
     if not model_ids:
         return _update_upstream_health(runtime, upstream, "未发现可用模型")
 
@@ -298,7 +304,9 @@ async def _run_upstream_pipeline(runtime: Any, upstream: Upstream) -> Upstream:
         )
         _apply_preset_discovery(runtime, upstream, discovery, discovered)
     else:
-        discovered = await discover_offerings(upstream, credential, protocol_map=protocol_map)
+        discovered = await discover_offerings(
+            upstream, credential, protocol_map=protocol_map, models=upstream_models
+        )
         def apply(state: Any) -> None:
             old_ids = {o.id for o in state.offerings if o.upstream_id == upstream.id}
             state.offerings = [o for o in state.offerings if o.upstream_id != upstream.id]
@@ -479,14 +487,25 @@ async def update_upstream(request: Request, upstream_id: str, payload: UpstreamU
 @router.delete("/upstreams/{upstream_id}")
 async def delete_upstream(request: Request, upstream_id: str) -> dict[str, Any]:
     runtime = _runtime(request)
-    runtime.state_store.mutate(lambda s: setattr(
-        s,
-        "upstreams",
-        [u for u in s.upstreams if u.id != upstream_id],
-    ))
-    runtime.state_store.mutate(
-        lambda s: setattr(s, "offerings", [o for o in s.offerings if o.upstream_id != upstream_id])
-    )
+
+    def apply(state: Any) -> None:
+        state.upstreams = [u for u in state.upstreams if u.id != upstream_id]
+        state.offerings = [o for o in state.offerings if o.upstream_id != upstream_id]
+        # 清理路由顺序中的悬空引用，避免删除后仍指向不存在的上游。
+        state.routing_preferences = [
+            pref.model_copy(
+                update={
+                    "ordered_upstream_ids": [
+                        item for item in pref.ordered_upstream_ids if item != upstream_id
+                    ]
+                }
+            )
+            if upstream_id in pref.ordered_upstream_ids
+            else pref
+            for pref in state.routing_preferences
+        ]
+
+    runtime.state_store.mutate(apply)
     runtime.circuit_breaker.clear(upstream_id)
     await _maybe_aggregate(runtime)
     return {"id": upstream_id, "deleted": True}

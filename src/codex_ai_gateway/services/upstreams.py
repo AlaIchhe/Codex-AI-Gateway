@@ -19,6 +19,9 @@ PROBE_CONNECT_TIMEOUT_SECONDS = 3
 PROBE_TOTAL_TIMEOUT_SECONDS = 8
 PROBE_ATTEMPTS = 1
 PROBE_TIMEOUT_SECONDS = 8
+# 模型列表端点通常比推理端点慢，且部分聚合站会间歇性超时；给足读超时并区分失败原因。
+MODELS_DISCOVERY_CONNECT_TIMEOUT_SECONDS = 10.0
+MODELS_DISCOVERY_TIMEOUT_SECONDS = 30.0
 
 
 def _auth_header(api_credential: str) -> dict[str, str]:
@@ -189,23 +192,47 @@ async def probe_model_protocols(
             await asyncio.sleep(PROBE_MODEL_BATCH_DELAY_SECONDS)
     return results
 
+async def fetch_upstream_models(
+    upstream: Upstream,
+    api_credential: str,
+) -> list[dict[str, Any]]:
+    """获取上游 ``/models`` 原始条目。
+
+    超时按模型列表端点单独放宽，失败时抛出 ``httpx.HTTPError`` / ``ValueError``，
+    由调用方决定如何记录，避免把网络失败误报成"未发现可用模型"。
+    """
+    base = upstream.base_url.rstrip("/")
+    headers = _headers(upstream, api_credential)
+    timeout = httpx.Timeout(
+        MODELS_DISCOVERY_TIMEOUT_SECONDS,
+        connect=MODELS_DISCOVERY_CONNECT_TIMEOUT_SECONDS,
+    )
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        response = await client.get(f"{base}/models", headers=headers)
+        response.raise_for_status()
+        data = response.json()
+    if not isinstance(data, dict):
+        return []
+    items = data.get("data", [])
+    if not isinstance(items, list):
+        return []
+    return [item for item in items if isinstance(item, dict) and item.get("id")]
+
+
 async def discover_offerings(
     upstream: Upstream,
     api_credential: str,
     *,
     protocol_map: dict[str, list[WireProtocol]] | None = None,
+    models: list[dict[str, Any]] | None = None,
 ) -> list[Offering]:
-    """Discover offerings for each confirmed protocol."""
-    base = upstream.base_url.rstrip("/")
-    headers = _headers(upstream, api_credential)
-    try:
-        async with httpx.AsyncClient(timeout=PROBE_TIMEOUT_SECONDS) as client:
-            response = await client.get(f"{base}/models", headers=headers)
-            response.raise_for_status()
-            data = response.json()
-    except (httpx.HTTPError, ValueError):
-        return []
-    models = data.get("data", []) if isinstance(data, dict) else []
+    """Discover offerings for each confirmed protocol.
+
+    ``models`` 可由调用方传入已获取的模型列表，避免重复请求 ``/models``；
+    未传入时自行拉取，拉取失败会向上抛出而不是静默返回空列表。
+    """
+    if models is None:
+        models = await fetch_upstream_models(upstream, api_credential)
     now = utc_now()
     result: list[Offering] = []
     for item in models:

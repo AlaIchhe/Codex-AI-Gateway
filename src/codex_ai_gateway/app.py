@@ -100,18 +100,18 @@ def create_app(
 
     @app.on_event("startup")
     async def start_model_refresh_loop() -> None:
-        """后台定时刷新预设模型列表与协议探测（每 5 小时）。"""
+        """后台定时刷新各上游模型列表与协议探测（每 5 小时）。"""
         import asyncio
 
         async def _model_refresh_loop():
             while True:
                 try:
                     state = runtime.state_store.read_state()
-                    preset_upstreams = [
+                    refresh_upstreams = [
                         u for u in state.upstreams
-                        if u.kind.value == "preset" and u.status.value == "enabled"
+                        if u.status.value == "enabled"
                     ]
-                    for upstream in preset_upstreams:
+                    for upstream in refresh_upstreams:
                         try:
                             from codex_ai_gateway.api.admin import _run_upstream_pipeline
                             await _run_upstream_pipeline(runtime, upstream)

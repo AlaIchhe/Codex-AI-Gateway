@@ -137,6 +137,13 @@ async def _gateway(request: Request) -> Response:
             retry_after = earliest_cooldown_seconds(
                 state, canonical, runtime.circuit_breaker
             )
+            if retry_after is None:
+                raise GatewayError(
+                    error_type="provider_error",
+                    code="no_available_upstream",
+                    message="该模型暂无可用上游，请检查上游配置或模型列表。",
+                    status_code=503,
+                )
             raise GatewayError(
                 error_type="provider_error",
                 code="no_available_upstream",
