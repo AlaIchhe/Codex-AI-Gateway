@@ -12,6 +12,55 @@ export type Upstream = {
   connectivity_probe: Record<string, unknown> | null
   protocol_probe_summary?: string
   preset_discovery?: PresetDiscoverySummary
+  cooldowns?: UpstreamCooldown[]
+}
+
+export type UpstreamCooldown = {
+  upstream_id: string
+  provider_model_id: string | null
+  scope: "target" | "provider"
+  reason: string
+  status_code: number | null
+  code: string | null
+  remaining_seconds: number
+  until: string
+}
+
+export type UpdatePolicy = "auto" | "notify" | "pinned"
+
+export type UpdateStatus = {
+  managed: boolean
+  app_root: string
+  current_version: string | null
+  current_build: string | null
+  policy: UpdatePolicy
+  pinned_version: string | null
+  dismissed_version: string | null
+  latest_version: string | null
+  target_version: string | null
+  update_available: boolean
+  action: string
+  action_reason: string
+  notes_url: string | null
+  published_at: string | null
+  target_sha256: string | null
+  last_check_at: string | null
+  last_check_error: string | null
+  next_check_at: number | null
+  install_status: string
+  install_version: string | null
+  install_requested_at: string | null
+  install_finished_at: string | null
+  install_error: string | null
+  retained_releases: number
+  started?: boolean | null
+  message?: string | null
+}
+
+export type UpdatePolicyValues = {
+  policy: UpdatePolicy
+  pinned_version?: string | null
+  dismissed_version?: string | null
 }
 
 export type PresetDiscoverySummary = {
@@ -365,6 +414,19 @@ export const api = {
       `/admin/usage/attempts${qs ? `?${qs}` : ""}`,
     )
   },
+  getUpdateStatus: () => request<UpdateStatus>("/admin/update/status"),
+  checkUpdate: () =>
+    request<UpdateStatus>("/admin/update/check", { method: "POST" }),
+  runUpdate: (force = false) =>
+    request<UpdateStatus>("/admin/update/run", {
+      method: "POST",
+      body: JSON.stringify({ force }),
+    }),
+  setUpdatePolicy: (body: UpdatePolicyValues) =>
+    request<UpdateStatus>("/admin/update/policy", {
+      method: "PUT",
+      body: JSON.stringify(body),
+    }),
   updateRetention: (days: number) =>
     request<unknown>("/admin/settings", {
       method: "PATCH",

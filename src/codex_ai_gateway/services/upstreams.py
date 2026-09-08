@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import httpx
@@ -281,27 +280,3 @@ def _capabilities_from_metadata(item: dict[str, Any]) -> dict[str, Any]:
         "tools": item.get("capabilities", {}).get("tools") or [],
         "description": item.get("description"),
     }
-
-
-def request_failure_fields(status_code: int | None = None) -> dict[str, Any]:
-    """计算请求失败后的 30 秒健康冷却字段。"""
-    should_cooldown = (
-        status_code is None
-        or status_code in {429, 502, 503, 529}
-    )
-    now = datetime.now(UTC)
-    return {
-        "last_health_result": "请求失败，冷却中" if should_cooldown else "请求失败",
-        "cooldown_until": (
-            (now + timedelta(seconds=30)).isoformat() if should_cooldown else None
-        ),
-        "updated_at": now.isoformat(),
-    }
-
-
-def is_cooling_down(upstream: Any, *, now: str | None = None) -> bool:
-    value = getattr(upstream, "cooldown_until", None)
-    if not value:
-        return False
-    current = now or datetime.now(UTC).isoformat()
-    return value > current

@@ -12,6 +12,7 @@ import { Route as rootRouteImport } from './routes/__root'
 import { Route as IndexRouteImport } from './routes/index'
 import { Route as CodexPluginsRouteImport } from './routes/codex-plugins'
 import { Route as ModelsRouteImport } from './routes/models'
+import { Route as UpdateRouteImport } from './routes/update'
 import { Route as UpstreamsRouteImport } from './routes/upstreams'
 import { Route as UsageRouteImport } from './routes/usage'
 import { Route as CodexPluginsIndexRouteImport } from './routes/codex-plugins/index'
@@ -31,6 +32,11 @@ const CodexPluginsRoute = CodexPluginsRouteImport.update({
 const ModelsRoute = ModelsRouteImport.update({
   id: '/models',
   path: '/models',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const UpdateRoute = UpdateRouteImport.update({
+  id: '/update',
+  path: '/update',
   getParentRoute: () => rootRouteImport,
 } as any)
 const UpstreamsRoute = UpstreamsRouteImport.update({
@@ -63,6 +69,7 @@ export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
   '/codex-plugins': typeof CodexPluginsRouteWithChildren
   '/models': typeof ModelsRoute
+  '/update': typeof UpdateRoute
   '/upstreams': typeof UpstreamsRoute
   '/usage': typeof UsageRoute
   '/codex-plugins/mcp': typeof CodexPluginsMcpRoute
@@ -72,6 +79,7 @@ export interface FileRoutesByFullPath {
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
   '/models': typeof ModelsRoute
+  '/update': typeof UpdateRoute
   '/upstreams': typeof UpstreamsRoute
   '/usage': typeof UsageRoute
   '/codex-plugins/mcp': typeof CodexPluginsMcpRoute
@@ -83,6 +91,7 @@ export interface FileRoutesById {
   '/': typeof IndexRoute
   '/codex-plugins': typeof CodexPluginsRouteWithChildren
   '/models': typeof ModelsRoute
+  '/update': typeof UpdateRoute
   '/upstreams': typeof UpstreamsRoute
   '/usage': typeof UsageRoute
   '/codex-plugins/mcp': typeof CodexPluginsMcpRoute
@@ -95,6 +104,7 @@ export interface FileRouteTypes {
     | '/'
     | '/codex-plugins'
     | '/models'
+    | '/update'
     | '/upstreams'
     | '/usage'
     | '/codex-plugins/mcp'
@@ -104,6 +114,7 @@ export interface FileRouteTypes {
   to:
     | '/'
     | '/models'
+    | '/update'
     | '/upstreams'
     | '/usage'
     | '/codex-plugins/mcp'
@@ -114,6 +125,7 @@ export interface FileRouteTypes {
     | '/'
     | '/codex-plugins'
     | '/models'
+    | '/update'
     | '/upstreams'
     | '/usage'
     | '/codex-plugins/mcp'
@@ -125,6 +137,7 @@ export interface RootRouteChildren {
   IndexRoute: typeof IndexRoute
   CodexPluginsRoute: typeof CodexPluginsRouteWithChildren
   ModelsRoute: typeof ModelsRoute
+  UpdateRoute: typeof UpdateRoute
   UpstreamsRoute: typeof UpstreamsRoute
   UsageRoute: typeof UsageRoute
 }
@@ -150,6 +163,13 @@ declare module '@tanstack/react-router' {
       path: '/models'
       fullPath: '/models'
       preLoaderRoute: typeof ModelsRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/update': {
+      id: '/update'
+      path: '/update'
+      fullPath: '/update'
+      preLoaderRoute: typeof UpdateRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/upstreams': {
@@ -210,6 +230,7 @@ const rootRouteChildren: RootRouteChildren = {
   IndexRoute: IndexRoute,
   CodexPluginsRoute: CodexPluginsRouteWithChildren,
   ModelsRoute: ModelsRoute,
+  UpdateRoute: UpdateRoute,
   UpstreamsRoute: UpstreamsRoute,
   UsageRoute: UsageRoute,
 }

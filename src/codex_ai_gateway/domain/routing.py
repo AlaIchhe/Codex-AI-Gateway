@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+from codex_ai_gateway.domain.circuit_breaker import CircuitBreaker
 from codex_ai_gateway.models.entities import (
     CanonicalModel,
     Offering,
@@ -15,7 +16,6 @@ from codex_ai_gateway.models.entities import (
     WireProtocol,
 )
 from codex_ai_gateway.services.model_identity import family_key_of
-from codex_ai_gateway.services.upstreams import is_cooling_down
 
 
 class RoutingError(Exception):
@@ -61,9 +61,17 @@ def resolve_canonical_model(state: Any, model: str) -> CanonicalModel:
 
 
 def route_candidates(
-    state: Any, canonical: CanonicalModel, *, prefer_chat: bool = False
+    state: Any,
+    canonical: CanonicalModel,
+    *,
+    prefer_chat: bool = False,
+    circuit_breaker: CircuitBreaker | None = None,
 ) -> list[tuple[Offering, Upstream, WireProtocol]]:
-    """按生效优先级返回已确认 offering/upstream 候选。"""
+    """按生效优先级返回已确认 offering/upstream 候选。
+
+    ``circuit_breaker`` 按 (upstream, provider_model) 粒度剔除冷却中的目标，
+    而不是像旧实现那样冻结整个 upstream。
+    """
     enabled = {u.id: u for u in _enabled_upstreams(state)}
     global_pref = next(
         (r for r in state.routing_preferences if r.scope == RoutingScope.global_preference),
@@ -82,8 +90,6 @@ def route_candidates(
     ordered.extend(u for u in enabled.values() if u not in ordered)
     responses_first: list[tuple[Offering, Upstream, WireProtocol]] = []
     for upstream in ordered:
-        if is_cooling_down(upstream):
-            continue
         candidates = [
             o
             for o in state.offerings
@@ -91,6 +97,14 @@ def route_candidates(
             and o.status == OfferingStatus.approved
             and o.upstream_id == upstream.id
         ]
+        if circuit_breaker is not None:
+            candidates = [
+                o
+                for o in candidates
+                if not circuit_breaker.is_open(upstream.id, o.provider_model_id)
+            ]
+        if not candidates:
+            continue
         if any(o.wire_protocol == WireProtocol.responses for o in candidates):
             responses_offering = next(
                 (o for o in candidates if o.wire_protocol == WireProtocol.responses), None
@@ -109,3 +123,20 @@ def route_candidates(
             )
             responses_first.append((offering, upstream, WireProtocol.chat_completions))
     return responses_first
+
+
+def earliest_cooldown_seconds(
+    state: Any,
+    canonical: CanonicalModel,
+    circuit_breaker: CircuitBreaker,
+    *,
+    now: float | None = None,
+) -> float | None:
+    """该模型所有已批准 target 中最早的剩余冷却秒数。"""
+    targets = [
+        (offering.upstream_id, offering.provider_model_id)
+        for offering in state.offerings
+        if offering.canonical_model_id == canonical.id
+        and offering.status == OfferingStatus.approved
+    ]
+    return circuit_breaker.earliest_remaining(targets, now=now)

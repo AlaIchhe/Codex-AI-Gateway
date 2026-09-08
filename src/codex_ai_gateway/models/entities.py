@@ -146,7 +146,6 @@ class Upstream(BaseModel):
     last_health_at: str | None = None
     last_health_result: str | None = None
     model_protocol_probe: dict[str, list[str]] = Field(default_factory=dict)
-    cooldown_until: str | None = None
     created_at: str
     updated_at: str
 

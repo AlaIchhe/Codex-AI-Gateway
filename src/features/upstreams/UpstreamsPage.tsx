@@ -602,6 +602,35 @@ export function UpstreamsPage() {
         variant="sheet"
       >
         <div className="space-y-6">
+          {detail?.cooldowns && detail.cooldowns.length > 0 && (
+            <section aria-label="冷却状态">
+              <h3 className="mb-2 font-medium">冷却中的目标</h3>
+              <Table>
+                <TableHeader>
+                  <TableRow>
+                    <TableHead>模型</TableHead>
+                    <TableHead>范围</TableHead>
+                    <TableHead>原因</TableHead>
+                    <TableHead>剩余</TableHead>
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
+                  {detail.cooldowns.map((item) => (
+                    <TableRow
+                      key={`${item.provider_model_id ?? "all"}-${item.reason}`}
+                    >
+                      <TableCell>{item.provider_model_id ?? "全部模型"}</TableCell>
+                      <TableCell>
+                        {item.scope === "provider" ? "整个上游" : "单个模型"}
+                      </TableCell>
+                      <TableCell>{item.reason}</TableCell>
+                      <TableCell>{Math.ceil(item.remaining_seconds)}s</TableCell>
+                    </TableRow>
+                  ))}
+                </TableBody>
+              </Table>
+            </section>
+          )}
           <section aria-label="探测诊断">
             <h3 className="mb-2 font-medium">探测诊断</h3>
             <p className="text-sm">

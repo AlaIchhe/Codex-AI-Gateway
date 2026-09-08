@@ -70,22 +70,32 @@ systemctl status codex-ai-gateway
 
 ### 自动更新
 
-部署脚本会自动安装 systemd timer（每 5 分钟检查一次），检测到 GitHub
-Releases 有新版本时自动下载、部署并执行健康检查（失败回滚）。无需手动
-SSH 重新部署。
+自更新由「Release 清单 + sha256 校验 + 事务化安装」组成：
 
-发布流程简化为：
+- CI 在 Release 中发布 `latest.json`（版本 + 资产下载地址 + sha256）与 `SHA256SUMS`；
+- 服务端每小时触发一次检查，清单带 ETag 缓存（6 小时）与失败退避，不再反复裸打 GitHub API；
+- 版本比较使用语义化版本，只升不降；安装前校验 sha256，健康检查失败自动回滚；
+- 策略文件 `<data_dir>/update-policy.conf` 支持三种策略：
+  - `notify`（默认）：只检查并提示，不自动安装；
+  - `auto`：发现新版本自动安装；
+  - `pinned`：锁定在 `pinned_version`，不接受自动升级。
+
+管理端「更新」页可以查看当前/最新版本、检查、升级、跳过某版本与切换策略，
+对应接口为 `/admin/update/status|check|run|policy`。安装状态写入
+`<data_dir>/update-state.json`。
+
+发布流程：
 
 ```bash
-git tag v0.x.0 && git push --tags   # CI 自动构建并发布 Release
-# 服务器 5 分钟内自动检测并部署
+git tag v0.x.0 && git push --tags   # CI 自动构建并发布 Release（含 latest.json）
+# policy=auto 时，服务器 1 小时内自动检测并部署
 ```
 
-手动触发立即检查：
+手动触发立即检查/安装：
 
 ```bash
 sudo systemctl start codex-ai-gateway-update.service
-journalctl -u codex-ai-gateway-update -n 20 --no-pager
+journalctl -u codex-ai-gateway-update -n 50 --no-pager
 ```
 
 ### 自定义 Provider

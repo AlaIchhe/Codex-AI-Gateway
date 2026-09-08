@@ -116,9 +116,13 @@ async def patch_settings(request: Request, patch: SettingsPatch) -> SettingsView
     return get_settings(request)
 
 
-def _upstream_view(upstream: Upstream, state: Any | None = None) -> dict[str, Any]:
+def _upstream_view(
+    upstream: Upstream, state: Any | None = None, runtime: Any | None = None
+) -> dict[str, Any]:
     data = upstream.model_dump(mode="json")
     data["model_protocol_probe"] = upstream.model_protocol_probe
+    if runtime is not None:
+        data["cooldowns"] = runtime.circuit_breaker.snapshot_for(upstream.id)
     if state is not None and upstream.kind == UpstreamKind.preset and upstream.preset_id:
         data["preset_discovery"] = preset_discovery_view(
             state,
@@ -318,7 +322,6 @@ def _update_upstream_health(
     update = {
         "last_health_at": utc_now(),
         "last_health_result": result_text,
-        "cooldown_until": None,
         "updated_at": utc_now(),
     }
     if model_protocol_probe is not None:
@@ -336,8 +339,9 @@ def _update_upstream_health(
 
 @router.get("/upstreams")
 async def list_upstreams(request: Request) -> list[dict[str, Any]]:
-    state = _runtime(request).state_store.read_state()
-    return [_upstream_view(u, state) for u in state.upstreams]
+    runtime = _runtime(request)
+    state = runtime.state_store.read_state()
+    return [_upstream_view(u, state, runtime) for u in state.upstreams]
 
 
 
@@ -402,7 +406,7 @@ async def create_upstream(request: Request, payload: UpstreamCreate) -> dict[str
     refreshed = await _run_upstream_pipeline(runtime, upstream)
     await _offerings(runtime, refreshed)
     await _maybe_aggregate(runtime)
-    return _upstream_view(refreshed, runtime.state_store.read_state())
+    return _upstream_view(refreshed, runtime.state_store.read_state(), runtime)
 
 @router.post("/debug/probe/{upstream_id}")
 async def debug_probe(request: Request, upstream_id: str) -> dict[str, Any]:
@@ -463,11 +467,13 @@ async def update_upstream(request: Request, upstream_id: str, payload: UpstreamU
     if status_only:
         # 启用/禁用是纯状态切换：路由时本就跳过 disabled 上游，
         # 无需重跑发现/探测/聚合 pipeline（避免秒级到分钟级阻塞）。
-        return _upstream_view(updated, runtime.state_store.read_state())
+        if updated.status == UpstreamStatus.disabled:
+            runtime.circuit_breaker.clear(upstream_id)
+        return _upstream_view(updated, runtime.state_store.read_state(), runtime)
     refreshed = await _run_upstream_pipeline(runtime, updated)
     await _offerings(runtime, refreshed)
     await _maybe_aggregate(runtime)
-    return _upstream_view(refreshed, runtime.state_store.read_state())
+    return _upstream_view(refreshed, runtime.state_store.read_state(), runtime)
 
 
 @router.delete("/upstreams/{upstream_id}")
@@ -481,6 +487,7 @@ async def delete_upstream(request: Request, upstream_id: str) -> dict[str, Any]:
     runtime.state_store.mutate(
         lambda s: setattr(s, "offerings", [o for o in s.offerings if o.upstream_id != upstream_id])
     )
+    runtime.circuit_breaker.clear(upstream_id)
     await _maybe_aggregate(runtime)
     return {"id": upstream_id, "deleted": True}
 
@@ -495,7 +502,7 @@ async def probe(request: Request, upstream_id: str) -> dict[str, Any]:
     refreshed = await _run_upstream_pipeline(runtime, existing)
     await _offerings(runtime, refreshed)
     await _maybe_aggregate(runtime)
-    return _upstream_view(refreshed, runtime.state_store.read_state())
+    return _upstream_view(refreshed, runtime.state_store.read_state(), runtime)
 
 
 async def _offerings(runtime: Any, upstream: Upstream) -> list[Offering]:

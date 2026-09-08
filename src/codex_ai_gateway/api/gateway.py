@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -25,11 +26,11 @@ from codex_ai_gateway.adapters.responses_chat_translation import (
     response_created_event,
     response_failed_event,
     response_function_call_done_events,
-    restore_namespace_tool_name,
     response_message_done_event,
     response_message_started_events,
     response_sse,
     response_tool_call_started_event,
+    restore_namespace_tool_name,
     translate_chat_chunk_to_response_event,
 )
 from codex_ai_gateway.adapters.responses_passthrough import ResponsesPassthrough
@@ -40,9 +41,11 @@ from codex_ai_gateway.api.errors import (
     make_auth_error,
     make_invalid_request,
 )
+from codex_ai_gateway.domain.circuit_breaker import FailureClassification, FailureDecision
 from codex_ai_gateway.domain.error_mapping import map_provider_error
 from codex_ai_gateway.domain.routing import (
     RoutingError,
+    earliest_cooldown_seconds,
     resolve_canonical_model,
     route_candidates,
 )
@@ -62,12 +65,10 @@ from codex_ai_gateway.models.entities import (
 )
 from codex_ai_gateway.runtime import Runtime
 from codex_ai_gateway.services.gateway_token import verify_gateway_token
-from codex_ai_gateway.services.upstreams import request_failure_fields
 from codex_ai_gateway.util import utc_now
 
 router = APIRouter()
 logger = logging.getLogger("codex_ai_gateway.gateway")
-FALLBACK_STATUSES = {429, 502, 503, 529}
 
 
 def _runtime(request: Request) -> Runtime:
@@ -126,10 +127,22 @@ async def _gateway(request: Request) -> Response:
             raise make_invalid_request("missing_model", "请求缺少 model 字段。")
         state = runtime.state_store.read_state()
         canonical = resolve_canonical_model(state, str(model))
-        candidates = route_candidates(state, canonical, prefer_chat=_has_custom_tools(body))
+        candidates = route_candidates(
+            state,
+            canonical,
+            prefer_chat=_has_custom_tools(body),
+            circuit_breaker=runtime.circuit_breaker,
+        )
         if not candidates:
-            raise RoutingError(
-                code="no_available_upstream", message="该模型没有可用的健康上游。", status_code=503
+            retry_after = earliest_cooldown_seconds(
+                state, canonical, runtime.circuit_breaker
+            )
+            raise GatewayError(
+                error_type="provider_error",
+                code="no_available_upstream",
+                message="该模型的所有上游均在冷却中，请稍后重试。",
+                status_code=503,
+                headers=_retry_after_headers(retry_after),
             )
         return await _attempt_with_fallback(request, runtime, canonical.id, candidates, body)
     except GatewayError as exc:
@@ -166,6 +179,12 @@ async def _gateway(request: Request) -> Response:
         )
 
 
+def _retry_after_headers(seconds: float | None) -> dict[str, str] | None:
+    if seconds is None:
+        return None
+    return {"Retry-After": str(max(1, math.ceil(seconds)))}
+
+
 @router.post("/v1/responses")
 async def responses_v1(request: Request) -> Response:
     return await _gateway(request)
@@ -184,6 +203,7 @@ async def _attempt_with_fallback(
     body: dict[str, Any],
 ) -> Response:
     last_error: GatewayError | None = None
+    last_retry_after: float | None = None
     for ordinal, (offering, upstream, protocol) in enumerate(candidates, start=1):
         event = _new_event(runtime, canonical_id, offering, upstream, protocol, ordinal)
         runtime.usage_log.create_pending(event)
@@ -201,13 +221,48 @@ async def _attempt_with_fallback(
             else:
                 chat_body = disable_unsupported_web_search(ensure_prefill_continuation(body))
             streaming = bool(body.get("stream"))
+            path = (
+                "/chat/completions"
+                if protocol == WireProtocol.chat_completions
+                else "/responses"
+            )
             if streaming:
+                upstream_stream = await runtime.upstream_client.open_stream(
+                    upstream,
+                    path=path,
+                    method="POST",
+                    json_body=chat_body,
+                    headers=_public_headers(request),
+                )
+                if upstream_stream.status_code >= 400:
+                    status_code = upstream_stream.status_code
+                    error_headers = dict(upstream_stream.headers)
+                    error_body = await upstream_stream.read_error_body()
+                    await upstream_stream.aclose()
+                    mapped, classification = _record_upstream_failure(
+                        runtime,
+                        upstream,
+                        offering.provider_model_id,
+                        status_code=status_code,
+                        headers=error_headers,
+                        body=error_body,
+                    )
+                    _finalize(
+                        runtime, event, Outcome.failed, mapped=mapped, status_code=status_code
+                    )
+                    if classification.decision is FailureDecision.hop:
+                        last_error = mapped
+                        last_retry_after = runtime.circuit_breaker.remaining(
+                            upstream.id, offering.provider_model_id
+                        )
+                        continue
+                    return mapped_response(mapped)
                 return await _stream_response(
                     request,
                     runtime,
                     event,
                     upstream,
-                    chat_body,
+                    upstream_stream,
                     protocol,
                     offering,
                     custom_tool_names=custom_tool_names,
@@ -215,31 +270,31 @@ async def _attempt_with_fallback(
                 )
             result = await runtime.upstream_client.request(
                 upstream,
-                path="/chat/completions"
-                if protocol == WireProtocol.chat_completions
-                else "/responses",
+                path=path,
                 method="POST",
                 json_body=chat_body,
                 headers=_public_headers(request),
             )
-            if result.status_code in FALLBACK_STATUSES:
-                mapped = _mapped_error(result.status_code, result.body, upstream=upstream)
-                runtime.state_store.mutate(
-                    lambda state, upstream=upstream, result=result: _mark_upstream_failure(
-                        state, upstream, result.status_code
-                    )
-                )
-                _finalize(
-                    runtime, event, Outcome.failed, mapped=mapped, status_code=result.status_code
-                )
-                last_error = mapped
-                continue
             if result.status_code >= 400:
-                mapped = _mapped_error(result.status_code, result.body, upstream=upstream)
+                mapped, classification = _record_upstream_failure(
+                    runtime,
+                    upstream,
+                    offering.provider_model_id,
+                    status_code=result.status_code,
+                    headers=result.headers,
+                    body=result.body,
+                )
                 _finalize(
                     runtime, event, Outcome.failed, mapped=mapped, status_code=result.status_code
                 )
+                if classification.decision is FailureDecision.hop:
+                    last_error = mapped
+                    last_retry_after = runtime.circuit_breaker.remaining(
+                        upstream.id, offering.provider_model_id
+                    )
+                    continue
                 return mapped_response(mapped)
+            runtime.circuit_breaker.record_success(upstream.id, offering.provider_model_id)
             _finalize_success(runtime, event, result.body)
             return Response(
                 content=result.body,
@@ -248,9 +303,14 @@ async def _attempt_with_fallback(
             )
         except Exception as exc:
             logger.warning("upstream attempt failed: %s", type(exc).__name__)
-            mapped = _mapped_error(502, b"", error=exc, upstream=upstream)
-            runtime.state_store.mutate(
-                lambda state, upstream=upstream: _mark_upstream_failure(state, upstream, None)
+            mapped, classification = _record_upstream_failure(
+                runtime,
+                upstream,
+                offering.provider_model_id,
+                status_code=None,
+                headers={},
+                body=b"",
+                error=exc,
             )
             _finalize(
                 runtime,
@@ -260,24 +320,55 @@ async def _attempt_with_fallback(
                 status_code=502,
                 fallback_trigger="connection_failure",
             )
-            last_error = mapped
-            continue
+            if classification.decision is FailureDecision.hop:
+                last_error = mapped
+                last_retry_after = runtime.circuit_breaker.remaining(
+                    upstream.id, offering.provider_model_id
+                )
+                continue
+            return mapped_response(mapped)
     if last_error:
-        return mapped_response(last_error)
+        return mapped_response(last_error, headers=_retry_after_headers(last_retry_after))
     return gateway_error_response(
         error_type="provider_error",
         code="no_available_upstream",
         message="所有上游尝试失败。",
         status_code=502,
+        headers=_retry_after_headers(last_retry_after),
     )
 
 
-def _mark_upstream_failure(state: Any, upstream: Upstream, status_code: int | None) -> None:
-    fields = request_failure_fields(status_code)
-    for index, item in enumerate(state.upstreams):
-        if item.id == upstream.id:
-            state.upstreams[index] = item.model_copy(update=fields)
-            return
+def _record_upstream_failure(
+    runtime: Runtime,
+    upstream: Upstream,
+    provider_model_id: str,
+    *,
+    status_code: int | None,
+    headers: dict[str, str],
+    body: bytes,
+    error: Exception | None = None,
+) -> tuple[GatewayError, FailureClassification]:
+    mapped = _mapped_error(status_code or 502, body, error=error, upstream=upstream)
+    classification = runtime.circuit_breaker.record_failure(
+        upstream.id,
+        provider_model_id,
+        status_code=status_code,
+        error_type=mapped.details.get("provider_error_type"),
+        retry_after=_header_value(headers, "retry-after"),
+        code=mapped.code,
+        message=mapped.message,
+    )
+    return mapped, classification
+
+
+def _header_value(headers: dict[str, str], name: str) -> str | None:
+    if not headers:
+        return None
+    lowered = name.lower()
+    for key, value in headers.items():
+        if key.lower() == lowered:
+            return value
+    return None
 
 
 def _public_headers(request: Request) -> dict[str, str]:
@@ -333,6 +424,7 @@ def _mapped_error(
         details={
             "upstream_status": status_code,
             "upstream_error_type": provider.get("upstream_error_type"),
+            "provider_error_type": provider.get("provider_error_type"),
             "fingerprint": provider.get("fingerprint"),
         },
     )
@@ -345,13 +437,14 @@ def _has_custom_tools(body: dict[str, Any]) -> bool:
     return any(isinstance(tool, dict) and tool.get("type") == "custom" for tool in tools)
 
 
-def mapped_response(exc: GatewayError) -> Response:
+def mapped_response(exc: GatewayError, *, headers: dict[str, str] | None = None) -> Response:
     return gateway_error_response(
         error_type=exc.error_type,
         code=exc.code,
         message=exc.message,
         status_code=exc.status_code,
         details=exc.details,
+        headers=headers or exc.headers,
     )
 
 
@@ -360,41 +453,13 @@ async def _stream_response(
     runtime: Runtime,
     event: UsageEvent,
     upstream: Upstream,
-    chat_body: dict[str, Any] | None,
+    upstream_stream: Any,
     protocol: WireProtocol,
     offering: Any,
     *,
     custom_tool_names: set[str] | None = None,
     namespace_tool_aliases: dict[str, dict[str, str]] | None = None,
 ) -> Response:
-    path = "/chat/completions" if protocol == WireProtocol.chat_completions else "/responses"
-    upstream_stream = await runtime.upstream_client.open_stream(
-        upstream,
-        path=path,
-        method="POST",
-        json_body=chat_body,
-        headers=_public_headers(request),
-    )
-    if (
-        upstream_stream.status_code in FALLBACK_STATUSES
-        and upstream_stream.first_byte_ms is not None
-    ):
-        error_body = await upstream_stream.read_error_body()
-        await upstream_stream.aclose()
-        raise RoutingError(
-            code="fallback_upstream_error",
-            message=f"上游返回 {upstream_stream.status_code}，尝试备用上游。",
-            status_code=upstream_stream.status_code,
-        )
-    if upstream_stream.status_code >= 400:
-        error_body = await upstream_stream.read_error_body()
-        await upstream_stream.aclose()
-        mapped = _mapped_error(upstream_stream.status_code, error_body, upstream=upstream)
-        _finalize(
-            runtime, event, Outcome.failed, mapped=mapped, status_code=upstream_stream.status_code
-        )
-        return mapped_response(mapped)
-
     is_chat = protocol == WireProtocol.chat_completions
     model_label = event.canonical_model_label or event.provider_model_id
 
@@ -541,6 +606,14 @@ async def _stream_response(
                     # 上游流在 finish_reason 之前结束（典型为中途断开）。
                     # 伪装成 completed 会让 Codex 误认为回答完整，按失败收尾。
                     error_msg = "上游流式响应在 finish_reason 之前中断，无法保证回答完整。"
+                    runtime.circuit_breaker.record_failure(
+                        upstream.id,
+                        event.provider_model_id,
+                        status_code=502,
+                        error_type=ProviderErrorType.upstream_fault.value,
+                        code="provider_upstream_fault",
+                        message=error_msg,
+                    )
                     _finalize(
                         runtime,
                         event,
@@ -633,6 +706,14 @@ async def _stream_response(
             _finalize_success(runtime, event, b"", streaming=True)
         except Exception as exc:
             error_msg = f"上游 {upstream.name} 流式传输异常: {type(exc).__name__}: {exc}"
+            runtime.circuit_breaker.record_failure(
+                upstream.id,
+                event.provider_model_id,
+                status_code=None,
+                error_type=ProviderErrorType.upstream_fault.value,
+                code="provider_upstream_fault",
+                message=error_msg,
+            )
             _finalize(
                 runtime,
                 event,

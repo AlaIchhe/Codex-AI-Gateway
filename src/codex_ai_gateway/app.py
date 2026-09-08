@@ -14,7 +14,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
-from codex_ai_gateway.api import admin, catalog, codex_integration, gateway, usage
+from codex_ai_gateway.api import admin, catalog, codex_integration, gateway, update, usage
 from codex_ai_gateway.api.errors import problem_json
 from codex_ai_gateway.integrations.secret_store import SecretStore
 from codex_ai_gateway.persistence.file_store import init_data_dir
@@ -46,6 +46,7 @@ def create_app(
     app.include_router(codex_integration.rev_router)
     app.include_router(usage.router)
     app.include_router(gateway.router)
+    app.include_router(update.router)
 
     @app.exception_handler(RequestValidationError)
     async def validation_exception_handler(_request, exc):  # type: ignore[no-untyped-def]
@@ -80,6 +81,10 @@ def create_app(
 
     @app.get("/usage", include_in_schema=False)
     async def usage_page() -> HTMLResponse:
+        return _index_response(frontend_dist)
+
+    @app.get("/update", include_in_schema=False)
+    async def update_page() -> HTMLResponse:
         return _index_response(frontend_dist)
 
     @app.on_event("startup")
@@ -120,7 +125,7 @@ def create_app(
                     logging.getLogger(__name__).exception("模型刷新循环异常")
                 await asyncio.sleep(5 * 3600)
 
-            asyncio.create_task(_model_refresh_loop())
+        app.state.model_refresh_task = asyncio.create_task(_model_refresh_loop())
 
     @app.get("/healthz", include_in_schema=False)
     async def healthz() -> dict[str, str]:

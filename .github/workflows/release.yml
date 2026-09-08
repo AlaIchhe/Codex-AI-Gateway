@@ -33,20 +33,44 @@ jobs:
       - name: Assemble release bundle
         shell: bash
         run: |
-          NAME="codex-ai-gateway-${GITHUB_REF_NAME#refs/tags/}"
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME#refs/tags/}"
+          [ -n "$TAG" ] || TAG="dev-${GITHUB_SHA::7}"
+          NAME="codex-ai-gateway-${TAG}"
           mkdir -p "bundle/${NAME}/wheels"
           cp -r dist "bundle/${NAME}/dist"
           cp wheelhouse/*.whl "bundle/${NAME}/wheels/"
           cp README.md "bundle/${NAME}/README.md"
+          cp -r scripts "bundle/${NAME}/scripts"
           cd bundle
-          zip -r "${NAME}.zip" "${NAME}"
+          zip -qr "${NAME}.zip" "${NAME}"
+          SHA=$(sha256sum "${NAME}.zip" | cut -d' ' -f1)
+          cat > latest.json <<JSON
+          {
+            "version": "${TAG}",
+            "published_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "notes_url": "https://github.com/${GITHUB_REPOSITORY}/releases/tag/${TAG}",
+            "assets": [
+              {
+                "name": "${NAME}.zip",
+                "url": "https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/${NAME}.zip",
+                "sha256": "${SHA}"
+              }
+            ]
+          }
+          JSON
+          echo "${SHA}  ${NAME}.zip" > SHA256SUMS
           echo "BUNDLE_ZIP=${NAME}.zip" >> "$GITHUB_ENV"
+          echo "BUNDLE_TAG=${TAG}" >> "$GITHUB_ENV"
 
       - name: Upload workflow artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ env.BUNDLE_ZIP }}
-          path: bundle/${{ env.BUNDLE_ZIP }}
+          path: |
+            bundle/${{ env.BUNDLE_ZIP }}
+            bundle/latest.json
+            bundle/SHA256SUMS
           if-no-files-found: error
 
       - name: Create GitHub Release
@@ -54,7 +78,9 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "${GITHUB_REF_NAME#refs/tags/}" \
-            --title "Codex AI Gateway ${GITHUB_REF_NAME#refs/tags/}" \
+          gh release create "${BUNDLE_TAG}" \
+            --title "Codex AI Gateway ${BUNDLE_TAG}" \
             --generate-notes \
-            "bundle/${BUNDLE_ZIP}"
+            "bundle/${BUNDLE_ZIP}" \
+            "bundle/latest.json" \
+            "bundle/SHA256SUMS"

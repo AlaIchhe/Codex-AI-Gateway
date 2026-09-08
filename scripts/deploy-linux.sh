@@ -1,102 +1,149 @@
 #!/usr/bin/env bash
-# Codex AI Gateway Linux 全流程部署脚本
+# Codex AI Gateway 事务化部署脚本。
 #
-# 用法（root 运行）:
-#   sudo ./deploy-linux.sh [版本] [绑定地址]
+# 用法:
+#   sudo ./deploy-linux.sh --tag v0.2.28 --url <zip_url> --sha256 <hex> [--lock-held]
+#   sudo ./deploy-linux.sh --tag v0.2.28 --zip /tmp/bundle.zip --sha256 <hex>
 #
-# 版本可省略（自动拉取最新 Release），也可指定如 v0.1.0 或 0.1.0。
-# 绑定地址默认 127.0.0.1（配合同机反向代理）。Caddy/Podman 容器回源等
-# 场景传 0.0.0.0 或具体内网 IP。管理面无登录，切勿将端口暴露到公网。
-#
-# 脚本行为:
-#   1. 从 GitHub Releases 下载构建产物（无需手动下载）
-#   2. 安装到 /opt/codex-ai-gateway/releases/<时间戳>/，切换 current 软链
-#   3. 创建 venv 并安装 wheels/（优先用 uv，回退 python3.12 venv+pip）
-#   4. 写入 /etc/systemd/system/codex-ai-gateway.service 并重启服务
-#   5. 健康检查（最长等 30 秒）失败时自动回滚 current 并重启
+# 行为: 加锁 -> 下载 -> 校验 sha256 -> 解压 -> 建 venv -> 写 unit -> 切 current
+#       -> 重启 -> 健康检查(30s) -> 失败回滚 -> 清理旧 release -> 安装脚本自身。
 set -euo pipefail
 
-REPO="AlaIchhe/Codex-AI-Gateway"
-APP_ROOT=/opt/codex-ai-gateway
-PORT=8787
+APP_ROOT=${CODEX_AI_GATEWAY_APP_ROOT:-/opt/codex-ai-gateway}
+PORT=${CODEX_AI_GATEWAY_PORT:-8787}
+DATA_DIR=$APP_ROOT/data
+RELEASES=$APP_ROOT/releases
+CURRENT=$APP_ROOT/current
 BIND_FILE=$APP_ROOT/bind-address
-if [ -n "${2:-}" ]; then
-  BIND=$2
-  echo "$BIND" > "$BIND_FILE"
-elif [ -f "$BIND_FILE" ]; then
-  BIND=$(head -1 "$BIND_FILE" | tr -d '[:space:]')
-else
-  BIND=127.0.0.1
+UNIT=/etc/systemd/system/codex-ai-gateway.service
+UPDATE_SERVICE=/etc/systemd/system/codex-ai-gateway-update.service
+UPDATE_TIMER=/etc/systemd/system/codex-ai-gateway-update.timer
+RETAIN_RELEASES=${CODEX_AI_GATEWAY_RETAIN_RELEASES:-5}
+HEALTH_TIMEOUT=${CODEX_AI_GATEWAY_HEALTH_TIMEOUT:-30}
+
+TAG=""
+URL=""
+ZIP=""
+SHA256=""
+ALLOW_UNVERIFIED=""
+LOCK_HELD=""
+
+usage() {
+  sed -n '2,10p' "$0"
+}
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --tag) TAG=$2; shift 2 ;;
+    --url) URL=$2; shift 2 ;;
+    --zip) ZIP=$2; shift 2 ;;
+    --sha256) SHA256=$2; shift 2 ;;
+    --allow-unverified) ALLOW_UNVERIFIED=1; shift ;;
+    --lock-held) LOCK_HELD=1; shift ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo "未知参数: $1" >&2; usage; exit 1 ;;
+  esac
+done
+
+[ "$(id -u)" -eq 0 ] || { echo "错误: 请用 root 运行"; exit 1; }
+[ -n "$TAG" ] || { echo "错误: 缺少 --tag"; exit 1; }
+if [ -z "$URL" ] && [ -z "$ZIP" ]; then
+  echo "错误: 需要 --url 或 --zip"; exit 1
 fi
 
-[ "$(id -u)" -eq 0 ] || { echo "错误: 请用 root 运行（sudo）"; exit 1; }
+mkdir -p "$RELEASES" "$DATA_DIR" "$APP_ROOT/bin"
 
-command -v curl >/dev/null || { echo "错误: 缺少 curl"; exit 1; }
-command -v unzip >/dev/null || { echo "错误: 缺少 unzip"; exit 1; }
+if [ -z "$LOCK_HELD" ]; then
+  exec 9>"$APP_ROOT/update.lock"
+  flock -n 9 || { echo "另一个更新任务正在运行"; exit 0; }
+fi
 
-# 解析版本 → Release tag
-case "${1:-latest}" in
-  ""|latest) API_REF="latest" ;;
-  v[0-9]*.[0-9]*.[0-9]*|*.*.*) TAG=$1; [[ $TAG == v* ]] || TAG="v$TAG"; API_REF="tags/$TAG" ;;
-  *) echo "错误: 无法识别的版本 '$1'（示例: latest / v0.1.0 / 0.1.0）"; exit 1 ;;
-esac
+record() {
+  local status=$1
+  local error=${2:-}
+  local py="$CURRENT/backend/.venv/bin/python"
+  [ -x "$py" ] || return 0
+  if [ -n "$error" ]; then
+    CODEX_AI_GATEWAY_DATA_DIR="$DATA_DIR" CODEX_AI_GATEWAY_APP_ROOT="$APP_ROOT" \
+      "$py" -m codex_ai_gateway.cli update record --status "$status" --version "$TAG" --error "$error" >/dev/null 2>&1 || true
+  else
+    CODEX_AI_GATEWAY_DATA_DIR="$DATA_DIR" CODEX_AI_GATEWAY_APP_ROOT="$APP_ROOT" \
+      "$py" -m codex_ai_gateway.cli update record --status "$status" --version "$TAG" >/dev/null 2>&1 || true
+  fi
+}
 
-echo "==> 查询 GitHub Release（$API_REF）"
-API_URL="https://api.github.com/repos/$REPO/releases/$API_REF"
-API_RESP=$(curl -fsSL "$API_URL") || { echo "错误: 查询 Release 失败"; exit 1; }
-RELEASE_TAG=$(echo "$API_RESP" | grep -o '"tag_name": *"[^"]*"' | head -1 | cut -d'"' -f4)
-ZIP_URL=$(echo "$API_RESP" \
-  | grep -o '"browser_download_url": *"[^"]*\.zip"' | head -1 | cut -d'"' -f4)
-[ -n "$ZIP_URL" ] || { echo "错误: Release 中未找到 zip 产物"; exit 1; }
+BIND=0.0.0.0
+if [ -f "$BIND_FILE" ]; then
+  BIND=$(head -1 "$BIND_FILE" | tr -d '[:space:]')
+fi
+[ -n "$BIND" ] || BIND=0.0.0.0
 
 TMP_ZIP=$(mktemp /tmp/codex-ai-gateway-XXXXXX.zip)
-echo "==> 下载 $ZIP_URL"
-curl -fsSL --retry 3 -o "$TMP_ZIP" "$ZIP_URL"
+cleanup() { rm -f "$TMP_ZIP"; }
+trap cleanup EXIT
+
+if [ -n "$ZIP" ]; then
+  cp "$ZIP" "$TMP_ZIP"
+else
+  echo "==> 下载 $URL"
+  curl -fsSL --retry 3 --connect-timeout 15 --max-time 600 -o "$TMP_ZIP" "$URL"
+fi
+
+if [ -n "$SHA256" ]; then
+  echo "$SHA256  $TMP_ZIP" | sha256sum -c - >/dev/null || {
+    echo "错误: sha256 校验失败"; record failed "sha256 mismatch"; exit 1; }
+else
+  if [ -z "$ALLOW_UNVERIFIED" ]; then
+    echo "错误: 未提供 --sha256，拒绝安装未校验的产物（可用 --allow-unverified 覆盖）"
+    exit 1
+  fi
+  echo "警告: 未校验产物完整性"
+fi
 
 STAMP=$(date +%Y%m%d-%H%M%S)
-REL_DIR=$APP_ROOT/releases/$STAMP
-CURRENT=$APP_ROOT/current
-UNIT=/etc/systemd/system/codex-ai-gateway.service
-
-echo "==> 准备 release 目录 $REL_DIR"
-mkdir -p "$APP_ROOT/releases" "$APP_ROOT/data"
-unzip -q "$TMP_ZIP" -d "$REL_DIR" && rm -f "$TMP_ZIP"
-# zip 内含顶层目录时自动下沉一层
-entries=("$REL_DIR"/*)
-if [ ! -d "$REL_DIR/wheels" ] && [ ${#entries[@]} -eq 1 ] && [ -d "${entries[0]}" ]; then
-  REL_DIR=${entries[0]}
+REL_DIR=$RELEASES/$STAMP
+mkdir -p "$REL_DIR"
+unzip -q "$TMP_ZIP" -d "$REL_DIR"
+BUNDLE=$REL_DIR/codex-ai-gateway-$TAG
+if [ ! -d "$BUNDLE/wheels" ]; then
+  found=$(find "$REL_DIR" -maxdepth 2 -type d -name wheels | head -1)
+  if [ -z "$found" ]; then
+    echo "错误: release 内缺少 wheels/"; record failed "missing wheels"; exit 1
+  fi
+  BUNDLE=$(dirname "$found")
 fi
-[ -d "$REL_DIR/wheels" ] || { echo "错误: release 内缺少 wheels/"; exit 1; }
 
 OLD_TARGET=$(readlink -f "$CURRENT" 2>/dev/null || true)
+UNIT_BAK=$APP_ROOT/unit-backup-$STAMP.service
+if [ -f "$UNIT" ]; then cp "$UNIT" "$UNIT_BAK"; fi
 
 echo "==> 安装后端依赖"
-mkdir -p "$REL_DIR/backend"
-trap 'rm -rf "$REL_DIR"' ERR   # 部署中途失败时清理残留
+mkdir -p "$BUNDLE/backend"
 UV_BIN=""
-command -v uv >/dev/null 2>&1 && UV_BIN=$(command -v uv)
-if [ -z "$UV_BIN" ]; then
-  for p in "${HOME:-/root}/.local/bin/uv" /root/.local/bin/uv /usr/local/bin/uv; do
-    [ -x "$p" ] && UV_BIN=$p && break
-  done
+if command -v uv >/dev/null 2>&1; then
+  UV_BIN=$(command -v uv)
+elif [ -x /root/.local/bin/uv ]; then
+  UV_BIN=/root/.local/bin/uv
 fi
 if [ -n "$UV_BIN" ]; then
-  (cd "$REL_DIR/backend" && "$UV_BIN" venv && "$UV_BIN" pip install "$REL_DIR"/wheels/*.whl)
+  ( cd "$BUNDLE/backend" && "$UV_BIN" venv && "$UV_BIN" pip install "$BUNDLE"/wheels/*.whl )
 else
   PY=""
-  command -v python3.12 >/dev/null 2>&1 && PY=$(command -v python3.12)
-  [ -z "$PY" ] && [ -x /usr/bin/python3.12 ] && PY=/usr/bin/python3.12
-  [ -n "$PY" ] || { echo "错误: 需要 uv 或 Python 3.12（网关要求 <3.13，当前 python3 不满足）"; exit 1; }
-  (cd "$REL_DIR/backend" && "$PY" -m venv .venv \
+  if command -v python3.12 >/dev/null 2>&1; then
+    PY=$(command -v python3.12)
+  elif [ -x /usr/bin/python3.12 ]; then
+    PY=/usr/bin/python3.12
+  fi
+  [ -n "$PY" ] || { echo "错误: 需要 uv 或 Python 3.12"; exit 1; }
+  ( cd "$BUNDLE/backend" && "$PY" -m venv .venv \
     && ./.venv/bin/pip install --upgrade pip \
-    && ./.venv/bin/pip install "$REL_DIR"/wheels/*.whl)
+    && ./.venv/bin/pip install "$BUNDLE"/wheels/*.whl )
 fi
-[ -x "$REL_DIR/backend/.venv/bin/python" ] || { echo "错误: venv 创建失败"; exit 1; }
+[ -x "$BUNDLE/backend/.venv/bin/python" ] || { echo "错误: venv 创建失败"; exit 1; }
 
-# 网关凭据存入 keyring；若本机配有 keyring 解锁服务则声明依赖
 KREQ=""
 if systemctl list-unit-files 2>/dev/null | grep -q '^codex-keyring-unlock.service'; then
-  KREQ="Requires=codex-keyring-unlock.service"$'\n'"After=codex-keyring-unlock.service"
+  KREQ=$(printf 'Requires=codex-keyring-unlock.service\nAfter=codex-keyring-unlock.service')
 fi
 
 echo "==> 写入 systemd 服务"
@@ -109,12 +156,13 @@ $KREQ
 
 [Service]
 Type=simple
-WorkingDirectory=$REL_DIR/backend
-Environment=CODEX_AI_GATEWAY_DATA_DIR=$APP_ROOT/data
-Environment=CODEX_AI_GATEWAY_FRONTEND_DIST=$REL_DIR/dist
+WorkingDirectory=$BUNDLE/backend
+Environment=CODEX_AI_GATEWAY_DATA_DIR=$DATA_DIR
+Environment=CODEX_AI_GATEWAY_FRONTEND_DIST=$BUNDLE/dist
+Environment=CODEX_AI_GATEWAY_APP_ROOT=$APP_ROOT
 Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/0/bus
 Environment=XDG_RUNTIME_DIR=/run/user/0
-ExecStart=$REL_DIR/backend/.venv/bin/python -m uvicorn codex_ai_gateway.app:app --host $BIND --port $PORT
+ExecStart=$BUNDLE/backend/.venv/bin/python -m uvicorn codex_ai_gateway.app:app --host $BIND --port $PORT
 Restart=on-failure
 RestartSec=3
 
@@ -122,44 +170,42 @@ RestartSec=3
 WantedBy=multi-user.target
 EOF
 
-ln -sfn "$REL_DIR" "$CURRENT"
+ln -sfn "$BUNDLE" "$CURRENT"
 systemctl daemon-reload
-systemctl enable codex-ai-gateway >/dev/null 2>&1
 systemctl restart codex-ai-gateway
 
-echo "==> 健康检查（最长 30 秒）"
+echo "==> 健康检查（最长 $HEALTH_TIMEOUT 秒）"
 OK=""
-for i in $(seq 1 30); do
+for _ in $(seq 1 "$HEALTH_TIMEOUT"); do
   if curl -sf "http://127.0.0.1:$PORT/healthz" 2>/dev/null | grep -q '"status":"ok"'; then
     OK=1; break
   fi
   sleep 1
 done
 
-if [ -n "$OK" ]; then
-  echo "部署成功: $(readlink -f "$CURRENT")"
-  echo "管理界面: http://127.0.0.1:$PORT"
-  echo "$RELEASE_TAG" > "$APP_ROOT/deployed-version"
-else
+if [ -z "$OK" ]; then
   echo "健康检查失败，回滚到 $OLD_TARGET"
   if [ -n "$OLD_TARGET" ] && [ -d "$OLD_TARGET" ]; then
     ln -sfn "$OLD_TARGET" "$CURRENT"
+    if [ -f "$UNIT_BAK" ]; then cp "$UNIT_BAK" "$UNIT"; fi
+    systemctl daemon-reload
     systemctl restart codex-ai-gateway
-  else
-    systemctl stop codex-ai-gateway || true
   fi
-  journalctl -u codex-ai-gateway -n 30 --no-pager || true
+  journalctl -u codex-ai-gateway -n 40 --no-pager || true
+  record failed "health check failed"
   exit 1
 fi
 
-echo "==> 安装自动更新"
-mkdir -p "$APP_ROOT/bin"
-curl -fsSL --retry 3 \
-  "https://raw.githubusercontent.com/$REPO/main/scripts/auto-update.sh" \
-  -o "$APP_ROOT/bin/auto-update.sh"
-chmod +x "$APP_ROOT/bin/auto-update.sh"
+echo "$TAG" > "$APP_ROOT/deployed-version"
+echo "$TAG-$STAMP" > "$APP_ROOT/deployed-build"
 
-cat > /etc/systemd/system/codex-ai-gateway-update.service <<'UNIT'
+if [ -d "$BUNDLE/scripts" ]; then
+  cp "$BUNDLE/scripts/deploy-linux.sh" "$APP_ROOT/bin/deploy-linux.sh"
+  cp "$BUNDLE/scripts/auto-update.sh" "$APP_ROOT/bin/auto-update.sh"
+  chmod +x "$APP_ROOT/bin/deploy-linux.sh" "$APP_ROOT/bin/auto-update.sh"
+fi
+
+cat > "$UPDATE_SERVICE" <<UNIT
 [Unit]
 Description=Codex AI Gateway Auto Update
 After=network-online.target codex-ai-gateway.service
@@ -167,17 +213,19 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
-ExecStart=/opt/codex-ai-gateway/bin/auto-update.sh
-TimeoutStartSec=600
+Environment=CODEX_AI_GATEWAY_APP_ROOT=$APP_ROOT
+Environment=CODEX_AI_GATEWAY_DATA_DIR=$DATA_DIR
+ExecStart=$APP_ROOT/bin/auto-update.sh
+TimeoutStartSec=900
 UNIT
 
-cat > /etc/systemd/system/codex-ai-gateway-update.timer <<'UNIT'
+cat > "$UPDATE_TIMER" <<UNIT
 [Unit]
 Description=Codex AI Gateway Auto Update Timer
 
 [Timer]
 OnBootSec=2min
-OnUnitActiveSec=5min
+OnUnitActiveSec=1h
 Persistent=true
 
 [Install]
@@ -185,5 +233,20 @@ WantedBy=timers.target
 UNIT
 
 systemctl daemon-reload
-systemctl enable --now codex-ai-gateway-update.timer >/dev/null 2>&1
-echo "自动更新已启用（每 5 分钟检查一次）"
+systemctl enable --now codex-ai-gateway-update.timer >/dev/null 2>&1 || true
+
+record succeeded
+echo "部署成功: $BUNDLE"
+echo "管理界面: http://127.0.0.1:$PORT"
+
+# 清理旧 release：保留最近 N 个，跳过 current 指向的目录。
+ls -1dt "$RELEASES"/*/ 2>/dev/null | tail -n +$((RETAIN_RELEASES + 1)) | while read -r dir; do
+  dir=${dir%/}
+  case "$dir" in
+    "$RELEASES"/*)
+      if [ "$dir" != "$(readlink -f "$CURRENT" 2>/dev/null || true)" ]; then
+        rm -rf -- "$dir"
+      fi
+      ;;
+  esac
+done

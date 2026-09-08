@@ -177,3 +177,48 @@ class ProblemDocument(BaseModel):
     status: int
     instance: str | None = None
     details: dict[str, Any] = Field(default_factory=dict)
+
+class UpdatePolicyPatch(BaseModel):
+    policy: str
+    pinned_version: str | None = None
+    dismissed_version: str | None = None
+
+    @field_validator("policy")
+    @classmethod
+    def validate_policy(cls, value: str) -> str:
+        if value not in {"auto", "notify", "pinned"}:
+            raise ValueError("policy 只能是 auto、notify 或 pinned")
+        return value
+
+
+class UpdateRunRequest(BaseModel):
+    force: bool = False
+
+
+class UpdateStatusView(BaseModel):
+    managed: bool
+    app_root: str
+    current_version: str | None = None
+    current_build: str | None = None
+    policy: str
+    pinned_version: str | None = None
+    dismissed_version: str | None = None
+    latest_version: str | None = None
+    target_version: str | None = None
+    update_available: bool = False
+    action: str = "none"
+    action_reason: str = "unknown"
+    notes_url: str | None = None
+    published_at: str | None = None
+    target_sha256: str | None = None
+    last_check_at: str | None = None
+    last_check_error: str | None = None
+    next_check_at: float | None = None
+    install_status: str = "idle"
+    install_version: str | None = None
+    install_requested_at: str | None = None
+    install_finished_at: str | None = None
+    install_error: str | None = None
+    retained_releases: int = 0
+    started: bool | None = None
+    message: str | None = None

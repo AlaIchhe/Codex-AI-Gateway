@@ -5,6 +5,7 @@ import {
   Menu,
   Network,
   Package,
+  RefreshCw,
   ShieldAlert,
   X,
 } from "lucide-react"
@@ -22,6 +23,7 @@ const navigation = [
   { to: "/models", label: "模型", icon: ShieldAlert },
   { to: "/codex-plugins", label: "插件", icon: Package },
   { to: "/usage", label: "用量", icon: BarChart3 },
+  { to: "/update", label: "更新", icon: RefreshCw },
 ] as const
 
 function NavLinks({
