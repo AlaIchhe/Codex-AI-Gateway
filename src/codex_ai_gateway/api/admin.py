@@ -412,8 +412,8 @@ async def create_upstream(request: Request, payload: UpstreamCreate) -> dict[str
     if payload.api_credential:
         runtime.secret_store.set_secret(upstream.auth_credential_ref, payload.api_credential)
     refreshed = await _run_upstream_pipeline(runtime, upstream)
-    await _offerings(runtime, refreshed)
     await _maybe_aggregate(runtime)
+    await _offerings(runtime, refreshed)
     return _upstream_view(refreshed, runtime.state_store.read_state(), runtime)
 
 @router.post("/debug/probe/{upstream_id}")
@@ -479,8 +479,8 @@ async def update_upstream(request: Request, upstream_id: str, payload: UpstreamU
             runtime.circuit_breaker.clear(upstream_id)
         return _upstream_view(updated, runtime.state_store.read_state(), runtime)
     refreshed = await _run_upstream_pipeline(runtime, updated)
-    await _offerings(runtime, refreshed)
     await _maybe_aggregate(runtime)
+    await _offerings(runtime, refreshed)
     return _upstream_view(refreshed, runtime.state_store.read_state(), runtime)
 
 
@@ -519,8 +519,8 @@ async def probe(request: Request, upstream_id: str) -> dict[str, Any]:
     if existing is None:
         _not_found("上游不存在")
     refreshed = await _run_upstream_pipeline(runtime, existing)
-    await _offerings(runtime, refreshed)
     await _maybe_aggregate(runtime)
+    await _offerings(runtime, refreshed)
     return _upstream_view(refreshed, runtime.state_store.read_state(), runtime)
 
 

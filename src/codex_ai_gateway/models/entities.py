@@ -242,6 +242,7 @@ class CatalogCandidate(BaseModel):
     public_snapshot_version: str | None = None
     public_snapshot_time: str | None = None
     native_upstream_metadata_time: str | None = None
+    capability_probe_at: str | None = None
     lineage_hash: str | None = None
     created_at: str
     updated_at: str

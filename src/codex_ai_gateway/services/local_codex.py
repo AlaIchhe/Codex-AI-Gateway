@@ -29,6 +29,7 @@ from codex_ai_gateway.persistence.atomic_writer import (
 from codex_ai_gateway.services.catalog_publishing import (
     build_catalog_response,
     load_published_model_infos,
+    routable_slug_key,
     validate_catalog_response,
 )
 from codex_ai_gateway.services.codex_process_restart import restart_codex_processes
@@ -71,10 +72,34 @@ class LocalCodexService:
         }
         return preview, new_text
 
+    def _routable_catalog_slugs(self) -> set[str] | None:
+        """当前可路由 canonical slug 集合；state 不可读时返回 None（不过滤）。"""
+        if not (self.data_dir / "admin-state.json").exists():
+            return None
+        try:
+            from codex_ai_gateway.persistence.file_store import StateStore
+
+            state = StateStore(self.data_dir).load()
+        except Exception:  # noqa: BLE001 - 状态异常时不阻断目录生成
+            return None
+        slugs: set[str] = set()
+        for model in getattr(state, "canonical_models", []):
+            if str(getattr(model, "status", "")) != "available":
+                continue
+            slug = str(getattr(model, "slug", "") or "").strip()
+            if not slug:
+                continue
+            key = routable_slug_key(slug)
+            if key:
+                slugs.add(key)
+        return slugs
+
     def _latest_catalog_response(self) -> dict[str, Any] | None:
         """从最新发布资产生成官方目录文档；无发布或生成失败时返回 None。"""
         try:
-            infos = load_published_model_infos(self.data_dir)
+            infos = load_published_model_infos(
+                self.data_dir, valid_slugs=self._routable_catalog_slugs()
+            )
         except Exception:  # noqa: BLE001
             return None
         if not infos:

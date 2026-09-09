@@ -120,7 +120,18 @@ def create_app(
                                 "自动模型探测失败: upstream=%s", upstream.id,
                             )
                     from codex_ai_gateway.api.admin import _maybe_aggregate
+                    from codex_ai_gateway.services.catalog_publishing import (
+                        run_catalog_automation,
+                    )
+
                     await _maybe_aggregate(runtime)
+                    await run_catalog_automation(runtime)
+                    if os.environ.get("CODEX_AI_GATEWAY_DISABLE_STARTUP_AUTOMATION") != "1":
+                        await asyncio.to_thread(
+                            LocalCodexAutomationService(data_path).run_auto_maintenance,
+                            runtime,
+                            trigger="model_refresh",
+                        )
                 except Exception:
                     logging.getLogger(__name__).exception("模型刷新循环异常")
                 await asyncio.sleep(5 * 3600)

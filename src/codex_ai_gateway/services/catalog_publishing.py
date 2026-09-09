@@ -28,6 +28,7 @@ from codex_ai_gateway.models.entities import (
     SelectionResult,
     SourceKind,
     Upstream,
+    UpstreamStatus,
     VerificationStatus,
     WireProtocol,
 )
@@ -65,6 +66,309 @@ def _reasoning_levels(value: Any) -> list[str]:
     if isinstance(value, str) and value:
         return [value]
     return []
+
+
+_ROLLING_ALIAS_SUFFIXES = ("-latest",)
+
+
+def _strip_rolling_alias(slug: str) -> str:
+    """剥离 OpenRouter 滚动别名后缀（如 ``deepseek-v4-flash-latest``）。"""
+    text = slug.strip()
+    lowered = text.lower()
+    for suffix in _ROLLING_ALIAS_SUFFIXES:
+        if lowered.endswith(suffix) and len(text) > len(suffix):
+            text = text[: -len(suffix)]
+            lowered = text.lower()
+    return text
+
+
+def routable_slug_key(slug: str) -> str:
+    """发布 slug 与 canonical slug 的统一比较键（与聚合层 family_key 一致）。
+
+    复用 ``family_key_of``，使目录过滤/去重和路由使用同一套归一逻辑，
+    避免 ``deepseek-chat-v3-0324`` 之类的日期后缀与 canonical slug 对不上。
+    """
+    from codex_ai_gateway.services.model_identity import family_key_of
+
+    return family_key_of(slug)
+
+
+def _merge_metadata(base: dict[str, Any], overlay: dict[str, Any]) -> dict[str, Any]:
+    """合并元数据；overlay 中的有效值覆盖 base，空值不覆盖。"""
+    merged = dict(base)
+    for key, value in overlay.items():
+        if value is None or value == [] or value == {}:
+            continue
+        merged[key] = value
+    return merged
+
+
+def _upstream_modalities(values: Any, *, allow_image: bool = True) -> list[str]:
+    allowed = {"text", "image", "audio"}
+    items = (
+        [str(item).strip().lower() for item in values]
+        if isinstance(values, list)
+        else []
+    )
+    result = [item for item in items if item in allowed]
+    if allow_image and any(item in {"vision", "image_url", "image"} for item in items):
+        if "image" not in result:
+            result.append("image")
+    if "text" not in result:
+        result.insert(0, "text")
+    return result
+
+
+def _metadata_from_upstream(
+    native: dict[str, Any] | None, capabilities: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    """把上游原生 /models 条目归一化为网关内部元数据形态。"""
+    source = native if isinstance(native, dict) else {}
+    caps = capabilities if isinstance(capabilities, dict) else {}
+    architecture = source.get("architecture")
+    architecture = architecture if isinstance(architecture, dict) else {}
+    metadata: dict[str, Any] = {}
+    context = (
+        source.get("context_window")
+        or source.get("context_length")
+        or source.get("max_context_length")
+        or source.get("max_model_len")
+    )
+    parsed_context = _safe_positive_int(context)
+    if parsed_context is not None:
+        metadata["context_window"] = parsed_context
+    inputs = (
+        source.get("input_modalities")
+        or architecture.get("input_modalities")
+        or caps.get("modalities")
+        or []
+    )
+    outputs = (
+        source.get("output_modalities")
+        or architecture.get("output_modalities")
+        or []
+    )
+    metadata["input_modality"] = _upstream_modalities(inputs)
+    metadata["output_modality"] = _upstream_modalities(outputs, allow_image=False)
+    params = source.get("supported_parameters")
+    if isinstance(params, list) and params:
+        metadata["supported_parameters"] = [str(item) for item in params]
+    reasoning = source.get("reasoning")
+    if reasoning is not None:
+        metadata["reasoning"] = reasoning
+    return metadata
+
+
+def _provider_family_slug(offering: Offering, upstream: Upstream | None) -> str:
+    """上游兜底候选的目录 slug：与聚合层的 family_key 保持一致。"""
+    from codex_ai_gateway.services.model_identity import family_key_of
+
+    aliases: dict[str, str] = {}
+    if (
+        upstream is not None
+        and getattr(upstream, "kind", None) == "preset"
+        and upstream.preset_id
+    ):
+        try:
+            from codex_ai_gateway.services.presets import get_preset_provider
+
+            aliases = get_preset_provider(upstream.preset_id).identity_aliases
+        except KeyError:
+            aliases = {}
+    slug = family_key_of(
+        offering.provider_model_id,
+        namespace_prefixes=set(getattr(upstream, "namespace_prefixes", set()) or set()),
+        aliases=aliases or None,
+    )
+    return slug or offering.provider_model_id.lower().replace(".", "-")
+
+
+CAPABILITY_PROBE_TIMEOUT_SECONDS = 20.0
+CAPABILITY_PROBE_CONNECT_TIMEOUT_SECONDS = 5.0
+CAPABILITY_PROBE_MAX_TOKENS = 64
+CAPABILITY_PROBE_TTL_SECONDS = 6 * 3600
+_PROBED_REASONING = {
+    "supported_efforts": ["low", "medium", "high"],
+    "default_effort": "medium",
+}
+
+
+def _probe_is_fresh(value: str | None) -> bool:
+    if not value:
+        return False
+    try:
+        probed = datetime.fromisoformat(value)
+    except ValueError:
+        return False
+    if probed.tzinfo is None:
+        probed = probed.replace(tzinfo=UTC)
+    return (datetime.now(UTC) - probed).total_seconds() < CAPABILITY_PROBE_TTL_SECONDS
+
+
+def _probe_tool_schema() -> dict[str, Any]:
+    return {
+        "type": "function",
+        "function": {
+            "name": "gateway_probe",
+            "description": "Return pong.",
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    }
+
+
+def _probe_request_body(
+    protocol: WireProtocol, model_id: str, *, tools: bool, reasoning: bool
+) -> dict[str, Any]:
+    if protocol == WireProtocol.responses:
+        body: dict[str, Any] = {
+            "model": model_id,
+            "input": "ping",
+            "max_output_tokens": CAPABILITY_PROBE_MAX_TOKENS,
+        }
+        if tools:
+            schema = _probe_tool_schema()["function"]
+            body["tools"] = [{"type": "function", **schema}]
+            body["tool_choice"] = "auto"
+        if reasoning:
+            body["reasoning"] = {"effort": "low"}
+        return body
+    body = {
+        "model": model_id,
+        "messages": [{"role": "user", "content": "ping"}],
+        "max_tokens": CAPABILITY_PROBE_MAX_TOKENS,
+    }
+    if tools:
+        body["tools"] = [_probe_tool_schema()]
+        body["tool_choice"] = "auto"
+    if reasoning:
+        body["reasoning_effort"] = "low"
+    return body
+
+
+def _has_reasoning_output(body: dict[str, Any] | None) -> bool:
+    if not isinstance(body, dict):
+        return False
+    choices = body.get("choices")
+    if isinstance(choices, list):
+        for choice in choices:
+            message = choice.get("message") if isinstance(choice, dict) else None
+            if isinstance(message, dict) and (
+                message.get("reasoning_content") or message.get("reasoning")
+            ):
+                return True
+    usage = body.get("usage")
+    if isinstance(usage, dict):
+        details = usage.get("completion_tokens_details")
+        if isinstance(details, dict) and details.get("reasoning_tokens"):
+            return True
+        if usage.get("reasoning_tokens"):
+            return True
+    output = body.get("output")
+    if isinstance(output, list):
+        for item in output:
+            if isinstance(item, dict) and item.get("type") == "reasoning":
+                return True
+    return bool(body.get("reasoning_content"))
+
+
+async def _post_capability_probe(
+    client: httpx.AsyncClient,
+    url: str,
+    headers: dict[str, str],
+    body: dict[str, Any],
+) -> tuple[int | None, dict[str, Any] | None]:
+    try:
+        response = await client.post(url, json=body, headers=headers)
+    except httpx.HTTPError:
+        return None, None
+    parsed: dict[str, Any] | None = None
+    try:
+        payload = response.json()
+        if isinstance(payload, dict):
+            parsed = payload
+    except ValueError:
+        parsed = None
+    return response.status_code, parsed
+
+
+async def probe_model_capabilities(
+    upstream: Upstream,
+    api_credential: str,
+    model_id: str,
+    *,
+    protocol: WireProtocol,
+) -> dict[str, Any]:
+    """用极小请求探测 tools / tool_choice / reasoning，补齐上游兜底元数据。
+
+    OpenRouter 未收录的模型没有公开能力字段，这里发送一次（必要时两次）
+    ``max_tokens=64`` 的真实请求；失败时返回空元数据，候选保持拒绝。
+    """
+    path = "/responses" if protocol == WireProtocol.responses else "/chat/completions"
+    url = f"{upstream.base_url.rstrip('/')}{path}"
+    headers = dict(upstream.default_headers)
+    headers["Authorization"] = f"Bearer {api_credential}"
+    timeout = httpx.Timeout(
+        CAPABILITY_PROBE_TIMEOUT_SECONDS,
+        connect=CAPABILITY_PROBE_CONNECT_TIMEOUT_SECONDS,
+    )
+    metadata: dict[str, Any] = {}
+    tools_ok = False
+    reasoning_ok = False
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        status, body = await _post_capability_probe(
+            client,
+            url,
+            headers,
+            _probe_request_body(protocol, model_id, tools=True, reasoning=False),
+        )
+        if status == 200:
+            tools_ok = True
+            reasoning_ok = _has_reasoning_output(body)
+        if tools_ok and not reasoning_ok:
+            status, _body = await _post_capability_probe(
+                client,
+                url,
+                headers,
+                _probe_request_body(protocol, model_id, tools=False, reasoning=True),
+            )
+            reasoning_ok = status == 200
+    if tools_ok:
+        metadata["supported_parameters"] = ["tools", "tool_choice"]
+    if reasoning_ok:
+        metadata["reasoning"] = dict(_PROBED_REASONING)
+    return metadata
+
+
+async def _fallback_metadata(
+    runtime: Any,
+    candidate: CatalogCandidate,
+    offering: Offering,
+    upstream: Upstream | None,
+    existing_evidence: CatalogEvidenceSet | None,
+) -> dict[str, Any]:
+    """上游兜底元数据：原生 /models 字段 + 能力探测（按 TTL 复用）。"""
+    metadata = _metadata_from_upstream(
+        offering.native_metadata_json, offering.capabilities
+    )
+    existing = _metadata_from_evidence(
+        existing_evidence.fields if existing_evidence else []
+    )
+    metadata = _merge_metadata(metadata, existing)
+    if _probe_is_fresh(candidate.capability_probe_at):
+        return metadata
+    if upstream is None or upstream.status != UpstreamStatus.enabled:
+        return metadata
+    credential = runtime.secret_store.get_secret(upstream.auth_credential_ref) or ""
+    if not credential:
+        return metadata
+    candidate.capability_probe_at = utc_now()
+    probe = await probe_model_capabilities(
+        upstream,
+        credential,
+        offering.provider_model_id,
+        protocol=offering.wire_protocol,
+    )
+    return _merge_metadata(metadata, probe)
 
 
 def reconcile_metadata(openrouter: dict[str, Any], native: dict[str, Any] | None) -> dict[str, Any]:
@@ -196,7 +500,11 @@ class CatalogPublishingService:
             for field in fields:
                 field_sources[field.field_path] = field.source_kind.value
         evidence_set = next((item for item in evidence_sets if item.candidate_id == accepted[0].id), None)
-        model_info = _build_model_info(accepted[0], evidence_set.fields if evidence_set else [])
+        model_info = _build_model_info(
+            accepted[0],
+            evidence_set.fields if evidence_set else [],
+            provider_model_id=offering.provider_model_id,
+        )
         version_hash = _version_hash(model_info, field_sources)
         entry = PublishedCatalogEntry(
             id=uuid7(),
@@ -420,6 +728,7 @@ async def run_catalog_automation(runtime: Any) -> dict[str, Any]:
     )
 
     # 自动为 approved offering 建立候选；失败原因在维护作业中逐字段补全。
+    upstream_by_id = {item.id: item for item in getattr(state, "upstreams", [])}
     existing_offerings = {candidate.offering_id for candidate in candidates}
     now = utc_now()
     for offering in offerings:
@@ -432,7 +741,9 @@ async def run_catalog_automation(runtime: Any) -> dict[str, Any]:
                 id=uuid7(),
                 offering_id=offering.id,
                 upstream_id=offering.upstream_id,
-                proposed_alias_slug=offering.provider_model_id.lower().replace(".", "-"),
+                proposed_alias_slug=_provider_family_slug(
+                    offering, upstream_by_id.get(offering.upstream_id)
+                ),
                 mapping_status=MappingStatus.missing,
                 selection_result=SelectionResult.rejected,
                 rejection_reason="缺少公开元数据",
@@ -500,28 +811,56 @@ async def run_catalog_automation(runtime: Any) -> dict[str, Any]:
                 if result.candidate is not None:
                     identities[offering.provider_model_id] = result.candidate
 
+    evidence_by_candidate = {
+        item.candidate_id: item for item in state.catalog_evidence
+    }
+    fallback_tasks: list[tuple[CatalogCandidate, Offering, Upstream | None]] = []
     for candidate in candidates:
         offering = offering_by_id.get(candidate.offering_id)
         if offering is None:
             continue
         identity = identities.get(offering.provider_model_id)
-        if identity is None:
+        if identity is not None:
+            metadata = reconcile_metadata(
+                extract_model_metadata(identity),
+                offering.native_metadata_json,
+            )
+            metadata_by_candidate[candidate.id] = metadata
+            candidate.openrouter_model_id = identity.get("id")
+            candidate.openrouter_snapshot_id = snapshot_id
+            canonical_slug = _official_slug(identity)
+            if canonical_slug:
+                candidate.proposed_alias_slug = canonical_slug
+            candidate.openrouter_version_id = metadata.get("version_id")
+            candidate.mapping_status = MappingStatus.automatic_confirmed
+            candidate.public_snapshot_url = "https://openrouter.ai/api/v1/models"
+            candidate.public_snapshot_version = metadata.get("version_id")
+            candidate.public_snapshot_time = utc_now()
             continue
-        metadata = reconcile_metadata(
-            extract_model_metadata(identity),
-            offering.native_metadata_json,
+        # OpenRouter 未收录：用上游原生元数据 + 一次极小能力探测兜底发布。
+        upstream = upstream_by_id.get(offering.upstream_id)
+        fallback_slug = _provider_family_slug(offering, upstream)
+        if fallback_slug:
+            candidate.proposed_alias_slug = fallback_slug
+        fallback_tasks.append((candidate, offering, upstream))
+
+    if fallback_tasks:
+        fallback_results = await asyncio.gather(
+            *[
+                _fallback_metadata(
+                    runtime,
+                    candidate,
+                    offering,
+                    upstream,
+                    evidence_by_candidate.get(candidate.id),
+                )
+                for candidate, offering, upstream in fallback_tasks
+            ]
         )
-        metadata_by_candidate[candidate.id] = metadata
-        candidate.openrouter_model_id = identity.get("id")
-        candidate.openrouter_snapshot_id = snapshot_id
-        canonical_slug = _official_slug(identity)
-        if canonical_slug:
-            candidate.proposed_alias_slug = canonical_slug
-        candidate.openrouter_version_id = metadata.get("version_id")
-        candidate.mapping_status = MappingStatus.automatic_confirmed
-        candidate.public_snapshot_url = "https://openrouter.ai/api/v1/models"
-        candidate.public_snapshot_version = metadata.get("version_id")
-        candidate.public_snapshot_time = utc_now()
+        for (candidate, _offering, _upstream), metadata in zip(
+            fallback_tasks, fallback_results, strict=True
+        ):
+            metadata_by_candidate[candidate.id] = metadata
 
     evidence_input = list(state.catalog_evidence)
     for candidate_id, metadata in metadata_by_candidate.items():
@@ -614,13 +953,14 @@ def _official_slug(identity: dict[str, Any]) -> str | None:
 
     支持 YYYYMMDD（8 位）与 MM-DD（5 位，如 qwen3.6-plus-04-02）两类日期后缀；
     MM-DD 需通过月份/日期范围校验，避免误伤真实版本号。
+    同时剥离 ``~`` 滚动别名前缀与 ``-latest`` 后缀，避免同一模型重复发布。
     """
     import re
 
     value = identity.get("canonical_slug")
     if not isinstance(value, str) or "/" not in value:
         return None
-    slug = value.rsplit("/", 1)[-1]
+    slug = value.rsplit("/", 1)[-1].lstrip("~")
     # YYYYMMDD 或 MM-DD 结尾
     date_full = re.compile(r"^(?P<base>.+)-(?P<date>\d{8})$")
     date_short = re.compile(r"^(?P<base>.+)-(?P<mm>\d{2})-(?P<dd>\d{2})$")
@@ -631,8 +971,8 @@ def _official_slug(identity: dict[str, Any]) -> str | None:
     if match:
         mm, dd = int(match.group("mm")), int(match.group("dd"))
         if 1 <= mm <= 12 and 1 <= dd <= 31:
-            return match.group("base") or None
-    return slug or None
+            return _strip_rolling_alias(match.group("base") or "") or None
+    return _strip_rolling_alias(slug) or None
 
 
 def _metadata_from_evidence(fields: list[CatalogFieldEvidence]) -> dict[str, Any]:
@@ -677,13 +1017,19 @@ def evaluate_fields(
     """逐字段评估必要属性，生成 evidence。"""
     now = utc_now()
     fields: list[CatalogFieldEvidence] = []
+    # 无 OpenRouter 身份的候选由上游原生元数据 + 能力探测兜底，证据来源据此标记。
+    default_source = (
+        SourceKind.openrouter
+        if candidate.openrouter_model_id
+        else SourceKind.upstream_native
+    )
 
     def add(
         field_path: str,
         value: Any,
         status: VerificationStatus,
         advice: str | None = None,
-        source: SourceKind = SourceKind.openrouter,
+        source: SourceKind = default_source,
     ) -> None:
         fields.append(
             CatalogFieldEvidence(
@@ -744,10 +1090,14 @@ def evaluate_fields(
 
 
 def _build_model_info(
-    candidate: CatalogCandidate, evidence: list[CatalogFieldEvidence] | None = None
+    candidate: CatalogCandidate,
+    evidence: list[CatalogFieldEvidence] | None = None,
+    *,
+    provider_model_id: str | None = None,
 ) -> dict[str, Any]:
-    if candidate.openrouter_model_id is None:
-        raise ValueError("候选缺少 openrouter_model_id")
+    model_id = candidate.openrouter_model_id or provider_model_id
+    if not model_id:
+        raise ValueError("候选缺少模型标识（openrouter_model_id / provider_model_id 均为空）")
     metadata = _metadata_from_evidence(evidence or [])
     context_window = _safe_positive_int(metadata.get("context_window"))
     if context_window is None:
@@ -765,7 +1115,7 @@ def _build_model_info(
     return {
         "slug": candidate.proposed_alias_slug,
         "name": candidate.proposed_alias_slug,
-        "model_id": candidate.openrouter_model_id,
+        "model_id": model_id,
         "context_window": context_window,
         "reasoning_levels": reasoning_levels,
         "reasoning_effort": reasoning_effort,
@@ -837,23 +1187,42 @@ OFFICIAL_MODEL_INFO_FORBIDDEN = {"provider", "base_url", "env_key", "id", "name"
 DEFAULT_BASE_INSTRUCTIONS = "You are a helpful assistant."
 
 
-def load_published_model_infos(data_dir: Path) -> list[dict[str, Any]]:
-    """读取全部发布资产，按官方 slug 去重取最新，返回发布 model_info 列表。"""
+def load_published_model_infos(
+    data_dir: Path, *, valid_slugs: set[str] | None = None
+) -> list[dict[str, Any]]:
+    """读取全部发布资产，按目录 slug 去重取最新，返回发布 model_info 列表。
+
+    ``valid_slugs`` 非 None 时只保留当前仍可路由的 canonical slug，
+    剔除上游已下线模型留下的历史发布（幽灵条目）；``~vendor/x-latest``
+    等滚动别名归并到基础 slug 去重，避免同一模型重复出现。
+    """
     publications = Path(data_dir) / "catalog/publications"
     if not publications.exists():
         return []
-    latest: dict[str, tuple[str, dict[str, Any]]] = {}
+    latest: dict[str, tuple[tuple[int, str], dict[str, Any]]] = {}
     for path in sorted(publications.glob("*.json")):
         try:
             entry = PublishedCatalogEntry.model_validate_json(path.read_text(encoding="utf-8"))
         except Exception:  # noqa: BLE001 - 损坏资产跳过，不阻断目录生成
             continue
-        slug = str(entry.model_info_json.get("slug") or "").strip()
+        raw_slug = str(entry.model_info_json.get("slug") or "").strip()
+        if not raw_slug:
+            continue
+        slug = routable_slug_key(raw_slug)
         if not slug:
             continue
+        if valid_slugs is not None and slug not in valid_slugs:
+            continue
+        model_info = dict(entry.model_info_json)
+        if slug != raw_slug:
+            model_info["slug"] = slug
+            if str(model_info.get("name") or "") == raw_slug:
+                model_info["name"] = slug
+        # 非滚动别名优先；同优先级取最新 accepted_at。
+        rank = (1 if slug == raw_slug else 0, entry.accepted_at)
         seen = latest.get(slug)
-        if seen is None or entry.accepted_at >= seen[0]:
-            latest[slug] = (entry.accepted_at, entry.model_info_json)
+        if seen is None or rank > seen[0]:
+            latest[slug] = (rank, model_info)
     return [item[1] for item in latest.values()]
 
 
