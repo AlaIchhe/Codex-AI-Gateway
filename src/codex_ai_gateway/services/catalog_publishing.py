@@ -187,6 +187,14 @@ CAPABILITY_PROBE_TIMEOUT_SECONDS = 20.0
 CAPABILITY_PROBE_CONNECT_TIMEOUT_SECONDS = 5.0
 CAPABILITY_PROBE_MAX_TOKENS = 64
 CAPABILITY_PROBE_TTL_SECONDS = 6 * 3600
+# 上游对能力探测有速率限制（TokenDance 并发 20 时大面积 429），
+# 参照上游模型列表探测的分批策略，并给可重试状态码加退避。
+CAPABILITY_PROBE_BATCH_SIZE = 5
+CAPABILITY_PROBE_BATCH_DELAY_SECONDS = 2.0
+CAPABILITY_PROBE_MAX_ATTEMPTS = 3
+CAPABILITY_PROBE_RETRY_DELAY_SECONDS = 2.0
+CAPABILITY_PROBE_RETRY_STATUSES = frozenset({429, 500, 502, 503, 504})
+CATALOG_REVISION_RETENTION = 200
 _PROBED_REASONING = {
     "supported_efforts": ["low", "medium", "high"],
     "default_effort": "medium",
@@ -277,18 +285,27 @@ async def _post_capability_probe(
     headers: dict[str, str],
     body: dict[str, Any],
 ) -> tuple[int | None, dict[str, Any] | None]:
-    try:
-        response = await client.post(url, json=body, headers=headers)
-    except httpx.HTTPError:
-        return None, None
+    """发送一次探测请求；命中限流等可重试状态时退避重试。"""
+    status: int | None = None
     parsed: dict[str, Any] | None = None
-    try:
-        payload = response.json()
-        if isinstance(payload, dict):
-            parsed = payload
-    except ValueError:
+    for attempt in range(CAPABILITY_PROBE_MAX_ATTEMPTS):
+        try:
+            response = await client.post(url, json=body, headers=headers)
+        except httpx.HTTPError:
+            return None, None
         parsed = None
-    return response.status_code, parsed
+        try:
+            payload = response.json()
+            if isinstance(payload, dict):
+                parsed = payload
+        except ValueError:
+            parsed = None
+        status = response.status_code
+        if status not in CAPABILITY_PROBE_RETRY_STATUSES:
+            return status, parsed
+        if attempt + 1 < CAPABILITY_PROBE_MAX_ATTEMPTS:
+            await asyncio.sleep(CAPABILITY_PROBE_RETRY_DELAY_SECONDS * (attempt + 1))
+    return status, parsed
 
 
 async def probe_model_capabilities(
@@ -361,13 +378,15 @@ async def _fallback_metadata(
     credential = runtime.secret_store.get_secret(upstream.auth_credential_ref) or ""
     if not credential:
         return metadata
-    candidate.capability_probe_at = utc_now()
     probe = await probe_model_capabilities(
         upstream,
         credential,
         offering.provider_model_id,
         protocol=offering.wire_protocol,
     )
+    # 探测失败（空结果）不落 TTL，下一轮刷新会重试；成功才缓存 6h。
+    if probe:
+        candidate.capability_probe_at = utc_now()
     return _merge_metadata(metadata, probe)
 
 
@@ -464,8 +483,14 @@ class CatalogPublishingService:
         candidates: list[CatalogCandidate],
         evidence_sets: list[CatalogEvidenceSet],
         offering: Offering,
+        *,
+        existing_entries: list[PublishedCatalogEntry] | None = None,
     ) -> PublishedCatalogEntry:
-        """从 accepted candidates 构建版本，schema 校验后写独立 JSON 资产。"""
+        """从 accepted candidates 构建版本，schema 校验后写独立 JSON 资产。
+
+        ``existing_entries`` 中若已存在同一 offering 且内容哈希一致的发布，
+        直接返回旧条目，避免每次刷新都追加重复资产。
+        """
         accepted = [
             candidate
             for candidate in candidates
@@ -506,6 +531,18 @@ class CatalogPublishingService:
             provider_model_id=offering.provider_model_id,
         )
         version_hash = _version_hash(model_info, field_sources)
+        if existing_entries:
+            unchanged = next(
+                (
+                    item
+                    for item in existing_entries
+                    if item.offering_id == offering.id
+                    and item.version_hash == version_hash
+                ),
+                None,
+            )
+            if unchanged is not None:
+                return unchanged
         entry = PublishedCatalogEntry(
             id=uuid7(),
             offering_id=offering.id,
@@ -565,7 +602,57 @@ def _retained_catalog_revisions(data_dir: Path) -> list[CatalogRevision]:
     revisions = _catalog_revisions(data_dir)
     cutoff = datetime.now(UTC) - timedelta(days=90)
     by_age = [item for item in revisions if datetime.fromisoformat(item.created_at) >= cutoff]
-    return by_age if len(by_age) >= 100 else revisions[-100:]
+    retained = by_age if len(by_age) >= 100 else revisions[-100:]
+    # 硬上限：刷新循环每轮都会产生版本，仅靠 90 天窗口无法限制增长。
+    return retained[-CATALOG_REVISION_RETENTION:]
+
+
+def compact_catalog_history(data_dir: Path, state: Any) -> dict[str, int]:
+    """收敛发布资产与版本历史，删除不再被引用的历史文件。
+
+    目录内容按 slug 取最新，历史版本只服务 diff 查询。这里保留最近
+    ``CATALOG_REVISION_RETENTION`` 个版本及其引用资产，再保留每个 offering
+    的最新资产，其余文件删除，避免状态与目录无限膨胀拖慢刷新循环。
+    """
+    data_path = Path(data_dir)
+    revisions = _catalog_revisions(data_path)
+    retained_revisions = revisions[-CATALOG_REVISION_RETENTION:]
+    retained_revision_ids = {item.id for item in retained_revisions}
+    keep_entry_ids = {
+        entry_id for item in retained_revisions for entry_id in item.entry_ids
+    }
+    latest_by_offering: dict[str, PublishedCatalogEntry] = {}
+    for entry in getattr(state, "publications", []):
+        current = latest_by_offering.get(entry.offering_id)
+        if current is None or entry.accepted_at >= current.accepted_at:
+            latest_by_offering[entry.offering_id] = entry
+    keep_entry_ids.update(item.id for item in latest_by_offering.values())
+
+    state.publications = [
+        item
+        for item in getattr(state, "publications", [])
+        if item.id in keep_entry_ids
+    ]
+    if hasattr(state, "catalog_revisions"):
+        state.catalog_revisions = [
+            item for item in state.catalog_revisions if item.id in retained_revision_ids
+        ]
+
+    removed_publications = 0
+    publications_dir = data_path / "catalog/publications"
+    if publications_dir.exists():
+        for path in publications_dir.glob("*.json"):
+            if path.stem not in keep_entry_ids:
+                path.unlink(missing_ok=True)
+                removed_publications += 1
+    removed_revisions = 0
+    revisions_dir = data_path / "catalog/revisions"
+    if revisions_dir.exists():
+        for path in revisions_dir.glob("*.json"):
+            if path.stem not in retained_revision_ids:
+                path.unlink(missing_ok=True)
+                removed_revisions += 1
+    return {"publications": removed_publications, "revisions": removed_revisions}
 
 
 def list_catalog_revisions(data_dir: Path) -> list[CatalogRevision]:
@@ -845,18 +932,26 @@ async def run_catalog_automation(runtime: Any) -> dict[str, Any]:
         fallback_tasks.append((candidate, offering, upstream))
 
     if fallback_tasks:
-        fallback_results = await asyncio.gather(
-            *[
-                _fallback_metadata(
-                    runtime,
-                    candidate,
-                    offering,
-                    upstream,
-                    evidence_by_candidate.get(candidate.id),
+        # 分批探测并限流：上游对能力探测有速率限制，全量并发会大面积 429。
+        fallback_results: list[dict[str, Any]] = []
+        for start in range(0, len(fallback_tasks), CAPABILITY_PROBE_BATCH_SIZE):
+            batch = fallback_tasks[start : start + CAPABILITY_PROBE_BATCH_SIZE]
+            fallback_results.extend(
+                await asyncio.gather(
+                    *[
+                        _fallback_metadata(
+                            runtime,
+                            candidate,
+                            offering,
+                            upstream,
+                            evidence_by_candidate.get(candidate.id),
+                        )
+                        for candidate, offering, upstream in batch
+                    ]
                 )
-                for candidate, offering, upstream in fallback_tasks
-            ]
-        )
+            )
+            if start + CAPABILITY_PROBE_BATCH_SIZE < len(fallback_tasks):
+                await asyncio.sleep(CAPABILITY_PROBE_BATCH_DELAY_SECONDS)
         for (candidate, _offering, _upstream), metadata in zip(
             fallback_tasks, fallback_results, strict=True
         ):
@@ -902,9 +997,10 @@ async def run_catalog_automation(runtime: Any) -> dict[str, Any]:
 
     runtime.state_store.mutate(apply_results)
 
-    published_ids: list[str] = []
+    published_entries: list[PublishedCatalogEntry] = []
     if accepted_ids:
         refreshed = runtime.state_store.read_state()
+        existing_entry_ids = {item.id for item in refreshed.publications}
         offering_ids = {
             candidate.offering_id
             for candidate in refreshed.catalog_candidates
@@ -928,17 +1024,40 @@ async def run_catalog_automation(runtime: Any) -> dict[str, Any]:
             if offering is None:
                 continue
             entry = await service.build_publication(
-                group_candidates, group_evidence, offering
+                group_candidates,
+                group_evidence,
+                offering,
+                existing_entries=refreshed.publications,
             )
-            def publish(state, entry=entry, entry_id=None):
+            if entry.id not in existing_entry_ids:
+                published_entries.append(entry)
+
+    published_ids: list[str] = [entry.id for entry in published_entries]
+    published_entry_ids = set(published_ids)
+    new_revisions: list[CatalogRevision] = []
+    if published_entry_ids:
+        new_revisions = [
+            revision
+            for revision in list_catalog_revisions(runtime.data_dir)
+            if published_entry_ids.intersection(revision.entry_ids)
+        ]
+
+    # 单次 mutate 批量写入发布与版本，并顺带收敛历史资产，
+    # 避免逐条重解析 11MB 状态文件导致刷新循环分钟级卡顿。
+    def publish_all(state: Any) -> None:
+        known_entry_ids = {item.id for item in state.publications}
+        for entry in published_entries:
+            if entry.id not in known_entry_ids:
                 state.publications.append(entry)
-                revision = next((item for item in list_catalog_revisions(runtime.data_dir) if entry.id in item.entry_ids), None)
-                if revision and not any(item.id == revision.id for item in getattr(state, "catalog_revisions", [])):
-                    if not hasattr(state, "catalog_revisions"):
-                        state.catalog_revisions = []
-                    state.catalog_revisions.append(revision)
-            runtime.state_store.mutate(publish)
-            published_ids.append(entry.id)
+        if not hasattr(state, "catalog_revisions"):
+            state.catalog_revisions = []
+        known_revision_ids = {item.id for item in state.catalog_revisions}
+        for revision in new_revisions:
+            if revision.id not in known_revision_ids:
+                state.catalog_revisions.append(revision)
+        compact_catalog_history(runtime.data_dir, state)
+
+    runtime.state_store.mutate(publish_all)
 
     return {
         "status": "complete",

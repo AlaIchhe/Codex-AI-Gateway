@@ -139,8 +139,15 @@ async def publish(request: Request, payload: PublicationRequest) -> dict[str, An
         raise HTTPException(status_code=404, detail="offering 不存在")
     evidence_sets = [e for e in state.catalog_evidence if e.candidate_id in payload.candidate_ids]
     service = CatalogPublishingService(runtime.data_dir)
-    entry = await service.build_publication(candidates, evidence_sets, offering)
-    runtime.state_store.mutate(lambda s: s.publications.append(entry))
+    entry = await service.build_publication(
+        candidates, evidence_sets, offering, existing_entries=state.publications
+    )
+
+    def append_once(current: Any) -> None:
+        if not any(item.id == entry.id for item in current.publications):
+            current.publications.append(entry)
+
+    runtime.state_store.mutate(append_once)
     return entry.model_dump(mode="json")
 
 

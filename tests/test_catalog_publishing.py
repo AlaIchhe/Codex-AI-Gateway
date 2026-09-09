@@ -8,6 +8,8 @@ from typing import Any
 
 from codex_ai_gateway.models.entities import (
     CatalogCandidate,
+    CatalogRevision,
+    CatalogRevisionStatus,
     MappingStatus,
     Offering,
     OfferingStatus,
@@ -22,9 +24,12 @@ from codex_ai_gateway.models.entities import (
 )
 from codex_ai_gateway.services.catalog_publishing import (
     _build_model_info,
+    _fallback_metadata,
     _metadata_from_upstream,
     _official_slug,
+    _post_capability_probe,
     _provider_family_slug,
+    compact_catalog_history,
     evaluate_fields,
     load_published_model_infos,
     routable_slug_key,
@@ -70,7 +75,7 @@ def _publication(
     offering_id: str,
     accepted_at: str,
     model_id: str,
-) -> None:
+) -> PublishedCatalogEntry:
     entry = PublishedCatalogEntry(
         id=uuid7(),
         offering_id=offering_id,
@@ -96,6 +101,7 @@ def _publication(
     (publications / f"{entry.id}.json").write_text(
         entry.model_dump_json(), encoding="utf-8"
     )
+    return entry
 
 
 def test_official_slug_merges_latest_alias() -> None:
@@ -220,11 +226,13 @@ def test_load_published_without_filter_merges_alias_only(tmp_path: Path) -> None
 class _FakeStore:
     def __init__(self, state: Any) -> None:
         self._state = state
+        self.mutate_calls = 0
 
     def read_state(self) -> Any:
         return self._state
 
     def mutate(self, fn: Any, **_kwargs: Any) -> None:
+        self.mutate_calls += 1
         fn(self._state)
 
 
@@ -307,3 +315,224 @@ def test_run_catalog_automation_publishes_upstream_fallback(
 
     infos = load_published_model_infos(tmp_path, valid_slugs={"deepseek-v4.1-flash"})
     assert [item["slug"] for item in infos] == ["deepseek-v4.1-flash"]
+
+
+class _FakeResponse:
+    def __init__(self, status_code: int, payload: Any) -> None:
+        self.status_code = status_code
+        self._payload = payload
+
+    def json(self) -> Any:
+        return self._payload
+
+
+class _FakeProbeClient:
+    def __init__(self, responses: list[_FakeResponse]) -> None:
+        self._responses = list(responses)
+        self.calls = 0
+
+    async def post(self, *_args: Any, **_kwargs: Any) -> _FakeResponse:
+        self.calls += 1
+        return self._responses.pop(0)
+
+
+def test_post_capability_probe_retries_retryable_status(monkeypatch: Any) -> None:
+    import codex_ai_gateway.services.catalog_publishing as cp
+
+    sleeps: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    monkeypatch.setattr(cp.asyncio, "sleep", fake_sleep)
+    client = _FakeProbeClient(
+        [_FakeResponse(429, {"error": "rate"}), _FakeResponse(200, {"ok": True})]
+    )
+    status, body = asyncio.run(_post_capability_probe(client, "url", {}, {}))
+    assert (status, body) == (200, {"ok": True})
+    assert client.calls == 2
+    assert sleeps == [cp.CAPABILITY_PROBE_RETRY_DELAY_SECONDS]
+
+
+def test_post_capability_probe_gives_up_after_max_attempts(monkeypatch: Any) -> None:
+    import codex_ai_gateway.services.catalog_publishing as cp
+
+    sleeps: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    monkeypatch.setattr(cp.asyncio, "sleep", fake_sleep)
+    client = _FakeProbeClient(
+        [_FakeResponse(429, {}) for _ in range(cp.CAPABILITY_PROBE_MAX_ATTEMPTS)]
+    )
+    status, _body = asyncio.run(_post_capability_probe(client, "url", {}, {}))
+    assert status == 429
+    assert client.calls == cp.CAPABILITY_PROBE_MAX_ATTEMPTS
+    assert len(sleeps) == cp.CAPABILITY_PROBE_MAX_ATTEMPTS - 1
+
+
+def test_fallback_metadata_does_not_cache_failed_probe(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    import codex_ai_gateway.services.catalog_publishing as cp
+
+    offering = _offering("deepseek-v4.1-flash")
+    candidate = _candidate(offering_id=offering.id)
+    runtime = _FakeRuntime(tmp_path, _FakeState([offering], [_upstream()]))
+
+    async def failed_probe(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        return {}
+
+    monkeypatch.setattr(cp, "probe_model_capabilities", failed_probe)
+    asyncio.run(_fallback_metadata(runtime, candidate, offering, _upstream(), None))
+    assert candidate.capability_probe_at is None
+
+    async def ok_probe(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        return {"supported_parameters": ["tools", "tool_choice"]}
+
+    monkeypatch.setattr(cp, "probe_model_capabilities", ok_probe)
+    asyncio.run(_fallback_metadata(runtime, candidate, offering, _upstream(), None))
+    assert candidate.capability_probe_at is not None
+
+
+def test_run_catalog_automation_batches_fallback_probes(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    import codex_ai_gateway.services.catalog_publishing as cp
+
+    active = 0
+    max_active = 0
+    calls = {"probe": 0}
+
+    async def fake_search_models(**_kwargs: Any) -> list[Any]:
+        return []
+
+    async def fake_probe(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        nonlocal active, max_active
+        calls["probe"] += 1
+        active += 1
+        max_active = max(max_active, active)
+        await asyncio.sleep(0)
+        active -= 1
+        return {
+            "supported_parameters": ["tools", "tool_choice"],
+            "reasoning": {"supported_efforts": ["low"], "default_effort": "low"},
+        }
+
+    monkeypatch.setattr(cp, "search_models", fake_search_models)
+    monkeypatch.setattr(cp, "probe_model_capabilities", fake_probe)
+    monkeypatch.setattr(cp, "CAPABILITY_PROBE_BATCH_DELAY_SECONDS", 0)
+
+    offerings = []
+    for index in range(cp.CAPABILITY_PROBE_BATCH_SIZE + 1):
+        offering = _offering(f"fallback-{index}")
+        offerings.append(
+            offering.model_copy(
+                update={
+                    "native_metadata_json": {
+                        "id": f"fallback-{index}",
+                        "context_length": 1000000,
+                    }
+                }
+            )
+        )
+    state = _FakeState(offerings, [_upstream()])
+    runtime = _FakeRuntime(tmp_path, state)
+
+    result = asyncio.run(cp.run_catalog_automation(runtime))
+    assert result["accepted"] == len(offerings)
+    assert calls["probe"] == len(offerings)
+    assert max_active == cp.CAPABILITY_PROBE_BATCH_SIZE
+
+
+def test_run_catalog_automation_publishes_once_and_compacts(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    import codex_ai_gateway.services.catalog_publishing as cp
+
+    async def fake_search_models(**_kwargs: Any) -> list[Any]:
+        return []
+
+    async def fake_probe(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        return {
+            "supported_parameters": ["tools", "tool_choice"],
+            "reasoning": {"supported_efforts": ["low"], "default_effort": "low"},
+        }
+
+    monkeypatch.setattr(cp, "search_models", fake_search_models)
+    monkeypatch.setattr(cp, "probe_model_capabilities", fake_probe)
+
+    offering = _offering("deepseek-v4.1-flash").model_copy(
+        update={
+            "native_metadata_json": {
+                "id": "deepseek-v4.1-flash",
+                "context_length": 1000000,
+            }
+        }
+    )
+    state = _FakeState([offering], [_upstream()])
+    runtime = _FakeRuntime(tmp_path, state)
+
+    first = asyncio.run(cp.run_catalog_automation(runtime))
+    assert len(first["published"]) == 1
+    assert len(state.publications) == 1
+    mutates_after_first = runtime.state_store.mutate_calls
+
+    second = asyncio.run(cp.run_catalog_automation(runtime))
+    assert second["published"] == []
+    assert len(state.publications) == 1, "内容未变化的模型不应重复发布"
+    assert runtime.state_store.mutate_calls == mutates_after_first + 3
+
+
+def _write_revision(
+    tmp_path: Path, *, revision_id: str, entry_id: str, created_at: str
+) -> None:
+    revision = CatalogRevision(
+        id=revision_id,
+        parent_id=None,
+        trigger="model_change",
+        entry_ids=[entry_id],
+        models_response_hash="hash",
+        diff_summary={},
+        status=CatalogRevisionStatus.published,
+        created_at=created_at,
+        published_at=created_at,
+    )
+    revisions_dir = tmp_path / "catalog/revisions"
+    revisions_dir.mkdir(parents=True, exist_ok=True)
+    (revisions_dir / f"{revision_id}.json").write_text(
+        revision.model_dump_json(), encoding="utf-8"
+    )
+
+
+def test_compact_catalog_history_prunes_unreferenced(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    import codex_ai_gateway.services.catalog_publishing as cp
+
+    monkeypatch.setattr(cp, "CATALOG_REVISION_RETENTION", 2)
+    entries = []
+    for index in range(3):
+        entry = _publication(
+            tmp_path,
+            slug=f"model-{index}",
+            offering_id="off-1",
+            accepted_at=f"2026-09-0{index + 1}T00:00:00+00:00",
+            model_id=f"vendor/model-{index}",
+        )
+        _write_revision(
+            tmp_path,
+            revision_id=f"rev-{index}",
+            entry_id=entry.id,
+            created_at=f"2026-09-0{index + 1}T00:00:00+00:00",
+        )
+        entries.append(entry)
+
+    state = _FakeState([], [])
+    state.publications = list(entries)
+    removed = compact_catalog_history(tmp_path, state)
+
+    assert removed == {"publications": 1, "revisions": 1}
+    assert [item.id for item in state.publications] == [entries[1].id, entries[2].id]
+    assert not (tmp_path / "catalog/publications" / f"{entries[0].id}.json").exists()
