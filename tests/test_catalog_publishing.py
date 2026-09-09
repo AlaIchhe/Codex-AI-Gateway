@@ -536,3 +536,48 @@ def test_compact_catalog_history_prunes_unreferenced(
     assert removed == {"publications": 1, "revisions": 1}
     assert [item.id for item in state.publications] == [entries[1].id, entries[2].id]
     assert not (tmp_path / "catalog/publications" / f"{entries[0].id}.json").exists()
+
+
+def test_compact_catalog_history_drops_non_routable_publications(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    import codex_ai_gateway.services.catalog_publishing as cp
+
+    monkeypatch.setattr(cp, "CATALOG_REVISION_RETENTION", 1)
+    ghost = _publication(
+        tmp_path,
+        slug="ghost-model",
+        offering_id="off-ghost",
+        accepted_at="2026-09-01T00:00:00+00:00",
+        model_id="vendor/ghost-model",
+    )
+    routable = _publication(
+        tmp_path,
+        slug="keep-me",
+        offering_id="off-keep",
+        accepted_at="2026-09-02T00:00:00+00:00",
+        model_id="vendor/keep-me",
+    )
+    _write_revision(
+        tmp_path,
+        revision_id="rev-ghost",
+        entry_id=ghost.id,
+        created_at="2026-09-01T00:00:00+00:00",
+    )
+    _write_revision(
+        tmp_path,
+        revision_id="rev-keep",
+        entry_id=routable.id,
+        created_at="2026-09-02T00:00:00+00:00",
+    )
+
+    state = _FakeState([], [])
+    state.publications = [ghost, routable]
+    state.canonical_models = [
+        type("Model", (), {"slug": "keep-me", "status": "available"})()
+    ]
+    removed = compact_catalog_history(tmp_path, state)
+
+    assert removed["publications"] == 1
+    assert [item.id for item in state.publications] == [routable.id]
+    assert not (tmp_path / "catalog/publications" / f"{ghost.id}.json").exists()

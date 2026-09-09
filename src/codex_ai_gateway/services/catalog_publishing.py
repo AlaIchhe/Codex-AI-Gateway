@@ -621,8 +621,20 @@ def compact_catalog_history(data_dir: Path, state: Any) -> dict[str, int]:
     keep_entry_ids = {
         entry_id for item in retained_revisions for entry_id in item.entry_ids
     }
+    valid_slugs = {
+        routable_slug_key(str(getattr(model, "slug", "") or ""))
+        for model in getattr(state, "canonical_models", [])
+        if str(getattr(model, "status", "")) == "available"
+    }
+    valid_slugs.discard("")
     latest_by_offering: dict[str, PublishedCatalogEntry] = {}
     for entry in getattr(state, "publications", []):
+        # 只保留当前可路由模型的最新资产；不可路由的历史条目不再占用磁盘，
+        # 模型重新可用时 run_catalog_automation 会重新发布。
+        if valid_slugs and routable_slug_key(
+            str(entry.model_info_json.get("slug") or "")
+        ) not in valid_slugs:
+            continue
         current = latest_by_offering.get(entry.offering_id)
         if current is None or entry.accepted_at >= current.accepted_at:
             latest_by_offering[entry.offering_id] = entry
