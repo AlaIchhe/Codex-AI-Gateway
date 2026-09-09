@@ -516,7 +516,7 @@ def test_compact_catalog_history_prunes_unreferenced(
     for index in range(3):
         entry = _publication(
             tmp_path,
-            slug=f"model-{index}",
+            slug="model",
             offering_id="off-1",
             accepted_at=f"2026-09-0{index + 1}T00:00:00+00:00",
             model_id=f"vendor/model-{index}",

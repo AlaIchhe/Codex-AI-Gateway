@@ -627,18 +627,24 @@ def compact_catalog_history(data_dir: Path, state: Any) -> dict[str, int]:
         if str(getattr(model, "status", "")) == "available"
     }
     valid_slugs.discard("")
-    latest_by_offering: dict[str, PublishedCatalogEntry] = {}
+    # offering 会随上游重建而换 id，按 offering 去重无法收敛历史资产；
+    # 目录取数本身按 slug 取最新，这里保持同一口径。
+    latest_by_slug: dict[str, tuple[tuple[int, str], PublishedCatalogEntry]] = {}
     for entry in getattr(state, "publications", []):
+        raw_slug = str(entry.model_info_json.get("slug") or "").strip()
+        slug_key = routable_slug_key(raw_slug)
+        if not slug_key:
+            continue
         # 只保留当前可路由模型的最新资产；不可路由的历史条目不再占用磁盘，
         # 模型重新可用时 run_catalog_automation 会重新发布。
-        if valid_slugs and routable_slug_key(
-            str(entry.model_info_json.get("slug") or "")
-        ) not in valid_slugs:
+        if valid_slugs and slug_key not in valid_slugs:
             continue
-        current = latest_by_offering.get(entry.offering_id)
-        if current is None or entry.accepted_at >= current.accepted_at:
-            latest_by_offering[entry.offering_id] = entry
-    keep_entry_ids.update(item.id for item in latest_by_offering.values())
+        # 与 load_published_model_infos 同口径：非滚动别名优先，同优先级取最新。
+        rank = (1 if slug_key == raw_slug else 0, entry.accepted_at)
+        current = latest_by_slug.get(slug_key)
+        if current is None or rank > current[0]:
+            latest_by_slug[slug_key] = (rank, entry)
+    keep_entry_ids.update(item.id for _rank, item in latest_by_slug.values())
 
     state.publications = [
         item
