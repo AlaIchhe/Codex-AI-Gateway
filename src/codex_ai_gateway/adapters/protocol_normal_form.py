@@ -30,6 +30,7 @@ class NormalMessage:
     tool_call_id: str | None = None
     tool_calls: list[dict[str, Any]] = field(default_factory=list)
     name: str | None = None
+    reasoning_content: str | None = None
 
 
 @dataclass
@@ -87,6 +88,31 @@ def _normalize_content(content: Any) -> list[dict[str, Any]]:
     return []
 
 
+def _responses_reasoning_text(item: dict[str, Any]) -> str:
+    """从 Responses reasoning item 提取需要回传给 Chat 的 reasoning_content。"""
+    content = item.get("content")
+    if isinstance(content, str):
+        return content.strip()
+    summary = item.get("summary")
+    if isinstance(summary, list):
+        chunks: list[str] = []
+        for part in summary:
+            if isinstance(part, dict):
+                for key in ("text", "summary_text", "content"):
+                    value = part.get(key)
+                    if isinstance(value, str) and value.strip():
+                        chunks.append(value.strip())
+                        break
+            elif isinstance(part, str):
+                chunks.append(part.strip())
+        return "\n".join(chunks)
+    for key in ("text", "summary_text"):
+        value = item.get(key)
+        if isinstance(value, str):
+            return value.strip()
+    return ""
+
+
 def normalize_request(*, inbound_protocol: str, body: dict[str, Any]) -> NormalRequest:
     """把入站 request 转成 NormalRequest。
 
@@ -117,8 +143,19 @@ def _normalize_responses(body: dict[str, Any], model: str, stream: bool) -> Norm
         items = raw_input
     else:
         items = []
+    pending_reasoning: list[str] = []
+
+    def _take_pending_reasoning() -> str | None:
+        nonlocal pending_reasoning
+        if not pending_reasoning:
+            return None
+        text = "\n".join(pending_reasoning).strip()
+        pending_reasoning = []
+        return text or None
+
     for item in items:
         if isinstance(item, str):
+            pending_reasoning = []
             messages.append(NormalMessage(role="user", content=[{"type": "text", "text": item}]))
             continue
         if not isinstance(item, dict):
@@ -133,12 +170,19 @@ def _normalize_responses(body: dict[str, Any], model: str, stream: bool) -> Norm
         if item_type == "message":
             role = item.get("role", "user")
             content = _normalize_content(item.get("content"))
-            messages.append(NormalMessage(role=role, content=content))
+            reasoning = _take_pending_reasoning() if role == "assistant" else None
+            if role != "assistant":
+                pending_reasoning = []
+            messages.append(
+                NormalMessage(role=role, content=content, reasoning_content=reasoning)
+            )
         elif item_type == "function_call":
+            reasoning = _take_pending_reasoning()
             messages.append(
                 NormalMessage(
                     role="assistant",
                     name=item.get("name"),
+                    reasoning_content=reasoning,
                     tool_calls=[
                         {
                             "id": item.get("call_id") or item.get("id"),
@@ -153,10 +197,12 @@ def _normalize_responses(body: dict[str, Any], model: str, stream: bool) -> Norm
             )
         elif item_type == "custom_tool_call":
             input_text = item.get("input")
+            reasoning = _take_pending_reasoning()
             messages.append(
                 NormalMessage(
                     role="assistant",
                     name=item.get("name"),
+                    reasoning_content=reasoning,
                     tool_calls=[
                         {
                             "id": item.get("call_id") or item.get("id"),
@@ -172,6 +218,7 @@ def _normalize_responses(body: dict[str, Any], model: str, stream: bool) -> Norm
                 )
             )
         elif item_type == "function_call_output":
+            pending_reasoning = []
             messages.append(
                 NormalMessage(
                     role="tool",
@@ -180,6 +227,7 @@ def _normalize_responses(body: dict[str, Any], model: str, stream: bool) -> Norm
                 )
             )
         elif item_type == "custom_tool_call_output":
+            pending_reasoning = []
             messages.append(
                 NormalMessage(
                     role="tool",
@@ -188,8 +236,13 @@ def _normalize_responses(body: dict[str, Any], model: str, stream: bool) -> Norm
                 )
             )
         elif item_type == "reasoning":
-            # 普通对话子集不支持 reasoning item 到 chat 的安全映射
-            raise UntranslatableCapabilityError("reasoning_item")
+            # DeepSeek thinking 模式要求上一轮 assistant 的 reasoning 在
+            # 下一轮请求里回传为 reasoning_content；这里收集并在下一
+            # assistant 消息上挂载。
+            text = _responses_reasoning_text(item)
+            if text:
+                pending_reasoning.append(text)
+            continue
         else:
             # 未识别的 item 类型显式报错，绝不静默丢弃（丢弃会导致空 messages 上游 400）
             raise UntranslatableCapabilityError(
@@ -228,6 +281,7 @@ def _normalize_chat(body: dict[str, Any], model: str, stream: bool) -> NormalReq
                 tool_call_id=msg.get("tool_call_id"),
                 tool_calls=tool_calls,
                 name=msg.get("name"),
+                reasoning_content=msg.get("reasoning_content"),
             )
         )
     tools, custom_tool_names, aliases = _norm_tools(body.get("tools"))

@@ -25,16 +25,20 @@ def chat_request_from_normal(normal: NormalRequest, *, target_model: str) -> dic
                 }
             )
         elif msg.tool_calls:
-            raw_messages.append(
-                {
-                    "role": msg.role,
-                    "content": _concat_parts(msg.content) or None,
-                    "tool_calls": msg.tool_calls,
-                }
-            )
+            assistant: dict[str, Any] = {
+                "role": msg.role,
+                "content": _concat_parts(msg.content) or None,
+                "tool_calls": msg.tool_calls,
+            }
+            if msg.role == "assistant" and msg.reasoning_content:
+                assistant["reasoning_content"] = msg.reasoning_content
+            raw_messages.append(assistant)
         else:
             chat_role = "system" if msg.role == "developer" else msg.role
-            raw_messages.append({"role": chat_role, "content": _concat_parts(msg.content)})
+            assistant_or_user = {"role": chat_role, "content": _concat_parts(msg.content)}
+            if chat_role == "assistant" and msg.reasoning_content:
+                assistant_or_user["reasoning_content"] = msg.reasoning_content
+            raw_messages.append(assistant_or_user)
     messages = _merge_and_prune_tool_messages(raw_messages)
     body: dict[str, Any] = {
         "model": target_model,
@@ -57,6 +61,23 @@ def chat_request_from_normal(normal: NormalRequest, *, target_model: str) -> dic
         stream_options["include_usage"] = True
         body["stream_options"] = stream_options
     return body
+
+
+def _ensure_tool_call_reasoning_content(messages: list[dict[str, Any]]) -> None:
+    """DeepSeek thinking 模式要求带 tool_calls 的 assistant 消息回传 reasoning_content。
+
+    当网关从 Responses 历史转换出的 tool_call 消息 content 和 reasoning_content
+    都为空时，补一个占位 reasoning，避免上游 400：
+    The `reasoning_content` in the thinking mode must be passed back to the API.
+    """
+    for message in messages:
+        if message.get("role") != "assistant" or not message.get("tool_calls"):
+            continue
+        has_content = bool(str(message.get("content") or "").strip())
+        has_reasoning = bool(str(message.get("reasoning_content") or "").strip())
+        if has_content or has_reasoning:
+            continue
+        message["reasoning_content"] = "Calling the requested tool."
 
 
 def _merge_and_prune_tool_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -83,11 +104,15 @@ def _merge_and_prune_tool_messages(messages: list[dict[str, Any]]) -> list[dict[
             prev = merged[-1]
             if prev.get("content") and not prev.get("tool_calls"):
                 merged[-1] = {**prev, "tool_calls": calls}
+                if prev.get("reasoning_content") is None and msg.get("reasoning_content"):
+                    merged[-1]["reasoning_content"] = msg.get("reasoning_content")
                 continue
         if content and not calls and merged and merged[-1].get("role") == "assistant":
             prev = merged[-1]
             if prev.get("tool_calls") and not prev.get("content"):
                 merged[-1] = {**prev, "content": content}
+                if prev.get("reasoning_content") is None and msg.get("reasoning_content"):
+                    merged[-1]["reasoning_content"] = msg.get("reasoning_content")
                 continue
         if not calls and not content:
             continue
@@ -120,6 +145,8 @@ def _merge_and_prune_tool_messages(messages: list[dict[str, Any]]) -> list[dict[
                     calls.extend(nxt["tool_calls"])
                 if nxt.get("content"):
                     content = (content or "") + str(nxt["content"])
+                if msg.get("reasoning_content") is None and nxt.get("reasoning_content"):
+                    msg["reasoning_content"] = nxt["reasoning_content"]
                 j += 1
                 continue
             tool_block.append(nxt)
@@ -130,14 +157,21 @@ def _merge_and_prune_tool_messages(messages: list[dict[str, Any]]) -> list[dict[
         kept_calls = [tc for tc in calls if tc.get("id") and tc.get("id") in responded_ids]
 
         if keps := kept_calls:
-            result.append({"role": "assistant", "content": content, "tool_calls": keps})
+            kept_msg = {"role": "assistant", "content": content, "tool_calls": keps}
+            if msg.get("reasoning_content"):
+                kept_msg["reasoning_content"] = msg["reasoning_content"]
+            result.append(kept_msg)
         elif msg.get("content"):
-            result.append({"role": "assistant", "content": content})
+            kept_text = {"role": "assistant", "content": content}
+            if msg.get("reasoning_content"):
+                kept_text["reasoning_content"] = msg["reasoning_content"]
+            result.append(kept_text)
 
         kept_ids = {tc.get("id") for tc in kept_calls}
         result.extend(tm for tm in tool_block if tm.get("tool_call_id") in kept_ids)
         i = j
 
+    _ensure_tool_call_reasoning_content(result)
     return result
 
 
