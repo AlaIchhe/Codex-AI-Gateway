@@ -14,7 +14,11 @@ from types import SimpleNamespace
 from typing import Any
 
 from codex_ai_gateway.api.gateway import _attempt_with_fallback
-from codex_ai_gateway.domain.circuit_breaker import CircuitBreaker
+from codex_ai_gateway.domain.circuit_breaker import (
+    CircuitBreaker,
+    CooldownScope,
+    classify_failure,
+)
 from codex_ai_gateway.domain.routing import route_candidates
 from codex_ai_gateway.models.entities import (
     CanonicalModel,
@@ -38,6 +42,20 @@ UNSUPPORTED_BODY = json.dumps(
 
 RATE_LIMIT_BODY = json.dumps(
     {"error": {"message": "Too many requests", "code": "rate_limit_exceeded"}}
+).encode()
+
+# command ai 真实返回：HTTP 403，但 error.code 是 FORBIDDEN，真正的信号在 message。
+NOT_IN_PLAN_BODY = json.dumps(
+    {
+        "error": {
+            "message": (
+                "MODEL_NOT_IN_PLAN: Gemini 3.5 Flash Lite available in Pro and above "
+                "plans or extra on demand usage"
+            ),
+            "type": "permission_error",
+            "code": "FORBIDDEN",
+        }
+    }
 ).encode()
 
 
@@ -236,3 +254,231 @@ def test_terminal_error_keeps_model_unavailable_when_all_endpoints_agree() -> No
     assert response.status_code == 400
     assert payload["error"]["code"] == "provider_model_unavailable"
     assert "不支持该模型" in payload["error"]["message"]
+
+
+# ---------------------------------------------------------------------------
+# MODEL_NOT_IN_PLAN：不在套餐内的模型直接从该上游剔除
+# ---------------------------------------------------------------------------
+
+
+class _PruneStore:
+    """最小可写状态存储：记录 mutate 调用并在内存里生效。"""
+
+    def __init__(self, state: Any) -> None:
+        self._state = state
+        self.mutate_calls = 0
+
+    def read_state(self) -> Any:
+        return self._state
+
+    def mutate(self, fn: Any, **_kwargs: Any) -> None:
+        self.mutate_calls += 1
+        fn(self._state)
+
+
+def _prune_runtime(client: Any, state: Any) -> SimpleNamespace:
+    return SimpleNamespace(
+        state_store=_PruneStore(state),
+        usage_log=_UsageLog(),
+        circuit_breaker=CircuitBreaker(clock=lambda: 1000.0, jitter=lambda: 0.0),
+        upstream_client=client,
+    )
+
+
+def test_not_in_plan_is_target_scoped_even_though_status_is_403() -> None:
+    """403 不等于账号级鉴权失败：套餐缺模型必须按 target 记住，且窗口按小时计。"""
+    classification = classify_failure(
+        status_code=403,
+        error_type=ProviderErrorType.model_permission.value,
+        code="provider_model_not_in_plan",
+    )
+    assert classification.scope is CooldownScope.target
+    assert classification.base_cooldown_seconds >= 3600.0
+
+    breaker = _breaker()
+    breaker.record_failure(
+        "u1",
+        "model-a",
+        status_code=403,
+        error_type=ProviderErrorType.model_permission.value,
+        code="provider_model_not_in_plan",
+        wire_protocol=WireProtocol.responses,
+    )
+    assert breaker.remaining("u1", "model-a", wire_protocol=WireProtocol.responses) is not None
+    # 没有污染 provider 级：同一上游的其它模型不受影响。
+    assert [entry["scope"] for entry in breaker.snapshot()] == ["target"]
+
+
+def test_model_not_in_plan_prunes_only_the_failing_protocol() -> None:
+    """已确认协议的 offering 只剔除报错的那一个协议面。"""
+    client = _Client(
+        [
+            SimpleNamespace(status_code=403, headers={}, body=NOT_IN_PLAN_BODY),
+            SimpleNamespace(
+                status_code=200,
+                headers={"content-type": "application/json"},
+                body=b'{"choices":[{"message":{"role":"assistant","content":"ok"}}]}',
+            ),
+        ]
+    )
+    state = SimpleNamespace(
+        canonical_models=[_canonical()],
+        offerings=[
+            _offering(WireProtocol.responses),
+            _offering(WireProtocol.chat_completions),
+        ],
+        model_mappings=[],
+    )
+    runtime = _prune_runtime(client, state)
+    upstream = _upstream()
+
+    response = asyncio.run(
+        _attempt_with_fallback(
+            request=SimpleNamespace(headers={}),
+            runtime=runtime,
+            canonical_id="canon-1",
+            candidates=[
+                (_offering(WireProtocol.responses), upstream, WireProtocol.responses),
+                (
+                    _offering(WireProtocol.chat_completions),
+                    upstream,
+                    WireProtocol.chat_completions,
+                ),
+            ],
+            body={"model": "model-a", "input": "hi"},
+        )
+    )
+
+    # responses 被套餐拦住，但 chat/completions 照常可用，不能连坐剔除。
+    assert client.calls == ["/responses", "/chat/completions"]
+    assert response.status_code == 200
+    assert [item.id for item in state.offerings] == ["u1-model-a-chat_completions"]
+    assert runtime.state_store.mutate_calls == 1
+
+
+def test_model_not_in_plan_prunes_unconfirmed_placeholder_and_falls_back() -> None:
+    other_offering = _offering(WireProtocol.chat_completions).model_copy(
+        update={"id": "u2-model-a-chat", "upstream_id": "u2"}
+    )
+    client = _Client(
+        [
+            SimpleNamespace(status_code=403, headers={}, body=NOT_IN_PLAN_BODY),
+            SimpleNamespace(status_code=403, headers={}, body=NOT_IN_PLAN_BODY),
+            SimpleNamespace(
+                status_code=200,
+                headers={"content-type": "application/json"},
+                body=b'{"choices":[{"message":{"role":"assistant","content":"ok"}}]}',
+            ),
+        ]
+    )
+    state = SimpleNamespace(
+        canonical_models=[_canonical()],
+        offerings=[_offering(WireProtocol.unconfirmed), other_offering],
+        model_mappings=[],
+    )
+    runtime = _prune_runtime(client, state)
+    upstream = _upstream()
+    other_upstream = _upstream().model_copy(update={"id": "u2", "name": "MaoLao"})
+
+    response = asyncio.run(
+        _attempt_with_fallback(
+            request=SimpleNamespace(headers={}),
+            runtime=runtime,
+            canonical_id="canon-1",
+            candidates=[
+                (_offering(WireProtocol.unconfirmed), upstream, WireProtocol.responses),
+                (_offering(WireProtocol.unconfirmed), upstream, WireProtocol.chat_completions),
+                (other_offering, other_upstream, WireProtocol.chat_completions),
+            ],
+            body={"model": "model-a", "input": "hi"},
+        )
+    )
+
+    # 两个协议都被套餐拦住 → 占位整个剔除，落到备用上游正常返回。
+    assert client.calls == ["/responses", "/chat/completions", "/chat/completions"]
+    assert response.status_code == 200
+    assert [item.id for item in state.offerings] == ["u2-model-a-chat"]
+    assert runtime.state_store.mutate_calls == 1
+
+
+def test_not_in_plan_on_single_protocol_keeps_unconfirmed_placeholder() -> None:
+    """只在 responses 被套餐拦住时不能判死：chat 试通了就正常学习协议。"""
+    client = _Client(
+        [
+            SimpleNamespace(status_code=403, headers={}, body=NOT_IN_PLAN_BODY),
+            SimpleNamespace(
+                status_code=200,
+                headers={"content-type": "application/json"},
+                body=b'{"choices":[{"message":{"role":"assistant","content":"ok"}}]}',
+            ),
+        ]
+    )
+    state = SimpleNamespace(
+        canonical_models=[_canonical()],
+        upstreams=[_upstream()],
+        offerings=[_offering(WireProtocol.unconfirmed)],
+        model_mappings=[],
+    )
+    runtime = _prune_runtime(client, state)
+    upstream = _upstream()
+
+    response = asyncio.run(
+        _attempt_with_fallback(
+            request=SimpleNamespace(headers={}),
+            runtime=runtime,
+            canonical_id="canon-1",
+            candidates=[
+                (_offering(WireProtocol.unconfirmed), upstream, WireProtocol.responses),
+                (_offering(WireProtocol.unconfirmed), upstream, WireProtocol.chat_completions),
+            ],
+            body={"model": "model-a", "input": "hi"},
+        )
+    )
+
+    assert client.calls == ["/responses", "/chat/completions"]
+    assert response.status_code == 200
+    assert runtime.state_store.mutate_calls == 1
+    assert [item.wire_protocol for item in state.offerings] == [WireProtocol.chat_completions]
+    assert state.offerings[0].identity_evidence["source"] == "live_request"
+
+
+def test_model_not_in_plan_prune_cleans_dangling_model_mappings() -> None:
+    client = _Client([SimpleNamespace(status_code=403, headers={}, body=NOT_IN_PLAN_BODY)])
+    offering = _offering(WireProtocol.responses)
+    state = SimpleNamespace(
+        canonical_models=[_canonical()],
+        offerings=[offering],
+        model_mappings=[SimpleNamespace(offering_id=offering.id)],
+    )
+    runtime = _prune_runtime(client, state)
+
+    asyncio.run(
+        _attempt_with_fallback(
+            request=SimpleNamespace(headers={}),
+            runtime=runtime,
+            canonical_id="canon-1",
+            candidates=[(offering, _upstream(), WireProtocol.responses)],
+            body={"model": "model-a", "input": "hi"},
+        )
+    )
+
+    assert state.offerings == []
+    assert state.model_mappings == []
+
+
+def test_not_in_plan_prune_is_skipped_for_readonly_state_store() -> None:
+    """最小运行时（无 mutate）不应因为剔除逻辑而报错。"""
+    client = _Client([SimpleNamespace(status_code=403, headers={}, body=NOT_IN_PLAN_BODY)])
+    runtime = _runtime(client)
+
+    response = asyncio.run(
+        _attempt_with_fallback(
+            request=SimpleNamespace(headers={}),
+            runtime=runtime,
+            canonical_id="canon-1",
+            candidates=[(_offering(WireProtocol.responses), _upstream(), WireProtocol.responses)],
+            body={"model": "model-a", "input": "hi"},
+        )
+    )
+
+    assert response.status_code == 403

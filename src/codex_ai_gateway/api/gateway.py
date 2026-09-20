@@ -232,7 +232,12 @@ async def _attempt_with_fallback(
 ) -> Response:
     last_error: GatewayError | None = None
     last_retry_after: float | None = None
+    # 命中「不在套餐内」的记录：见 _register_not_in_plan 的剔除规则。
+    not_in_plan_seen: dict[tuple[str, str], set[WireProtocol]] = {}
+    dead_targets: set[tuple[str, str]] = set()
     for ordinal, (offering, upstream, protocol) in enumerate(candidates, start=1):
+        if (upstream.id, offering.provider_model_id) in dead_targets:
+            continue
         event = _new_event(runtime, canonical_id, offering, upstream, protocol, ordinal)
         runtime.usage_log.create_pending(event)
         try:
@@ -276,6 +281,15 @@ async def _attempt_with_fallback(
                         headers=error_headers,
                         body=error_body,
                     )
+                    if mapped.code == _NOT_IN_PLAN_CODE:
+                        _register_not_in_plan(
+                            runtime,
+                            upstream,
+                            offering,
+                            protocol,
+                            seen=not_in_plan_seen,
+                            dead=dead_targets,
+                        )
                     _finalize(
                         runtime, event, Outcome.failed, mapped=mapped, status_code=status_code
                     )
@@ -316,6 +330,15 @@ async def _attempt_with_fallback(
                     headers=result.headers,
                     body=result.body,
                 )
+                if mapped.code == _NOT_IN_PLAN_CODE:
+                    _register_not_in_plan(
+                        runtime,
+                        upstream,
+                        offering,
+                        protocol,
+                        seen=not_in_plan_seen,
+                        dead=dead_targets,
+                    )
                 _finalize(
                     runtime, event, Outcome.failed, mapped=mapped, status_code=result.status_code
                 )
@@ -441,6 +464,91 @@ def _record_upstream_failure(
         wire_protocol=wire_protocol,
     )
     return mapped, classification
+
+
+_NOT_IN_PLAN_CODE = "provider_model_not_in_plan"
+
+
+def _register_not_in_plan(
+    runtime: Runtime,
+    upstream: Upstream,
+    offering: Any,
+    protocol: WireProtocol,
+    *,
+    seen: dict[tuple[str, str], set[WireProtocol]],
+    dead: set[tuple[str, str]],
+) -> None:
+    """处理一次 ``MODEL_NOT_IN_PLAN``，必要时把已经确定不可用的目标剔除。
+
+    剔除粒度按「有多少证据」决定，而不是一律按模型删：
+
+    * 已确认协议的 offering：只剔除刚刚报错的那个协议面。同一个模型在
+      ``/responses`` 被套餐拦住不代表 ``/chat/completions`` 也不可用。
+    * ``unconfirmed`` 占位：一个对象同时代表两个协议面，只有两个协议都报
+      ``MODEL_NOT_IN_PLAN`` 才能断定整个模型不在套餐内，这时才剔除占位，
+      并在本次请求里跳过它的剩余候选（省掉一次注定失败的上游往返）。
+    """
+    key = (upstream.id, offering.provider_model_id)
+    if getattr(offering, "wire_protocol", None) != WireProtocol.unconfirmed:
+        _prune_not_in_plan_offering(runtime, upstream, key[1], wire_protocol=protocol)
+        return
+    protocols = seen.setdefault(key, set())
+    protocols.add(protocol)
+    if len(protocols) < 2:
+        # 另一个协议还没证明不可用：留着占位让它继续试，避免把只在
+        # /responses 被套餐拦住的模型整个判死。
+        return
+    _prune_not_in_plan_offering(runtime, upstream, key[1], wire_protocol=None)
+    dead.add(key)
+
+
+def _prune_not_in_plan_offering(
+    runtime: Runtime,
+    upstream: Upstream,
+    provider_model_id: str,
+    *,
+    wire_protocol: WireProtocol | None,
+) -> None:
+    """把「不在套餐内」的目标从该上游剔除，之后不再尝试它。
+
+    继续保留 offering 只会让每次请求都先白打一遍上游再回落备用上游，既浪费
+    上游限流配额，也会把真实原因盖成"认证失败"。``wire_protocol`` 为 None
+    表示整个模型在该上游都不可用。
+
+    剔除只改当前状态：下一次模型同步（``_run_upstream_pipeline``）会按上游
+    实际返回重建 offering，因此升级套餐后会自动恢复，不需要手动清理。
+    """
+    state_store = getattr(runtime, "state_store", None)
+    if state_store is None or not hasattr(state_store, "mutate"):
+        return
+
+    def is_target(item: Any) -> bool:
+        if item.upstream_id != upstream.id or item.provider_model_id != provider_model_id:
+            return False
+        if wire_protocol is None:
+            return True
+        return item.wire_protocol == wire_protocol
+
+    def apply(state: Any) -> None:
+        removed = {item.id for item in getattr(state, "offerings", []) if is_target(item)}
+        if not removed:
+            return
+        state.offerings = [o for o in state.offerings if o.id not in removed]
+        state.model_mappings = [
+            mapping
+            for mapping in getattr(state, "model_mappings", [])
+            if mapping.offering_id not in removed
+        ]
+
+    try:
+        state_store.mutate(apply, trigger="offering.not_in_plan")
+    except Exception:
+        logger.warning(
+            "剔除不在套餐内的模型失败: upstream=%s model=%s protocol=%s",
+            upstream.id,
+            provider_model_id,
+            wire_protocol.value if wire_protocol is not None else "all",
+        )
 
 
 def _should_hop(

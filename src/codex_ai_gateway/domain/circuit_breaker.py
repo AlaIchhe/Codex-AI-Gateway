@@ -173,6 +173,17 @@ def classify_failure(
             FailureDecision.hop, CooldownScope.none, 0.0, "request_shape"
         )
 
+    # 「不支持该模型 / 不在套餐内」常以 403/400 返回，但它是模型级事实而不是
+    # 账号级鉴权失败：必须先于 401/403 分支判定，否则会被降级成 provider 级
+    # 的 60 秒冷却，于是每个请求都重打一遍这个必然失败的模型。
+    if error_type == ProviderErrorType.model_permission.value or status_code == 404:
+        return FailureClassification(
+            FailureDecision.hop,
+            CooldownScope.target,
+            MODEL_UNAVAILABLE_COOLDOWN_SECONDS,
+            "model_unavailable",
+            MODEL_UNAVAILABLE_COOLDOWN_SECONDS,
+        )
     if error_type == ProviderErrorType.authentication.value or status_code in {401, 403}:
         return FailureClassification(
             FailureDecision.hop,
@@ -197,14 +208,6 @@ def classify_failure(
             CooldownScope.target,
             TRANSIENT_RATE_LIMIT_SECONDS,
             "rate_limit",
-        )
-    if error_type == ProviderErrorType.model_permission.value or status_code == 404:
-        return FailureClassification(
-            FailureDecision.hop,
-            CooldownScope.target,
-            MODEL_UNAVAILABLE_COOLDOWN_SECONDS,
-            "model_unavailable",
-            MODEL_UNAVAILABLE_COOLDOWN_SECONDS,
         )
     if error_type == ProviderErrorType.invalid_request.value or (
         status_code is not None and 400 <= status_code < 500

@@ -40,6 +40,11 @@ _MODEL_UNAVAILABLE_HINTS = (
     "unsupported model",
     "does not support the model",
 )
+# 「模型不在套餐内」：上游常见写法是 HTTP 403 + error.code=FORBIDDEN，
+# 真正的信号在 message 里的 MODEL_NOT_IN_PLAN（或 error.code 里）。
+# 它是模型级事实（套餐没这个模型），不是账号级鉴权失败，必须单独识别，
+# 否则会被 403 分支吞掉成 provider 级 authentication。
+_NOT_IN_PLAN_MARKERS = ("model_not_in_plan", "not_in_plan")
 
 
 def _provider_error_code(body: bytes | str | None) -> str | None:
@@ -90,7 +95,14 @@ def map_provider_error(
         )
         or any(hint in lowered_text for hint in _MODEL_UNAVAILABLE_HINTS)
     )
-    if status_code == 401 or status_code == 403:
+    not_in_plan = (
+        provider_code is not None and any(mark in provider_code for mark in _NOT_IN_PLAN_MARKERS)
+    ) or any(mark in lowered_text for mark in _NOT_IN_PLAN_MARKERS)
+    if not_in_plan:
+        error_type = ProviderErrorType.model_permission
+        code = "provider_model_not_in_plan"
+        message = f"{prefix}该模型不在上游套餐内（MODEL_NOT_IN_PLAN），已从该上游剔除。"
+    elif status_code == 401 or status_code == 403:
         error_type = ProviderErrorType.authentication
         code = "provider_authentication_failed"
         message = f"{prefix}上游认证失败，请检查上游凭据。"

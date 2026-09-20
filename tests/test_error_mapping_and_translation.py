@@ -35,6 +35,38 @@ def test_400_without_body_still_names_upstream():
     assert "400" in mapped["message"]
 
 
+MODEL_NOT_IN_PLAN_BODY = json.dumps(
+    {
+        "error": {
+            "message": (
+                "MODEL_NOT_IN_PLAN: Gemini 3.5 Flash Lite available in Pro and above "
+                "plans or extra on demand usage"
+            ),
+            "type": "permission_error",
+            "code": "FORBIDDEN",
+        }
+    }
+)
+
+
+def test_model_not_in_plan_beats_generic_403_authentication():
+    """403 + MODEL_NOT_IN_PLAN 是模型级事实，不能报成「上游认证失败」。"""
+    mapped = map_provider_error(403, body=MODEL_NOT_IN_PLAN_BODY, upstream_name="command ai")
+    assert mapped["error_mapping_code"] == "provider_model_not_in_plan"
+    assert mapped["provider_error_type"] == "model_permission"
+    assert "[command ai]" in mapped["message"]
+    assert "套餐" in mapped["message"]
+
+
+def test_plain_403_still_maps_to_authentication():
+    mapped = map_provider_error(
+        403,
+        body=json.dumps({"error": {"code": "FORBIDDEN", "message": "invalid api key"}}),
+        upstream_name="A",
+    )
+    assert mapped["error_mapping_code"] == "provider_authentication_failed"
+
+
 def test_402_keeps_quota_category():
     mapped = map_provider_error(402, body=b"{}", upstream_name="A")
     assert mapped["error_mapping_code"] == "provider_quota_budget"
