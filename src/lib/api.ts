@@ -248,6 +248,8 @@ export type UsageAttempt = {
   attempt_ordinal?: number
   fallback_trigger?: string | null
   error_mapping_code?: string | null
+  upstream_error_excerpt?: string | null
+  outbound_request_digest?: Record<string, unknown> | null
   tokens: Record<string, number>
 }
 

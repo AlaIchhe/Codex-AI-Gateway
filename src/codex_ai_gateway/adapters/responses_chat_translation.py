@@ -11,10 +11,14 @@ from codex_ai_gateway.adapters.protocol_normal_form import NormalRequest
 
 def chat_request_from_normal(normal: NormalRequest, *, target_model: str) -> dict[str, Any]:
     """NormalRequest -> Chat Completions request body。"""
-    messages = []
-    if normal.extra.get("instructions"):
-        messages.append({"role": "system", "content": str(normal.extra["instructions"])})
     raw_messages: list[dict[str, Any]] = []
+    # 入站 Responses 的 instructions 就是 Codex 的系统提示词。它必须进 raw_messages，
+    # 否则后面 messages = _merge_and_prune_tool_messages(raw_messages) 会把它整个丢掉，
+    # chat 上游只剩历史里的 developer 片段。
+    if normal.extra.get("instructions"):
+        raw_messages.append(
+            {"role": "system", "content": str(normal.extra["instructions"])}
+        )
     for msg in normal.messages:
         if msg.role == "tool":
             raw_messages.append(
@@ -39,7 +43,7 @@ def chat_request_from_normal(normal: NormalRequest, *, target_model: str) -> dic
             if chat_role == "assistant" and msg.reasoning_content:
                 assistant_or_user["reasoning_content"] = msg.reasoning_content
             raw_messages.append(assistant_or_user)
-    messages = _merge_and_prune_tool_messages(raw_messages)
+    messages: list[dict[str, Any]] = _merge_and_prune_tool_messages(raw_messages)
     body: dict[str, Any] = {
         "model": target_model,
         "messages": messages,
@@ -172,7 +176,41 @@ def _merge_and_prune_tool_messages(messages: list[dict[str, Any]]) -> list[dict[
         i = j
 
     _ensure_tool_call_reasoning_content(result)
+    _fold_system_messages(result)
     return result
+
+
+def _fold_system_messages(messages: list[dict[str, Any]]) -> None:
+    """把非开头的 system/developer 消息折进开头那条 system，并丢掉空消息。
+
+    历史跨上游/跨模型复用时（典型场景：在一个对话里换过 provider），
+    Codex 会在**历史中段**重新带上 ``<app-context>`` / ``<skills_instructions>``
+    这类 developer 片段。Responses 允许中段 developer item，翻译成 Chat 后却是
+    中段 ``role=system``——DeepSeek / 方舟 / Gemini-OpenAI 兼容层等严格实现会
+    直接 400（``Invalid input`` / ``param: messages.N.content``），把整段对话判死。
+    这里统一保留一条开头 system，其余 system 文本按原顺序并入它。
+    """
+    system_indexes = [i for i, m in enumerate(messages) if m.get("role") == "system"]
+    if system_indexes:
+        texts = [
+            str(messages[i].get("content") or "").strip()
+            for i in system_indexes
+        ]
+        merged_text = "\n\n".join(text for text in texts if text)
+        for i in reversed(system_indexes):
+            messages.pop(i)
+        if merged_text:
+            messages.insert(0, {"role": "system", "content": merged_text})
+
+    # 空 content 的非 assistant 消息同样是严格的 4xx 来源（messages.N.content）。
+    for index in reversed(range(len(messages))):
+        message = messages[index]
+        role = message.get("role")
+        if role == "tool" and not str(message.get("content") or "").strip():
+            message["content"] = "(tool returned no output)"
+            continue
+        if role in {"user", "system"} and not str(message.get("content") or "").strip():
+            messages.pop(index)
 
 
 def responses_request_from_normal(normal: NormalRequest, *, target_model: str) -> dict[str, Any]:

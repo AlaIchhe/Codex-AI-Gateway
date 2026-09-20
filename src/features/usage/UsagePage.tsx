@@ -144,6 +144,7 @@ export function UsagePage() {
       attempt.upstream_label,
       attempt.outbound_protocol,
       attempt.error_mapping_code,
+      attempt.upstream_error_excerpt,
       attempt.fallback_trigger,
     ]
       .filter(Boolean)
@@ -166,6 +167,7 @@ export function UsagePage() {
       "结果",
       "计费依据",
       "错误映射",
+      "上游错误正文",
     ]
     const values = filteredAttempts.map((attempt: UsageAttempt) => [
       attempt.started_at,
@@ -177,6 +179,7 @@ export function UsagePage() {
       attempt.outcome,
       attempt.reporting_basis,
       attempt.error_mapping_code,
+      attempt.upstream_error_excerpt,
     ])
     const csvEscape = (value: unknown) =>
       `"${String(value ?? "").replaceAll('"', '""')}"`
@@ -486,6 +489,7 @@ export function UsagePage() {
                 <TableHead>尝试</TableHead>
                 <TableHead>结果</TableHead>
                 <TableHead>计费依据</TableHead>
+                <TableHead>错误</TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>
@@ -508,12 +512,31 @@ export function UsagePage() {
                         ? "混合"
                         : "本地估算"}
                   </TableCell>
+                  <TableCell className="max-w-[320px]">
+                    {attempt.error_mapping_code ? (
+                      <div className="space-y-0.5">
+                        <div className="font-mono text-xs">
+                          {attempt.error_mapping_code}
+                        </div>
+                        {attempt.upstream_error_excerpt ? (
+                          <div
+                            className="truncate text-xs text-muted-foreground"
+                            title={attempt.upstream_error_excerpt}
+                          >
+                            {attempt.upstream_error_excerpt}
+                          </div>
+                        ) : null}
+                      </div>
+                    ) : (
+                      "-"
+                    )}
+                  </TableCell>
                 </TableRow>
               ))}
               {!filteredAttempts.length && !attempts.isLoading && (
                 <TableRow>
                   <TableCell
-                    colSpan={6}
+                    colSpan={7}
                     className="text-center text-muted-foreground"
                   >
                     暂无匹配的用量记录。
@@ -523,7 +546,7 @@ export function UsagePage() {
               {attempts.hasNextPage && (
                 <TableRow ref={loadMoreRef}>
                   <TableCell
-                    colSpan={6}
+                    colSpan={7}
                     className="text-center text-muted-foreground"
                   >
                     {attempts.isFetchingNextPage

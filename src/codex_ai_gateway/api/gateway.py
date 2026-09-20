@@ -45,7 +45,7 @@ from codex_ai_gateway.api.errors import (
     make_untranslatable,
 )
 from codex_ai_gateway.domain.circuit_breaker import FailureClassification, FailureDecision
-from codex_ai_gateway.domain.error_mapping import map_provider_error
+from codex_ai_gateway.domain.error_mapping import ERROR_EXCERPT_LIMIT, map_provider_error
 from codex_ai_gateway.domain.routing import (
     RoutingError,
     resolve_canonical_model,
@@ -240,6 +240,7 @@ async def _attempt_with_fallback(
             continue
         event = _new_event(runtime, canonical_id, offering, upstream, protocol, ordinal)
         runtime.usage_log.create_pending(event)
+        chat_body: dict[str, Any] | None = None
         try:
             custom_tool_names: set[str] = set()
             namespace_tool_aliases: dict[str, dict[str, str]] = {}
@@ -290,6 +291,7 @@ async def _attempt_with_fallback(
                             seen=not_in_plan_seen,
                             dead=dead_targets,
                         )
+                    _remember_request_digest(event, protocol, chat_body)
                     _finalize(
                         runtime, event, Outcome.failed, mapped=mapped, status_code=status_code
                     )
@@ -339,6 +341,7 @@ async def _attempt_with_fallback(
                         seen=not_in_plan_seen,
                         dead=dead_targets,
                     )
+                _remember_request_digest(event, protocol, chat_body)
                 _finalize(
                     runtime, event, Outcome.failed, mapped=mapped, status_code=result.status_code
                 )
@@ -385,6 +388,7 @@ async def _attempt_with_fallback(
                 body=b"",
                 error=exc,
             )
+            _remember_request_digest(event, protocol, chat_body)
             _finalize(
                 runtime,
                 event,
@@ -441,6 +445,51 @@ def _prefer_terminal_error(current: GatewayError | None, candidate: GatewayError
     return current
 
 
+def _remember_request_digest(
+    event: UsageEvent, protocol: WireProtocol, body: dict[str, Any] | None
+) -> None:
+    """失败时记下出站请求形态：上游说 param=messages.N 时才知道 N 是谁。"""
+    if protocol != WireProtocol.chat_completions or not isinstance(body, dict):
+        return
+    event.outbound_request_digest = _request_digest(body)
+
+
+def _request_digest(body: dict[str, Any]) -> dict[str, Any]:
+    raw_messages = body.get("messages")
+    messages = raw_messages if isinstance(raw_messages, list) else []
+    roles = [str(m.get("role")) for m in messages if isinstance(m, dict)]
+    role_counts: dict[str, int] = {}
+    for role in roles:
+        role_counts[role] = role_counts.get(role, 0) + 1
+    empty_content_indexes = [
+        index
+        for index, message in enumerate(messages)
+        if isinstance(message, dict)
+        and message.get("role") != "assistant"
+        and not str(message.get("content") or "").strip()
+    ]
+    mid_system_indexes = [
+        index
+        for index, message in enumerate(messages)
+        if isinstance(message, dict) and message.get("role") == "system" and index != 0
+    ]
+    tool_call_count = sum(
+        len(message.get("tool_calls") or [])
+        for message in messages
+        if isinstance(message, dict)
+    )
+    return {
+        "message_count": len(messages),
+        "role_counts": role_counts,
+        "leading_roles": roles[:8],
+        "empty_content_indexes": empty_content_indexes[:10],
+        "mid_system_indexes": mid_system_indexes[:10],
+        "tool_call_count": tool_call_count,
+        "tool_count": len(body.get("tools") or []),
+        "stream": bool(body.get("stream")),
+    }
+
+
 def _record_upstream_failure(
     runtime: Runtime,
     upstream: Upstream,
@@ -453,6 +502,17 @@ def _record_upstream_failure(
     wire_protocol: WireProtocol | None = None,
 ) -> tuple[GatewayError, FailureClassification]:
     mapped = _mapped_error(status_code or 502, body, error=error, upstream=upstream)
+    excerpt = mapped.details.get("upstream_error_excerpt")
+    if excerpt:
+        logger.warning(
+            "上游返回错误 upstream=%s model=%s protocol=%s status=%s code=%s excerpt=%s",
+            upstream.name,
+            provider_model_id,
+            getattr(wire_protocol, "value", wire_protocol),
+            status_code,
+            mapped.code,
+            excerpt,
+        )
     classification = runtime.circuit_breaker.record_failure(
         upstream.id,
         provider_model_id,
@@ -691,6 +751,7 @@ def _mapped_error(
             "upstream_error_type": provider.get("upstream_error_type"),
             "provider_error_type": provider.get("provider_error_type"),
             "fingerprint": provider.get("fingerprint"),
+            "upstream_error_excerpt": provider.get("excerpt"),
         },
     )
 
@@ -1039,6 +1100,9 @@ def _finalize(
         event.provider_error_type = ProviderErrorType(
             mapped.details.get("provider_error_type", "upstream_fault")
         )
+        excerpt = mapped.details.get("upstream_error_excerpt")
+        if excerpt:
+            event.upstream_error_excerpt = str(excerpt)[:ERROR_EXCERPT_LIMIT]
     if fallback_trigger:
         event.fallback_trigger = fallback_trigger
     runtime.usage_log.record_finalized(event)

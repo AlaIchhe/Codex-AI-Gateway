@@ -80,6 +80,8 @@ class UsageReportingService:
                 "fallback_trigger": e.get("fallback_trigger"),
                 "cost_minor_units": e.get("cost_minor_units"),
                 "error_mapping_code": e.get("error_mapping_code"),
+                "upstream_error_excerpt": e.get("upstream_error_excerpt"),
+                "outbound_request_digest": e.get("outbound_request_digest"),
                 "tokens": e.get("token_usage_by_category"),
             }
             for e in events

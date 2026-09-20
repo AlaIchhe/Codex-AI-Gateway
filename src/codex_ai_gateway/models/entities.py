@@ -378,6 +378,12 @@ class UsageEvent(BaseModel):
     http_upstream_status: int | None = None
     provider_error_type: ProviderErrorType | None = None
     error_mapping_code: str | None = None
+    # 上游错误正文（截断）：只有 4xx/5xx 失败时写入。
+    # 没有它就只能看到 map_provider_error 的归类，无法回答「上游到底在抱怨
+    # 请求里的哪一段」（例如 param=messages.1.content）。
+    upstream_error_excerpt: str | None = None
+    # 出站请求形态摘要（chat 翻译路径才有）：定位跨上游历史被拒时是哪条消息。
+    outbound_request_digest: dict[str, Any] | None = None
     attempt_ordinal: int = 1
     fallback_trigger: str | None = None
     reporting_basis: ReportingBasis = ReportingBasis.estimated

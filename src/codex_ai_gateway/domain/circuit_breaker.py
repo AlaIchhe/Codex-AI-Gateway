@@ -41,6 +41,7 @@ JITTER_RATIO = 0.15
 
 _REQUEST_SHAPE_CODES = {
     "context_length_exceeded",
+    "provider_context_length_exceeded",
     "tool_catalog_too_large",
     "input_admission_refused",
     "target_incompatible",
@@ -48,11 +49,19 @@ _REQUEST_SHAPE_CODES = {
 _REQUEST_SHAPE_HINTS = (
     "context length",
     "context_length",
+    "context window",
     "maximum context",
     "prompt is too long",
+    "input is too long",
     "too many tokens",
+    "maximum number of tokens",
+    "reduce the length",
     "tool catalog",
     "too many tools",
+    "上下文长度",
+    "上下文超",
+    "超出最大",
+    "请求体过大",
 )
 _ACCOUNT_QUOTA_HINTS = (
     "insufficient_quota",

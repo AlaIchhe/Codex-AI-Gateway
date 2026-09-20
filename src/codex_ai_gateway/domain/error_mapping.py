@@ -23,6 +23,23 @@ def _body_text(body: bytes | str | None) -> str:
     return (body.decode("utf-8", errors="ignore") if isinstance(body, bytes) else body).strip()
 
 
+# 上游错误正文摘要长度：够定位 param/错误码，又不会把 21MB 的 admin-state 撑爆。
+ERROR_EXCERPT_LIMIT = 500
+
+
+def error_excerpt(body: bytes | str | None, *, limit: int = ERROR_EXCERPT_LIMIT) -> str | None:
+    """把上游错误正文压成单行摘要，用于故障留档。
+
+    之前 UsageEvent 只存 ``error_mapping_code``：一旦上游返回
+    ``{"error":{"message":"Invalid input","param":"messages.1.content"}}``，
+    事后完全看不出它抱怨的是我们发出去的哪一段请求。
+    """
+    text = " ".join(_body_text(body).split())
+    if not text:
+        return None
+    return text[:limit]
+
+
 _MODEL_UNAVAILABLE_CODES = {
     "model_not_found",
     "model_not_available",
@@ -39,6 +56,35 @@ _MODEL_UNAVAILABLE_HINTS = (
     "model is not supported",
     "unsupported model",
     "does not support the model",
+)
+# 「上下文超限」是请求形状问题：换一个窗口更大的上游可能成功，上游本身没病。
+# 各家措辞差异很大（OpenAI 用 maximum context length，方舟/DeepSeek 用
+# 「请求体过大」「超出最大长度」，网关自己的 cc 层只回 Invalid input），
+# 这里尽量覆盖，识别不出来就会退化成 invalid_request 并直接失败。
+_CONTEXT_LENGTH_CODES = {
+    "context_length_exceeded",
+    "context_window_exceeded",
+    "maximum_context_length_exceeded",
+    "input_too_long",
+    "prompt_too_long",
+    "string_above_max_length",
+    "max_tokens_exceeded",
+}
+_CONTEXT_LENGTH_HINTS = (
+    "context length",
+    "context_length",
+    "context window",
+    "maximum context",
+    "prompt is too long",
+    "input is too long",
+    "too many tokens",
+    "maximum number of tokens",
+    "reduce the length",
+    "token limit",
+    "上下文长度",
+    "上下文超",
+    "超出最大",
+    "请求体过大",
 )
 # 「模型不在套餐内」：上游常见写法是 HTTP 403 + error.code=FORBIDDEN，
 # 真正的信号在 message 里的 MODEL_NOT_IN_PLAN（或 error.code 里）。
@@ -98,6 +144,10 @@ def map_provider_error(
     not_in_plan = (
         provider_code is not None and any(mark in provider_code for mark in _NOT_IN_PLAN_MARKERS)
     ) or any(mark in lowered_text for mark in _NOT_IN_PLAN_MARKERS)
+    context_length_exceeded = status_code in {400, 413, 422} and (
+        provider_code in _CONTEXT_LENGTH_CODES
+        or any(hint in lowered_text for hint in _CONTEXT_LENGTH_HINTS)
+    )
     if not_in_plan:
         error_type = ProviderErrorType.model_permission
         code = "provider_model_not_in_plan"
@@ -122,6 +172,15 @@ def map_provider_error(
         error_type = ProviderErrorType.model_permission
         code = "provider_model_unavailable"
         message = f"{prefix}上游不支持该模型或请求。"
+    elif context_length_exceeded:
+        # 上下文超限按「请求形状」处理：可以继续换窗口更大的上游，且上游不进入避让。
+        error_type = ProviderErrorType.invalid_request
+        code = "provider_context_length_exceeded"
+        detail = text or error_text or ""
+        if detail:
+            message = f"{prefix}上游判定上下文超限（{status_code}）：{detail}"
+        else:
+            message = f"{prefix}上游判定上下文超限（{status_code}），请压缩历史后重试。"
     elif status_code == 503:
         error_type = ProviderErrorType.upstream_fault
         code = "provider_upstream_fault"
@@ -149,4 +208,5 @@ def map_provider_error(
         "upstream_error_type": code,
         "fingerprint": sanitize_fingerprint(body),
         "message": message,
+        "excerpt": error_excerpt(body),
     }
