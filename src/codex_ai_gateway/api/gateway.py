@@ -6,6 +6,8 @@ import asyncio
 import json
 import logging
 import math
+import threading
+import time
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -70,6 +72,11 @@ from codex_ai_gateway.util import utc_now
 router = APIRouter()
 logger = logging.getLogger("codex_ai_gateway.gateway")
 
+# token 最近使用时间的落盘节流窗口：内存里每次都更新，落盘按窗口合并。
+TOKEN_TOUCH_INTERVAL_SECONDS = 60.0
+_token_persisted_at: dict[str, float] = {}
+_TOKEN_TOUCH_LOCK = threading.Lock()
+
 
 def _runtime(request: Request) -> Runtime:
     return request.app.state.runtime
@@ -92,14 +99,37 @@ def _authenticate(request: Request, runtime: Runtime) -> GatewayToken:
     token = verify_gateway_token(raw, state.gateway_tokens, runtime.signing_key)
     if token is None:
         raise make_auth_error("unauthorized_gateway_token", "全局网关 token 无效或已吊销。")
-    runtime.state_store.mutate(lambda s: _touch_token(s, token.id))
+    _record_token_use(runtime, token)
     return token
 
 
-def _touch_token(state: Any, token_id: str) -> None:
+def _record_token_use(runtime: Runtime, token: GatewayToken) -> None:
+    """记录 token 最近使用时间。
+
+    内存内每次请求都更新（管理端立即可见），落盘按 token 节流：远端
+    admin-state.json 已达 21MB，逐请求全量重写会拖慢数据面。记录失败只告警。
+    """
+    now = utc_now()
+    token.last_used_at = now
+    monotonic_now = time.monotonic()
+    with _TOKEN_TOUCH_LOCK:
+        last_persisted = _token_persisted_at.get(token.id)
+        if (
+            last_persisted is not None
+            and monotonic_now - last_persisted < TOKEN_TOUCH_INTERVAL_SECONDS
+        ):
+            return
+        _token_persisted_at[token.id] = monotonic_now
+    try:
+        runtime.state_store.mutate(lambda s: _touch_token(s, token.id, now))
+    except Exception:  # noqa: BLE001 - 使用时间属于遥测，落盘失败不阻断请求
+        logger.warning("记录 token 使用时间失败（不影响本次请求）", exc_info=True)
+
+
+def _touch_token(state: Any, token_id: str, used_at: str) -> None:
     for token in state.gateway_tokens:
         if token.id == token_id:
-            token.last_used_at = utc_now()
+            token.last_used_at = used_at
 
 
 def _read_body(request: Request) -> dict[str, Any]:

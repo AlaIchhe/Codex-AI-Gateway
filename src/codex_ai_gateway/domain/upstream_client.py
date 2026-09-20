@@ -31,6 +31,25 @@ HOP_BY_HOP_HEADERS = {
 }
 
 
+# 上游超时：任何路径都不能无限等待（timeout=None 曾让请求永久挂起，客户端只看到
+# 一个永不结束的 SSE 流）。流式读超时是兜底，网关自身 120s 无数据看门狗负责先中止。
+CONNECT_TIMEOUT_SECONDS = 15.0
+POOL_TIMEOUT_SECONDS = 15.0
+WRITE_TIMEOUT_SECONDS = 60.0
+NON_STREAM_READ_TIMEOUT_SECONDS = 600.0
+STREAM_READ_TIMEOUT_SECONDS = 180.0
+
+
+def upstream_http_timeout(read_timeout: float) -> httpx.Timeout:
+    """构造有限的上游超时；None 表示不限制，禁止使用。"""
+    return httpx.Timeout(
+        connect=CONNECT_TIMEOUT_SECONDS,
+        read=read_timeout,
+        write=WRITE_TIMEOUT_SECONDS,
+        pool=POOL_TIMEOUT_SECONDS,
+    )
+
+
 @dataclass
 class UpstreamResult:
     status_code: int
@@ -105,7 +124,10 @@ class UpstreamClient:
     ) -> UpstreamResult:
         url = self._upstream_url(upstream, path)
         out_headers = self._inject_headers(upstream, headers or {})
-        async with httpx.AsyncClient(timeout=None, follow_redirects=False) as client:
+        async with httpx.AsyncClient(
+            timeout=upstream_http_timeout(NON_STREAM_READ_TIMEOUT_SECONDS),
+            follow_redirects=False,
+        ) as client:
             start = time.perf_counter()
             req = client.build_request(
                 method,
@@ -142,7 +164,10 @@ class UpstreamClient:
         """流式读取上游响应字节。用于 SSE 直通。"""
         url = self._upstream_url(upstream, path)
         out_headers = self._inject_headers(upstream, headers or {})
-        async with httpx.AsyncClient(timeout=None, follow_redirects=False) as client:
+        async with httpx.AsyncClient(
+            timeout=upstream_http_timeout(STREAM_READ_TIMEOUT_SECONDS),
+            follow_redirects=False,
+        ) as client:
             req = client.build_request(
                 method,
                 url,
@@ -168,7 +193,10 @@ class UpstreamClient:
         """发送流式请求并返回带 status 的响应对象，供降级决策使用。"""
         url = self._upstream_url(upstream, path)
         out_headers = self._inject_headers(upstream, headers or {})
-        client = httpx.AsyncClient(timeout=None, follow_redirects=False)
+        client = httpx.AsyncClient(
+            timeout=upstream_http_timeout(STREAM_READ_TIMEOUT_SECONDS),
+            follow_redirects=False,
+        )
         try:
             req = client.build_request(
                 method,
