@@ -333,3 +333,16 @@ def test_route_candidates_prefers_chat_when_request_has_custom_tool():
     assert route_candidates(state, canonical, prefer_chat=True)[0][2] == (
         WireProtocol.chat_completions
     )
+
+
+def test_route_candidates_keeps_both_protocols_for_fallback():
+    """同一 upstream 的两种协议都要成为候选，某个端点不支持该模型时可回落。"""
+    state, canonical = _routing_state()
+    assert [c[2] for c in route_candidates(state, canonical)] == [
+        WireProtocol.responses,
+        WireProtocol.chat_completions,
+    ]
+    assert [c[2] for c in route_candidates(state, canonical, prefer_chat=True)] == [
+        WireProtocol.chat_completions,
+        WireProtocol.responses,
+    ]

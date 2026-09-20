@@ -51,6 +51,29 @@ def test_502_is_upstream_fault():
     assert mapped["error_mapping_code"] == "provider_upstream_fault"
 
 
+def test_400_unsupported_model_is_model_unavailable_not_invalid_request():
+    """上游 responses 端点不支持该模型（code=unsupported_model）要能回落，而不是硬 400。"""
+    body = json.dumps(
+        {
+            "error": {
+                "message": 'Model "deepseek-v4.1-flash" is not supported on this endpoint.',
+                "type": "invalid_request_error",
+                "param": "model",
+                "code": "unsupported_model",
+            }
+        }
+    )
+    mapped = map_provider_error(400, body=body, upstream_name="command ai")
+    assert mapped["error_mapping_code"] == "provider_model_unavailable"
+    assert mapped["provider_error_type"] == "model_permission"
+
+
+def test_400_unsupported_endpoint_message_without_code_is_model_unavailable():
+    body = json.dumps({"error": {"message": "Model x is not supported on this endpoint."}})
+    mapped = map_provider_error(400, body=body, upstream_name="A")
+    assert mapped["error_mapping_code"] == "provider_model_unavailable"
+
+
 def test_500_is_upstream_fault_not_client_error():
     """裸 500 必须归为上游故障：否则会被当作 invalid_request 直接 stop、不切换备用上游。"""
     mapped = map_provider_error(500, body=b"{}", upstream_name="A")

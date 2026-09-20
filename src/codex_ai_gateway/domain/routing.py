@@ -100,33 +100,31 @@ def route_candidates(
         ]
         if not candidates:
             continue
-        offering: Offering | None = None
-        if any(o.wire_protocol == WireProtocol.responses for o in candidates):
-            responses_offering = next(
-                (o for o in candidates if o.wire_protocol == WireProtocol.responses), None
-            )
-            chat_offering = next(
-                (o for o in candidates if o.wire_protocol == WireProtocol.chat_completions), None
-            )
-            if prefer_chat and chat_offering is not None:
-                offering = chat_offering
-            elif responses_offering is not None:
-                offering = responses_offering
-        if offering is None:
-            offering = next(
-                (o for o in candidates if o.wire_protocol == WireProtocol.chat_completions), None
-            )
-        if offering is None:
+        responses_offering = next(
+            (o for o in candidates if o.wire_protocol == WireProtocol.responses), None
+        )
+        chat_offering = next(
+            (o for o in candidates if o.wire_protocol == WireProtocol.chat_completions), None
+        )
+        # 同一 upstream 的两种协议各自成为候选：某个协议端点不支持该模型时
+        # （例如上游 responses 端点返回 400 unsupported_model），还能回落到
+        # 另一个协议，而不是把整个模型判死。
+        if prefer_chat:
+            preferred = [o for o in (chat_offering, responses_offering) if o is not None]
+        else:
+            preferred = [o for o in (responses_offering, chat_offering) if o is not None]
+        if not preferred:
             continue
-        # 方案 A：失败目标只降权、不屏蔽。冷却中的目标排在健康目标之后，
-        # 全部目标都在冷却时仍然 fail-open（尝试最优目标），绝不返回
-        # “所有上游均在冷却中”。
-        avoid_seconds = 0.0
-        if circuit_breaker is not None:
-            avoid_seconds = (
-                circuit_breaker.remaining(upstream.id, offering.provider_model_id) or 0.0
-            )
-        responses_first.append((offering, upstream, offering.wire_protocol, avoid_seconds))
+        for offering in preferred:
+            # 方案 A：失败目标只降权、不屏蔽。避让中的目标排在健康目标之后，
+            # 全部目标都在避让时仍然 fail-open（尝试最优目标），绝不返回
+            # “所有上游均在冷却中”。
+            avoid_seconds = 0.0
+            if circuit_breaker is not None:
+                avoid_seconds = (
+                    circuit_breaker.remaining(upstream.id, offering.provider_model_id) or 0.0
+                )
+            responses_first.append((offering, upstream, offering.wire_protocol, avoid_seconds))
     # 稳定排序：健康目标保持配置顺序，避让中的目标排到最后（最早恢复的优先）。
     responses_first.sort(key=lambda item: (item[3] > 0, item[3]))
     return [(offering, upstream, protocol) for offering, upstream, protocol, _ in responses_first]

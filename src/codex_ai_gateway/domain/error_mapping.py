@@ -29,7 +29,17 @@ _MODEL_UNAVAILABLE_CODES = {
     "model_unavailable",
     "no_available_channel",
     "no_available_channels",
+    "unsupported_model",
+    "model_unsupported",
+    "model_not_supported",
+    "unsupported_provider_model",
 }
+_MODEL_UNAVAILABLE_HINTS = (
+    "not supported on this endpoint",
+    "model is not supported",
+    "unsupported model",
+    "does not support the model",
+)
 
 
 def _provider_error_code(body: bytes | str | None) -> str | None:
@@ -67,10 +77,18 @@ def map_provider_error(
     text = _body_text(body)
     prefix = f"[{upstream_name}] " if upstream_name else ""
     provider_code = _provider_error_code(body)
-    model_unavailable = provider_code in _MODEL_UNAVAILABLE_CODES or (
-        provider_code is not None
-        and "model" in provider_code
-        and ("not_found" in provider_code or "unavailable" in provider_code)
+    lowered_text = text.lower()
+    model_unavailable = (
+        provider_code in _MODEL_UNAVAILABLE_CODES
+        or (
+            provider_code is not None
+            and "model" in provider_code
+            and any(
+                token in provider_code
+                for token in ("not_found", "unavailable", "unsupported")
+            )
+        )
+        or any(hint in lowered_text for hint in _MODEL_UNAVAILABLE_HINTS)
     )
     if status_code == 401 or status_code == 403:
         error_type = ProviderErrorType.authentication

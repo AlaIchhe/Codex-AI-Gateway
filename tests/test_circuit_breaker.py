@@ -73,6 +73,11 @@ class TestClassifyFailure:
         assert result.decision is FailureDecision.stop
         assert result.scope is CooldownScope.none
 
+    def test_model_permission_400_hops_with_target_avoidance(self) -> None:
+        result = classify_failure(status_code=400, error_type="model_permission")
+        assert result.decision is FailureDecision.hop
+        assert result.scope is CooldownScope.target
+
     def test_context_length_hops_without_cooling(self) -> None:
         result = classify_failure(
             status_code=400,

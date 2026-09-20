@@ -52,6 +52,34 @@ class _FailingUpstreamClient:
         return SimpleNamespace(status_code=500, headers={}, body=b"{}")
 
 
+class _ProtocolFallbackClient:
+    """第一个端点（responses）不支持该模型，第二个端点（chat）正常。"""
+
+    UNSUPPORTED = json.dumps(
+        {
+            "error": {
+                "message": 'Model "model-a" is not supported on this endpoint.',
+                "type": "invalid_request_error",
+                "param": "model",
+                "code": "unsupported_model",
+            }
+        }
+    ).encode()
+
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    async def request(self, upstream: Any, **kwargs: Any) -> Any:
+        self.calls.append(str(kwargs.get("path")))
+        if len(self.calls) == 1:
+            return SimpleNamespace(status_code=400, headers={}, body=self.UNSUPPORTED)
+        return SimpleNamespace(
+            status_code=200,
+            headers={"content-type": "application/json"},
+            body=b'{"choices":[{"message":{"role":"assistant","content":"ok"}}]}',
+        )
+
+
 def _upstream() -> Upstream:
     return Upstream(
         id="u1",
@@ -65,7 +93,7 @@ def _upstream() -> Upstream:
 
 def _offering(protocol: WireProtocol) -> Offering:
     return Offering(
-        id="u1-model-a",
+        id=f"u1-model-a-{protocol.value}",
         upstream_id="u1",
         provider_model_id="model-a",
         wire_protocol=protocol,
@@ -150,3 +178,28 @@ def test_upstream_fault_records_avoidance_but_still_routes_afterwards() -> None:
     candidates = route_candidates(state, _canonical(), circuit_breaker=runtime.circuit_breaker)
     assert len(candidates) == 1
     assert candidates[0][1].id == "u1"
+
+
+def test_unsupported_protocol_endpoint_falls_back_to_sibling_offering() -> None:
+    """上游 responses 端点不支持该模型时，同一 upstream 的 chat 端点必须顶上。"""
+    client = _ProtocolFallbackClient()
+    runtime = _runtime(client)
+    upstream = _upstream()
+    responses_offering = _offering(WireProtocol.responses)
+    chat_offering = _offering(WireProtocol.chat_completions)
+
+    response = asyncio.run(
+        _attempt_with_fallback(
+            request=SimpleNamespace(headers={}),
+            runtime=runtime,
+            canonical_id="canon-1",
+            candidates=[
+                (responses_offering, upstream, WireProtocol.responses),
+                (chat_offering, upstream, WireProtocol.chat_completions),
+            ],
+            body={"model": "m", "input": "hi"},
+        )
+    )
+
+    assert response.status_code == 200
+    assert client.calls == ["/responses", "/chat/completions"]
