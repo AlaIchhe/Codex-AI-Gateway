@@ -44,6 +44,10 @@ def chat_request_from_normal(normal: NormalRequest, *, target_model: str) -> dic
                 assistant_or_user["reasoning_content"] = msg.reasoning_content
             raw_messages.append(assistant_or_user)
     messages: list[dict[str, Any]] = _merge_and_prune_tool_messages(raw_messages)
+    # 全空历史（例如整段对话只剩被丢弃的空 user 消息，或只有 instructions）会让
+    # 上游报 "messages must not be empty"，补一条最小占位用户消息。
+    if not any(m.get("role") in {"user", "assistant", "tool"} for m in messages):
+        messages = [*messages, {"role": "user", "content": "(empty message)"}]
     body: dict[str, Any] = {
         "model": target_model,
         "messages": messages,

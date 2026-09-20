@@ -238,3 +238,32 @@ def test_gateway_records_upstream_error_excerpt_and_request_digest() -> None:
     assert digest["mid_system_indexes"] == []
     assert digest["empty_content_indexes"] == []
     assert digest["leading_roles"][0] == "system"
+
+
+def test_no_outbound_message_ever_has_empty_content() -> None:
+    """上游对空 content 直接 400（param=messages.N.content），必须保证不发出去。"""
+    body = _chat_body(
+        "You are Codex.",
+        [
+            _text_message("user", ""),
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_file", "file_id": "file_1"}],
+            },
+            _text_message("assistant", "ok"),
+            _text_message("developer", ""),
+            _text_message("user", "real question"),
+        ],
+    )
+    for index, message in enumerate(body["messages"]):
+        if message.get("role") == "assistant":
+            continue
+        assert str(message.get("content") or "").strip(), (index, message)
+
+
+def test_history_with_only_empty_messages_gets_placeholder() -> None:
+    body = _chat_body("You are Codex.", [_text_message("user", "")])
+    roles = [m["role"] for m in body["messages"]]
+    assert roles == ["system", "user"]
+    assert body["messages"][1]["content"].strip()
