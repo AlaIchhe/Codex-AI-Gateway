@@ -622,12 +622,16 @@ export function UpstreamsPage() {
                     <TableRow
                       key={`${item.provider_model_id ?? "all"}-${item.reason}`}
                     >
-                      <TableCell>{item.provider_model_id ?? "全部模型"}</TableCell>
+                      <TableCell>
+                        {item.provider_model_id ?? "全部模型"}
+                      </TableCell>
                       <TableCell>
                         {item.scope === "provider" ? "整个上游" : "单个模型"}
                       </TableCell>
                       <TableCell>{item.reason}</TableCell>
-                      <TableCell>{Math.ceil(item.remaining_seconds)}s</TableCell>
+                      <TableCell>
+                        {Math.ceil(item.remaining_seconds)}s
+                      </TableCell>
                     </TableRow>
                   ))}
                 </TableBody>
