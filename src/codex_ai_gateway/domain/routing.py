@@ -122,7 +122,12 @@ def route_candidates(
             avoid_seconds = 0.0
             if circuit_breaker is not None:
                 avoid_seconds = (
-                    circuit_breaker.remaining(upstream.id, offering.provider_model_id) or 0.0
+                    circuit_breaker.remaining(
+                        upstream.id,
+                        offering.provider_model_id,
+                        wire_protocol=offering.wire_protocol,
+                    )
+                    or 0.0
                 )
             responses_first.append((offering, upstream, offering.wire_protocol, avoid_seconds))
     # 稳定排序：健康目标保持配置顺序，避让中的目标排到最后（最早恢复的优先）。
@@ -143,7 +148,7 @@ def earliest_cooldown_seconds(
     避让窗口时也照常返回候选，因此该值只用于展示与 ``Retry-After`` 提示。
     """
     targets = [
-        (offering.upstream_id, offering.provider_model_id)
+        (offering.upstream_id, offering.provider_model_id, offering.wire_protocol)
         for offering in state.offerings
         if offering.canonical_model_id == canonical.id
         and offering.status == OfferingStatus.approved

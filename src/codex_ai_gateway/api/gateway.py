@@ -271,6 +271,7 @@ async def _attempt_with_fallback(
                         runtime,
                         upstream,
                         offering.provider_model_id,
+                        wire_protocol=protocol,
                         status_code=status_code,
                         headers=error_headers,
                         body=error_body,
@@ -279,9 +280,11 @@ async def _attempt_with_fallback(
                         runtime, event, Outcome.failed, mapped=mapped, status_code=status_code
                     )
                     if classification.decision is FailureDecision.hop:
-                        last_error = mapped
+                        last_error = _prefer_terminal_error(last_error, mapped)
                         last_retry_after = runtime.circuit_breaker.remaining(
-                            upstream.id, offering.provider_model_id
+                            upstream.id,
+                            offering.provider_model_id,
+                            wire_protocol=protocol,
                         )
                         continue
                     return mapped_response(mapped)
@@ -308,6 +311,7 @@ async def _attempt_with_fallback(
                     runtime,
                     upstream,
                     offering.provider_model_id,
+                    wire_protocol=protocol,
                     status_code=result.status_code,
                     headers=result.headers,
                     body=result.body,
@@ -316,13 +320,17 @@ async def _attempt_with_fallback(
                     runtime, event, Outcome.failed, mapped=mapped, status_code=result.status_code
                 )
                 if classification.decision is FailureDecision.hop:
-                    last_error = mapped
+                    last_error = _prefer_terminal_error(last_error, mapped)
                     last_retry_after = runtime.circuit_breaker.remaining(
-                        upstream.id, offering.provider_model_id
+                        upstream.id,
+                        offering.provider_model_id,
+                        wire_protocol=protocol,
                     )
                     continue
                 return mapped_response(mapped)
-            runtime.circuit_breaker.record_success(upstream.id, offering.provider_model_id)
+            runtime.circuit_breaker.record_success(
+                upstream.id, offering.provider_model_id, wire_protocol=protocol
+            )
             _finalize_success(runtime, event, result.body)
             return Response(
                 content=result.body,
@@ -347,6 +355,7 @@ async def _attempt_with_fallback(
                 runtime,
                 upstream,
                 offering.provider_model_id,
+                wire_protocol=protocol,
                 status_code=None,
                 headers={},
                 body=b"",
@@ -361,9 +370,11 @@ async def _attempt_with_fallback(
                 fallback_trigger="connection_failure",
             )
             if classification.decision is FailureDecision.hop:
-                last_error = mapped
+                last_error = _prefer_terminal_error(last_error, mapped)
                 last_retry_after = runtime.circuit_breaker.remaining(
-                    upstream.id, offering.provider_model_id
+                    upstream.id,
+                    offering.provider_model_id,
+                    wire_protocol=protocol,
                 )
                 continue
             return mapped_response(mapped)
@@ -378,6 +389,34 @@ async def _attempt_with_fallback(
     )
 
 
+# 终端错误优先级：数字越大越应该让客户端看到。上游限流/故障比「端点不支持该模型」
+# 更能解释「为什么这次请求失败」。
+_TERMINAL_ERROR_RANK: dict[str, int] = {
+    ProviderErrorType.rate_limit.value: 3,
+    ProviderErrorType.quota_budget.value: 3,
+    ProviderErrorType.authentication.value: 2,
+    ProviderErrorType.upstream_fault.value: 2,
+    ProviderErrorType.model_permission.value: 1,
+}
+
+
+def _terminal_error_rank(mapped: GatewayError) -> int:
+    return _TERMINAL_ERROR_RANK.get(str(mapped.details.get("provider_error_type", "")), 0)
+
+
+def _prefer_terminal_error(current: GatewayError | None, candidate: GatewayError) -> GatewayError:
+    """所有候选都失败时，返回最能定位问题的那个错误。
+
+    典型场景：chat 端点被 429 限流，随后同一上游的 responses 端点回「不支持该
+    模型」；若原样返回后者，用户会以为模型下线，而真实原因是限流。
+    """
+    if current is None:
+        return candidate
+    if _terminal_error_rank(candidate) >= _terminal_error_rank(current):
+        return candidate
+    return current
+
+
 def _record_upstream_failure(
     runtime: Runtime,
     upstream: Upstream,
@@ -387,6 +426,7 @@ def _record_upstream_failure(
     headers: dict[str, str],
     body: bytes,
     error: Exception | None = None,
+    wire_protocol: WireProtocol | None = None,
 ) -> tuple[GatewayError, FailureClassification]:
     mapped = _mapped_error(status_code or 502, body, error=error, upstream=upstream)
     classification = runtime.circuit_breaker.record_failure(
@@ -397,6 +437,7 @@ def _record_upstream_failure(
         retry_after=_header_value(headers, "retry-after"),
         code=mapped.code,
         message=mapped.message,
+        wire_protocol=wire_protocol,
     )
     return mapped, classification
 
@@ -650,6 +691,7 @@ async def _stream_response(
                         upstream.id,
                         event.provider_model_id,
                         status_code=502,
+                        wire_protocol=protocol,
                         error_type=ProviderErrorType.upstream_fault.value,
                         code="provider_upstream_fault",
                         message=error_msg,
@@ -743,6 +785,9 @@ async def _stream_response(
                     )
                 )
 
+            runtime.circuit_breaker.record_success(
+                upstream.id, event.provider_model_id, wire_protocol=protocol
+            )
             _finalize_success(runtime, event, b"", streaming=True)
         except Exception as exc:
             error_msg = f"上游 {upstream.name} 流式传输异常: {type(exc).__name__}: {exc}"
@@ -750,6 +795,7 @@ async def _stream_response(
                 upstream.id,
                 event.provider_model_id,
                 status_code=None,
+                wire_protocol=protocol,
                 error_type=ProviderErrorType.upstream_fault.value,
                 code="provider_upstream_fault",
                 message=error_msg,

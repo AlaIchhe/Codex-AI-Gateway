@@ -32,6 +32,10 @@ DEFAULT_COOLDOWN_SECONDS = 60.0
 TRANSIENT_RATE_LIMIT_SECONDS = 5.0
 QUOTA_COOLDOWN_SECONDS = 300.0
 MAX_COOLDOWN_SECONDS = 600.0
+# 「该端点不支持此模型」是端点属性，不会在几分钟内自愈；用长窗口记住它，
+# 否则每次请求都会先打一遍这个必死的端点（浪费额度、还会把真正的 429/5xx
+# 错误盖成「上游不支持该模型或已下线」）。
+MODEL_UNAVAILABLE_COOLDOWN_SECONDS = 6 * 3600.0
 MIN_COOLDOWN_SECONDS = 1.0
 JITTER_RATIO = 0.15
 
@@ -81,6 +85,7 @@ class FailureClassification:
     scope: CooldownScope
     base_cooldown_seconds: float
     reason: str
+    cap_seconds: float = MAX_COOLDOWN_SECONDS
 
 
 @dataclass
@@ -92,6 +97,7 @@ class CooldownEntry:
     reason: str
     status_code: int | None = None
     code: str | None = None
+    wire_protocol: str | None = None
 
     def remaining(self, now: float) -> float:
         return max(0.0, self.until - now)
@@ -104,9 +110,19 @@ class CooldownEntry:
             "reason": self.reason,
             "status_code": self.status_code,
             "code": self.code,
+            "wire_protocol": self.wire_protocol,
             "remaining_seconds": round(self.remaining(now), 1),
             "until": datetime.fromtimestamp(self.until, tz=UTC).isoformat(),
         }
+
+
+def _protocol_key(wire_protocol: Any) -> str | None:
+    """把 WireProtocol 枚举或字符串规范化为键用的字符串。"""
+    if wire_protocol is None:
+        return None
+    value = getattr(wire_protocol, "value", wire_protocol)
+    text = str(value).strip()
+    return text or None
 
 
 def parse_retry_after(value: str | None, *, now: float | None = None) -> float | None:
@@ -186,8 +202,9 @@ def classify_failure(
         return FailureClassification(
             FailureDecision.hop,
             CooldownScope.target,
-            DEFAULT_COOLDOWN_SECONDS,
+            MODEL_UNAVAILABLE_COOLDOWN_SECONDS,
             "model_unavailable",
+            MODEL_UNAVAILABLE_COOLDOWN_SECONDS,
         )
     if error_type == ProviderErrorType.invalid_request.value or (
         status_code is not None and 400 <= status_code < 500
@@ -201,7 +218,12 @@ def classify_failure(
 
 
 class CircuitBreaker:
-    """进程内熔断表。键为 (upstream_id, provider_model_id)，provider 级用 None。"""
+    """进程内熔断表。键为 (upstream_id, provider_model_id, wire_protocol)。
+
+    provider 级用 (upstream_id, None, None)；target 级带协议，因为同一个模型在
+    上游的 /responses 与 /chat/completions 是两个能力面，一个端点不支持不代表
+    另一个不支持（反之亦然）。协议为 None 表示「不区分协议」的通用条目。
+    """
 
     def __init__(
         self,
@@ -212,37 +234,66 @@ class CircuitBreaker:
         self._clock = clock
         self._jitter = jitter
         self._lock = threading.RLock()
-        self._entries: dict[tuple[str, str | None], CooldownEntry] = {}
+        self._entries: dict[tuple[str, str | None, str | None], CooldownEntry] = {}
 
     def _prune(self, now: float) -> None:
         for key in [key for key, entry in self._entries.items() if entry.until <= now]:
             self._entries.pop(key, None)
 
     def _targets(
-        self, upstream_id: str, provider_model_id: str | None
-    ) -> tuple[tuple[str, str | None], ...]:
-        provider_key = (upstream_id, None)
+        self,
+        upstream_id: str,
+        provider_model_id: str | None,
+        wire_protocol: str | None = None,
+    ) -> tuple[tuple[str, str | None, str | None], ...]:
+        provider_key = (upstream_id, None, None)
         if provider_model_id is None:
             return (provider_key,)
-        return (provider_key, (upstream_id, provider_model_id))
+        keys = [provider_key, (upstream_id, provider_model_id, wire_protocol)]
+        if wire_protocol is not None:
+            keys.append((upstream_id, provider_model_id, None))
+        else:
+            # 未指定协议时覆盖该模型的全部协议条目，避免漏判避让。
+            keys.extend(
+                key
+                for key in self._entries
+                if key[0] == upstream_id and key[1] == provider_model_id
+            )
+        return tuple(keys)
 
     def remaining(
-        self, upstream_id: str, provider_model_id: str | None, *, now: float | None = None
+        self,
+        upstream_id: str,
+        provider_model_id: str | None,
+        *,
+        wire_protocol: Any = None,
+        now: float | None = None,
     ) -> float | None:
+        protocol = _protocol_key(wire_protocol)
         current = self._clock() if now is None else now
         with self._lock:
             self._prune(current)
             values = [
                 entry.until - current
-                for key in self._targets(upstream_id, provider_model_id)
+                for key in self._targets(upstream_id, provider_model_id, protocol)
                 if (entry := self._entries.get(key)) is not None and entry.until > current
             ]
             return min(values) if values else None
 
     def is_open(
-        self, upstream_id: str, provider_model_id: str | None, *, now: float | None = None
+        self,
+        upstream_id: str,
+        provider_model_id: str | None,
+        *,
+        wire_protocol: Any = None,
+        now: float | None = None,
     ) -> bool:
-        return self.remaining(upstream_id, provider_model_id, now=now) is not None
+        return (
+            self.remaining(
+                upstream_id, provider_model_id, wire_protocol=wire_protocol, now=now
+            )
+            is not None
+        )
 
     def record_failure(
         self,
@@ -254,8 +305,10 @@ class CircuitBreaker:
         retry_after: str | None = None,
         code: str | None = None,
         message: str | None = None,
+        wire_protocol: Any = None,
         now: float | None = None,
     ) -> FailureClassification:
+        protocol = _protocol_key(wire_protocol)
         classification = classify_failure(
             status_code=status_code, error_type=error_type, code=code, message=message
         )
@@ -269,11 +322,12 @@ class CircuitBreaker:
             seconds = classification.base_cooldown_seconds
             if seconds > 0:
                 seconds *= 1.0 + self._jitter() * JITTER_RATIO
-        seconds = min(max(seconds, MIN_COOLDOWN_SECONDS), MAX_COOLDOWN_SECONDS)
-        target_model = (
-            provider_model_id if classification.scope is CooldownScope.target else None
+        seconds = min(
+            max(seconds, MIN_COOLDOWN_SECONDS), classification.cap_seconds
         )
-        key = (upstream_id, target_model)
+        is_target = classification.scope is CooldownScope.target
+        target_model = provider_model_id if is_target else None
+        key = (upstream_id, target_model, protocol if is_target else None)
         with self._lock:
             self._prune(current)
             self._entries[key] = CooldownEntry(
@@ -284,16 +338,29 @@ class CircuitBreaker:
                 reason=classification.reason,
                 status_code=status_code,
                 code=code,
+                wire_protocol=key[2],
             )
         return classification
 
     def record_success(
-        self, upstream_id: str, provider_model_id: str | None, *, now: float | None = None
+        self,
+        upstream_id: str,
+        provider_model_id: str | None,
+        *,
+        wire_protocol: Any = None,
+        now: float | None = None,
     ) -> None:
+        """清掉本次成功的路径。
+
+        只清本协议（以及不区分协议的通用条目）：某个端点的成功不能抹掉另一个端点
+        「不支持该模型」的记忆，否则必死端点会被无限重试。"""
+        protocol = _protocol_key(wire_protocol)
         current = self._clock() if now is None else now
         with self._lock:
             self._prune(current)
-            self._entries.pop((upstream_id, provider_model_id), None)
+            self._entries.pop((upstream_id, provider_model_id, protocol), None)
+            if protocol is not None:
+                self._entries.pop((upstream_id, provider_model_id, None), None)
 
     def clear(self, upstream_id: str | None = None) -> None:
         with self._lock:
@@ -305,7 +372,7 @@ class CircuitBreaker:
 
     def earliest_remaining(
         self,
-        targets: Iterable[tuple[str, str | None]],
+        targets: Iterable[tuple[Any, ...]],
         *,
         now: float | None = None,
     ) -> float | None:
@@ -313,8 +380,11 @@ class CircuitBreaker:
         with self._lock:
             self._prune(current)
             values: list[float] = []
-            for upstream_id, provider_model_id in targets:
-                for key in self._targets(upstream_id, provider_model_id):
+            for target in targets:
+                upstream_id = target[0]
+                provider_model_id = target[1] if len(target) > 1 else None
+                protocol = target[2] if len(target) > 2 else None
+                for key in self._targets(upstream_id, provider_model_id, protocol):
                     entry = self._entries.get(key)
                     if entry is not None and entry.until > current:
                         values.append(entry.until - current)

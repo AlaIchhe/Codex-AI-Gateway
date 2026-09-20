@@ -41,6 +41,19 @@ import {
 import { useOverlaySearch } from "@/lib/search-params"
 import { cn } from "@/lib/utils"
 
+function formatRemainingSeconds(seconds: number): string {
+  const totalSeconds = Math.max(0, Math.ceil(seconds))
+  if (totalSeconds < 60) return `${totalSeconds} 秒`
+  if (totalSeconds < 3600) return `${Math.ceil(totalSeconds / 60)} 分钟`
+  return `${(totalSeconds / 3600).toFixed(1)} 小时`
+}
+
+function protocolLabel(wireProtocol?: string | null): string {
+  if (wireProtocol === "chat_completions") return "chat/completions"
+  if (wireProtocol === "responses") return "responses"
+  return "不限"
+}
+
 function SortableRow({
   upstream,
   index,
@@ -612,6 +625,7 @@ export function UpstreamsPage() {
                 <TableHeader>
                   <TableRow>
                     <TableHead>模型</TableHead>
+                    <TableHead>端点</TableHead>
                     <TableHead>范围</TableHead>
                     <TableHead>原因</TableHead>
                     <TableHead>剩余</TableHead>
@@ -620,17 +634,18 @@ export function UpstreamsPage() {
                 <TableBody>
                   {detail.cooldowns.map((item) => (
                     <TableRow
-                      key={`${item.provider_model_id ?? "all"}-${item.reason}`}
+                      key={`${item.provider_model_id ?? "all"}-${item.wire_protocol ?? "any"}-${item.reason}`}
                     >
                       <TableCell>
                         {item.provider_model_id ?? "全部模型"}
                       </TableCell>
+                      <TableCell>{protocolLabel(item.wire_protocol)}</TableCell>
                       <TableCell>
                         {item.scope === "provider" ? "整个上游" : "单个模型"}
                       </TableCell>
                       <TableCell>{item.reason}</TableCell>
                       <TableCell>
-                        {Math.ceil(item.remaining_seconds)}s
+                        {formatRemainingSeconds(item.remaining_seconds)}
                       </TableCell>
                     </TableRow>
                   ))}

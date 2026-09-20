@@ -22,6 +22,8 @@ export type UpstreamCooldown = {
   reason: string
   status_code: number | null
   code: string | null
+  /** 避让所属的端点协议；target 级避让按协议分开记忆。 */
+  wire_protocol?: string | null
   remaining_seconds: number
   until: string
 }
