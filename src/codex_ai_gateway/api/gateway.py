@@ -44,7 +44,11 @@ from codex_ai_gateway.api.errors import (
     make_invalid_request,
     make_untranslatable,
 )
-from codex_ai_gateway.domain.circuit_breaker import FailureClassification, FailureDecision
+from codex_ai_gateway.domain.circuit_breaker import (
+    CONTENT_POLICY_REASON,
+    FailureClassification,
+    FailureDecision,
+)
 from codex_ai_gateway.domain.error_mapping import ERROR_EXCERPT_LIMIT, map_provider_error
 from codex_ai_gateway.domain.routing import (
     RoutingError,
@@ -235,8 +239,14 @@ async def _attempt_with_fallback(
     # 命中「不在套餐内」的记录：见 _register_not_in_plan 的剔除规则。
     not_in_plan_seen: dict[tuple[str, str], set[WireProtocol]] = {}
     dead_targets: set[tuple[str, str]] = set()
+    # 命中内容审查的上游：一次请求里的候选都是同一个 canonical model，过滤词表
+    # 只跟上游有关，所以它在该上游的另一个协议面上必然同样拒收——换协议没有意义，
+    # 直接跳过它的剩余候选，省一次注定失败的上游往返。
+    content_blocked_upstreams: set[str] = set()
     for ordinal, (offering, upstream, protocol) in enumerate(candidates, start=1):
         if (upstream.id, offering.provider_model_id) in dead_targets:
+            continue
+        if upstream.id in content_blocked_upstreams:
             continue
         event = _new_event(runtime, canonical_id, offering, upstream, protocol, ordinal)
         runtime.usage_log.create_pending(event)
@@ -291,6 +301,8 @@ async def _attempt_with_fallback(
                             seen=not_in_plan_seen,
                             dead=dead_targets,
                         )
+                    if classification.reason == CONTENT_POLICY_REASON:
+                        content_blocked_upstreams.add(upstream.id)
                     _remember_request_digest(event, protocol, chat_body)
                     _finalize(
                         runtime, event, Outcome.failed, mapped=mapped, status_code=status_code
@@ -341,6 +353,8 @@ async def _attempt_with_fallback(
                         seen=not_in_plan_seen,
                         dead=dead_targets,
                     )
+                if classification.reason == CONTENT_POLICY_REASON:
+                    content_blocked_upstreams.add(upstream.id)
                 _remember_request_digest(event, protocol, chat_body)
                 _finalize(
                     runtime, event, Outcome.failed, mapped=mapped, status_code=result.status_code
@@ -420,6 +434,9 @@ async def _attempt_with_fallback(
 # 终端错误优先级：数字越大越应该让客户端看到。上游限流/故障比「端点不支持该模型」
 # 更能解释「为什么这次请求失败」。
 _TERMINAL_ERROR_RANK: dict[str, int] = {
+    # 内容审查拒收排最高：它是唯一「等多久都不会自愈、必须用户动手」的原因。
+    # 若被限流类错误盖掉，用户会一直重试同一份带毒上下文。
+    ProviderErrorType.content_policy.value: 4,
     ProviderErrorType.rate_limit.value: 3,
     ProviderErrorType.quota_budget.value: 3,
     ProviderErrorType.authentication.value: 2,

@@ -130,6 +130,10 @@ class ProviderErrorType(str, Enum):
     rate_limit = "rate_limit"
     model_permission = "model_permission"
     upstream_fault = "upstream_fault"
+    # 上游内容审查（内容策略）拒收：对整包上下文的内容判定，不是请求格式问题。
+    # 各家过滤词表不同，换一个上游可能直接通过，所以必须独立成类：
+    # 它要 hop 到下一个上游，且绝不能进入避让（目标本身没病）。
+    content_policy = "content_policy"
 
 
 class Upstream(BaseModel):

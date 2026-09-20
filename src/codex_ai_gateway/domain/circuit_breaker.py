@@ -63,6 +63,21 @@ _REQUEST_SHAPE_HINTS = (
     "超出最大",
     "请求体过大",
 )
+# 内容审查拒收：对整包上下文的判定，与请求格式无关。上游本身没病（不进避让），
+# 但换一个过滤词表不同的上游可能直接通过，所以必须 hop 而不是 stop。
+CONTENT_POLICY_REASON = "content_policy"
+_CONTENT_POLICY_CODES = {
+    "provider_content_policy_blocked",
+    "content_policy_violation",
+}
+_CONTENT_POLICY_HINTS = (
+    "content exists risk",
+    "datainspectionfailed",
+    "content policy",
+    "内容审查",
+    "内容审核",
+    "敏感词",
+)
 _ACCOUNT_QUOTA_HINTS = (
     "insufficient_quota",
     "quota exhausted",
@@ -180,6 +195,17 @@ def classify_failure(
     ):
         return FailureClassification(
             FailureDecision.hop, CooldownScope.none, 0.0, "request_shape"
+        )
+
+    # 内容审查拒收：换一个过滤词表不同的上游可能直接通过，且上游本身没病，
+    # 因此 hop 但不冷却（对齐 LiteLLM：内容策略错误既不重试同一目标、也不冷却）。
+    if (
+        error_type == ProviderErrorType.content_policy.value
+        or normalized_code in _CONTENT_POLICY_CODES
+        or any(hint in text for hint in _CONTENT_POLICY_HINTS)
+    ):
+        return FailureClassification(
+            FailureDecision.hop, CooldownScope.none, 0.0, CONTENT_POLICY_REASON
         )
 
     # 「不支持该模型 / 不在套餐内」常以 403/400 返回，但它是模型级事实而不是

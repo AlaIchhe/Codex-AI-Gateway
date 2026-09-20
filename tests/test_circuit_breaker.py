@@ -121,6 +121,24 @@ class TestClassifyFailure:
         assert result.decision is FailureDecision.hop
         assert result.scope is CooldownScope.target
 
+    def test_content_policy_hops_without_cooling(self) -> None:
+        """内容审查拒收是请求内容问题：目标没病（不冷却），但要换上游再试。"""
+        result = classify_failure(
+            status_code=400,
+            error_type="content_policy",
+            code="provider_content_policy_blocked",
+            message="[command ai] 上游内容审查拦截了本次请求。",
+        )
+        assert result.decision is FailureDecision.hop
+        assert result.scope is CooldownScope.none
+        assert result.reason == "content_policy"
+
+    def test_content_policy_recognized_without_error_type(self) -> None:
+        """没有 error_type 时按正文兜底，避免未知调用方退回 stop。"""
+        result = classify_failure(status_code=400, message="Content Exists Risk")
+        assert result.decision is FailureDecision.hop
+        assert result.scope is CooldownScope.none
+
 
 class TestParseRetryAfter:
     def test_numeric_seconds(self) -> None:

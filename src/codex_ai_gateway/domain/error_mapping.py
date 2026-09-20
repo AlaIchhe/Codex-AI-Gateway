@@ -91,6 +91,36 @@ _CONTEXT_LENGTH_HINTS = (
 # 它是模型级事实（套餐没这个模型），不是账号级鉴权失败，必须单独识别，
 # 否则会被 403 分支吞掉成 provider 级 authentication。
 _NOT_IN_PLAN_MARKERS = ("model_not_in_plan", "not_in_plan")
+# 「上游内容审查拒收」：与请求格式无关，是上游对整包上下文做的内容判定。
+# 各家措辞完全不统一（DeepSeek / command ai 用 Content Exists Risk，DashScope
+# 用 DataInspectionFailed，Azure 用 ResponsibleAIPolicyViolation），这里尽量覆盖。
+# 参考 LiteLLM 的 ContentPolicyViolationError + content_policy_fallbacks 的做法：
+# 必须独立成类，才能「换一个上游再试」而不是当成 invalid_request 直接失败。
+_CONTENT_POLICY_CODE_MARKERS = (
+    "content_policy_violation",
+    "content_policy_blocked",
+    "datainspectionfailed",
+    "data_inspection_failed",
+    "contentexistsrisk",
+)
+_CONTENT_POLICY_HINTS = (
+    "content exists risk",
+    "content_exists_risk",
+    "contentexistsrisk",
+    "datainspectionfailed",
+    "data inspection failed",
+    "content policy",
+    "content_policy",
+    "responsibleaipolicyviolation",
+    "safety system",
+    "content filter",
+    "flagged as potentially",
+    "sensitive content",
+    "input is sensitive",
+    "内容审核",
+    "内容风控",
+    "敏感词",
+)
 
 
 def _provider_error_code(body: bytes | str | None) -> str | None:
@@ -148,10 +178,33 @@ def map_provider_error(
         provider_code in _CONTEXT_LENGTH_CODES
         or any(hint in lowered_text for hint in _CONTEXT_LENGTH_HINTS)
     )
+    # 只在 4xx 上判定：5xx 正文里偶然出现「content policy」是上游自身故障，
+    # 不该被当成用户请求的内容问题。
+    content_policy_blocked = 400 <= status_code < 500 and (
+        (
+            provider_code is not None
+            and any(mark in provider_code for mark in _CONTENT_POLICY_CODE_MARKERS)
+        )
+        or any(hint in lowered_text for hint in _CONTENT_POLICY_HINTS)
+    )
     if not_in_plan:
         error_type = ProviderErrorType.model_permission
         code = "provider_model_not_in_plan"
         message = f"{prefix}该模型不在上游套餐内（MODEL_NOT_IN_PLAN），已从该上游剔除。"
+    elif content_policy_blocked:
+        # 必须先于 401/403：部分上游用 403 表达内容拦截，否则会误报成
+        # 「上游认证失败」，把用户引向完全错误的方向。
+        error_type = ProviderErrorType.content_policy
+        code = "provider_content_policy_blocked"
+        detail = text or error_text or ""
+        hint = (
+            "该判定针对整包上下文，重试或压缩后仍含该内容时无效；"
+            "可改走其它上游，或新开会话。"
+        )
+        if detail:
+            message = f"{prefix}上游内容审查拦截了本次请求：{detail} {hint}"
+        else:
+            message = f"{prefix}上游内容审查拦截了本次请求。{hint}"
     elif status_code == 401 or status_code == 403:
         error_type = ProviderErrorType.authentication
         code = "provider_authentication_failed"

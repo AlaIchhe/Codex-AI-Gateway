@@ -267,3 +267,78 @@ def test_current_turn_image_still_fails_closed():
     with pytest.raises(UntranslatableCapabilityError) as excinfo:
         validate_translatable(normal)
     assert excinfo.value.capability == "multimodal_input"
+
+
+# ---------------------------------------------------------------------------
+# 内容审查拒收：必须是独立类别，而不是被当成「400 请求格式错误」透传
+# ---------------------------------------------------------------------------
+
+# command ai / DeepSeek 的真实返回：正文是 JSON-in-JSON，Content Exists Risk
+# 藏在两层 message 里；旧行为把它归成 provider_invalid_request。
+CONTENT_EXISTS_RISK_BODY = json.dumps(
+    {
+        "error": {
+            "message": json.dumps(
+                {
+                    "error": {
+                        "message": "Content Exists Risk",
+                        "type": "AI_APICallError",
+                        "isRetryable": False,
+                    },
+                    "providerMetadata": {
+                        "gateway": {"routing": {"resolvedProvider": "deepseek"}}
+                    },
+                }
+            )
+        }
+    }
+)
+
+
+def test_content_exists_risk_is_content_policy_not_invalid_request():
+    mapped = map_provider_error(400, body=CONTENT_EXISTS_RISK_BODY, upstream_name="command ai")
+    assert mapped["error_mapping_code"] == "provider_content_policy_blocked"
+    assert mapped["provider_error_type"] == "content_policy"
+    assert "[command ai]" in mapped["message"]
+    # 用户必须看懂「这不是格式问题、重试无效」，否则还会走老路。
+    assert "内容审查" in mapped["message"]
+    assert "重试" in mapped["message"]
+
+
+def test_dashscope_data_inspection_failed_is_content_policy():
+    body = json.dumps(
+        {"error": {"code": "DataInspectionFailed", "message": "DataInspectionFailed"}}
+    )
+    mapped = map_provider_error(400, body=body, upstream_name="DashScope")
+    assert mapped["error_mapping_code"] == "provider_content_policy_blocked"
+    assert mapped["provider_error_type"] == "content_policy"
+
+
+def test_content_policy_on_403_beats_authentication():
+    """部分上游用 403 表达内容拦截，不能报成「上游认证失败」。"""
+    body = json.dumps(
+        {"error": {"message": "Your request was rejected as a result of our safety system."}}
+    )
+    mapped = map_provider_error(403, body=body, upstream_name="A")
+    assert mapped["error_mapping_code"] == "provider_content_policy_blocked"
+    assert mapped["provider_error_type"] == "content_policy"
+
+
+def test_plain_400_still_maps_to_invalid_request():
+    """没有内容审查信号的 400 不能被新分支吞掉。"""
+    mapped = map_provider_error(
+        400, body=json.dumps({"error": {"message": "messages is required"}}), upstream_name="A"
+    )
+    assert mapped["error_mapping_code"] == "provider_invalid_request"
+    assert mapped["provider_error_type"] == "invalid_request"
+
+
+def test_5xx_mentioning_content_policy_stays_upstream_fault():
+    """5xx 正文里出现 content policy 是上游自身故障，不是用户内容问题。"""
+    mapped = map_provider_error(
+        500,
+        body=json.dumps({"error": {"message": "content policy service unavailable"}}),
+        upstream_name="A",
+    )
+    assert mapped["error_mapping_code"] == "provider_upstream_fault"
+    assert mapped["provider_error_type"] == "upstream_fault"
