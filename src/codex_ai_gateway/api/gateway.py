@@ -279,7 +279,7 @@ async def _attempt_with_fallback(
                     _finalize(
                         runtime, event, Outcome.failed, mapped=mapped, status_code=status_code
                     )
-                    if classification.decision is FailureDecision.hop:
+                    if _should_hop(offering, classification, status_code):
                         last_error = _prefer_terminal_error(last_error, mapped)
                         last_retry_after = runtime.circuit_breaker.remaining(
                             upstream.id,
@@ -319,7 +319,7 @@ async def _attempt_with_fallback(
                 _finalize(
                     runtime, event, Outcome.failed, mapped=mapped, status_code=result.status_code
                 )
-                if classification.decision is FailureDecision.hop:
+                if _should_hop(offering, classification, result.status_code):
                     last_error = _prefer_terminal_error(last_error, mapped)
                     last_retry_after = runtime.circuit_breaker.remaining(
                         upstream.id,
@@ -331,6 +331,7 @@ async def _attempt_with_fallback(
             runtime.circuit_breaker.record_success(
                 upstream.id, offering.provider_model_id, wire_protocol=protocol
             )
+            _learn_protocol(runtime, upstream, offering, protocol)
             _finalize_success(runtime, event, result.body)
             return Response(
                 content=result.body,
@@ -369,7 +370,7 @@ async def _attempt_with_fallback(
                 status_code=502,
                 fallback_trigger="connection_failure",
             )
-            if classification.decision is FailureDecision.hop:
+            if _should_hop(offering, classification, None):
                 last_error = _prefer_terminal_error(last_error, mapped)
                 last_retry_after = runtime.circuit_breaker.remaining(
                     upstream.id,
@@ -440,6 +441,81 @@ def _record_upstream_failure(
         wire_protocol=wire_protocol,
     )
     return mapped, classification
+
+
+def _should_hop(
+    offering: Any,
+    classification: FailureClassification,
+    status_code: int | None,
+) -> bool:
+    """是否继续尝试下一个候选。
+
+    协议未确认的占位 offering 只有一次猜中协议的机会：此时 4xx 更可能是
+    「猜错了端点」而不是用户请求有问题，所以继续换另一个协议，而不是把
+    400 直接抛回客户端。
+    """
+    if classification.decision is FailureDecision.hop:
+        return True
+    if offering.wire_protocol != WireProtocol.unconfirmed:
+        return False
+    return status_code is not None and 400 <= status_code < 500
+
+
+def _learn_protocol(
+    runtime: Runtime, upstream: Upstream, offering: Any, protocol: WireProtocol
+) -> None:
+    """把真实请求试出来的协议落盘，之后不再试错。
+
+    只对 ``unconfirmed`` 占位 offering 生效：写回 ``model_protocol_probe`` 并把
+    offering 提升为具体协议。落盘失败不影响本次请求。
+    """
+    if offering.wire_protocol != WireProtocol.unconfirmed:
+        return
+    if protocol not in (WireProtocol.responses, WireProtocol.chat_completions):
+        return
+    if not hasattr(runtime.state_store, "mutate"):
+        return
+    upstream_id = upstream.id
+    provider_model_id = offering.provider_model_id
+    now = utc_now()
+
+    def apply(state: Any) -> None:
+        for index, item in enumerate(getattr(state, "upstreams", [])):
+            if item.id != upstream_id:
+                continue
+            probe = dict(item.model_protocol_probe or {})
+            if probe.get(provider_model_id) != [protocol.value]:
+                probe[provider_model_id] = [protocol.value]
+                state.upstreams[index] = item.model_copy(
+                    update={"model_protocol_probe": probe, "updated_at": now}
+                )
+        for index, item in enumerate(getattr(state, "offerings", [])):
+            if (
+                item.upstream_id != upstream_id
+                or item.provider_model_id != provider_model_id
+                or item.wire_protocol != WireProtocol.unconfirmed
+            ):
+                continue
+            state.offerings[index] = item.model_copy(
+                update={
+                    "wire_protocol": protocol,
+                    "identity_evidence": {
+                        "source": "live_request",
+                        "protocol": protocol.value,
+                    },
+                    "updated_at": now,
+                }
+            )
+
+    try:
+        runtime.state_store.mutate(apply, trigger="protocol.learned")
+    except Exception:
+        logger.warning(
+            "协议学习落盘失败: upstream=%s model=%s protocol=%s",
+            upstream_id,
+            provider_model_id,
+            protocol.value,
+        )
 
 
 def _header_value(headers: dict[str, str], name: str) -> str | None:
@@ -788,6 +864,7 @@ async def _stream_response(
             runtime.circuit_breaker.record_success(
                 upstream.id, event.provider_model_id, wire_protocol=protocol
             )
+            _learn_protocol(runtime, upstream, offering, protocol)
             _finalize_success(runtime, event, b"", streaming=True)
         except Exception as exc:
             error_msg = f"上游 {upstream.name} 流式传输异常: {type(exc).__name__}: {exc}"

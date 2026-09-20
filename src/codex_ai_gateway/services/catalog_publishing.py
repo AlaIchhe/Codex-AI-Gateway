@@ -188,12 +188,13 @@ CAPABILITY_PROBE_CONNECT_TIMEOUT_SECONDS = 5.0
 CAPABILITY_PROBE_MAX_TOKENS = 64
 CAPABILITY_PROBE_TTL_SECONDS = 6 * 3600
 # 上游对能力探测有速率限制（TokenDance 并发 20 时大面积 429），
-# 参照上游模型列表探测的分批策略，并给可重试状态码加退避。
+# 所以分批探测；只对瞬态 5xx 退避重试——429 是明确的限流信号，
+# 重试只会加深限流（对齐 opencodex：429 不重试，仅重试瞬态 5xx）。
 CAPABILITY_PROBE_BATCH_SIZE = 5
 CAPABILITY_PROBE_BATCH_DELAY_SECONDS = 2.0
 CAPABILITY_PROBE_MAX_ATTEMPTS = 3
 CAPABILITY_PROBE_RETRY_DELAY_SECONDS = 2.0
-CAPABILITY_PROBE_RETRY_STATUSES = frozenset({429, 500, 502, 503, 504})
+CAPABILITY_PROBE_RETRY_STATUSES = frozenset({500, 502, 503, 504})
 CATALOG_REVISION_RETENTION = 200
 _PROBED_REASONING = {
     "supported_efforts": ["low", "medium", "high"],
@@ -838,6 +839,10 @@ async def run_catalog_automation(runtime: Any) -> dict[str, Any]:
     now = utc_now()
     for offering in offerings:
         if offering.status != OfferingStatus.approved:
+            continue
+        # 协议未确认的 offering 先不进目录：能力探测是真打上游的推理请求，
+        # 等真实请求确认协议（offering 被提升为具体协议）之后再做。
+        if offering.wire_protocol == WireProtocol.unconfirmed:
             continue
         if offering.id in existing_offerings:
             continue

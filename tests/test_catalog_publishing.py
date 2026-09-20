@@ -336,7 +336,7 @@ class _FakeProbeClient:
         return self._responses.pop(0)
 
 
-def test_post_capability_probe_retries_retryable_status(monkeypatch: Any) -> None:
+def test_post_capability_probe_retries_transient_5xx(monkeypatch: Any) -> None:
     import codex_ai_gateway.services.catalog_publishing as cp
 
     sleeps: list[float] = []
@@ -346,7 +346,7 @@ def test_post_capability_probe_retries_retryable_status(monkeypatch: Any) -> Non
 
     monkeypatch.setattr(cp.asyncio, "sleep", fake_sleep)
     client = _FakeProbeClient(
-        [_FakeResponse(429, {"error": "rate"}), _FakeResponse(200, {"ok": True})]
+        [_FakeResponse(503, {"error": "unavailable"}), _FakeResponse(200, {"ok": True})]
     )
     status, body = asyncio.run(_post_capability_probe(client, "url", {}, {}))
     assert (status, body) == (200, {"ok": True})
@@ -364,12 +364,22 @@ def test_post_capability_probe_gives_up_after_max_attempts(monkeypatch: Any) -> 
 
     monkeypatch.setattr(cp.asyncio, "sleep", fake_sleep)
     client = _FakeProbeClient(
-        [_FakeResponse(429, {}) for _ in range(cp.CAPABILITY_PROBE_MAX_ATTEMPTS)]
+        [_FakeResponse(502, {}) for _ in range(cp.CAPABILITY_PROBE_MAX_ATTEMPTS)]
     )
     status, _body = asyncio.run(_post_capability_probe(client, "url", {}, {}))
-    assert status == 429
+    assert status == 502
     assert client.calls == cp.CAPABILITY_PROBE_MAX_ATTEMPTS
     assert len(sleeps) == cp.CAPABILITY_PROBE_MAX_ATTEMPTS - 1
+
+
+def test_post_capability_probe_does_not_retry_429() -> None:
+    """429 是明确的限流信号，重试只会加深限流（对齐 opencodex）。"""
+    client = _FakeProbeClient([_FakeResponse(429, {"error": "rate"})])
+
+    status, body = asyncio.run(_post_capability_probe(client, "url", {}, {}))
+
+    assert (status, body) == (429, {"error": "rate"})
+    assert client.calls == 1
 
 
 def test_fallback_metadata_does_not_cache_failed_probe(

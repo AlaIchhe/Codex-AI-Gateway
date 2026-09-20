@@ -60,7 +60,6 @@ from codex_ai_gateway.services.upstreams import (
     build_preset_offerings,
     discover_offerings,
     fetch_upstream_models,
-    probe_model_protocols,
 )
 from codex_ai_gateway.util import utc_now, uuid7
 
@@ -242,7 +241,11 @@ def _credential_ref(runtime: Any, upstream_id: str) -> str:
 
 
 async def _run_upstream_pipeline(runtime: Any, upstream: Upstream) -> Upstream:
-    """Run full pipeline: discover models -> probe protocols -> build offerings."""
+    """同步上游模型列表并重建 offerings（不发送任何推理请求）。
+
+    协议不在创建时探测：有协议记录的模型按已确认协议各建一条 offering，
+    没有记录的模型建一条 ``unconfirmed`` 占位，等它的第一个真实请求确认协议。
+    """
     credential = runtime.secret_store.get_secret(upstream.auth_credential_ref) or ""
 
     # Phase 1: discover model IDs
@@ -251,7 +254,7 @@ async def _run_upstream_pipeline(runtime: Any, upstream: Upstream) -> Upstream:
         preset = get_preset_provider(upstream.preset_id or "")
         discovery = await discover_preset(preset)
         if discovery.status != "succeeded":
-            return _update_upstream_health(runtime, upstream, "探测失败：" + (discovery.failure_message or "未知错误"))
+            return _update_upstream_health(runtime, upstream, "同步失败：" + (discovery.failure_message or "未知错误"))
         model_ids = discovery.model_ids
     else:
         import httpx
@@ -262,11 +265,11 @@ async def _run_upstream_pipeline(runtime: Any, upstream: Upstream) -> Upstream:
             return _update_upstream_health(
                 runtime,
                 upstream,
-                f"探测失败：模型列表 HTTP {exc.response.status_code}",
+                f"同步失败：模型列表 HTTP {exc.response.status_code}",
             )
         except (httpx.HTTPError, ValueError) as exc:
             detail = str(exc).strip()
-            message = f"探测失败：{type(exc).__name__}"
+            message = f"同步失败：{type(exc).__name__}"
             if detail:
                 message += f"（{detail}）"
             return _update_upstream_health(runtime, upstream, message[:200])
@@ -274,28 +277,19 @@ async def _run_upstream_pipeline(runtime: Any, upstream: Upstream) -> Upstream:
     if not model_ids:
         return _update_upstream_health(runtime, upstream, "未发现可用模型")
 
-    # Phase 2: incremental diff - only probe new models
-    existing_probe = dict(upstream.model_protocol_probe or {})
-    to_probe = [mid for mid in model_ids
-            if mid not in existing_probe or not existing_probe[mid]]
-    removed = [mid for mid in existing_probe if mid not in set(model_ids)]
-
-    # Phase 3: probe model protocols (batched)
-    if to_probe:
-        new_results = await probe_model_protocols(upstream, credential, to_probe)
-        for mid in removed:
-            existing_probe.pop(mid, None)
-        for mid, protocols in new_results.items():
-            existing_probe[mid] = [p.value for p in protocols]
-    else:
-        for mid in removed:
-            existing_probe.pop(mid, None)
-
-    # Phase 4: build offerings
-    protocol_map = {
-        mid: [WireProtocol(p) for p in protocols]
-        for mid, protocols in existing_probe.items()
+    # Phase 2: 保留仍然存在的模型的协议记忆（已确认的结论长期有效）。
+    known_ids = set(model_ids)
+    learned = {
+        model_id: protocols
+        for model_id, protocols in dict(upstream.model_protocol_probe or {}).items()
+        if model_id in known_ids
     }
+    protocol_map = {
+        model_id: [WireProtocol(protocol) for protocol in protocols]
+        for model_id, protocols in learned.items()
+    }
+
+    # Phase 3: build offerings
     if upstream.kind == UpstreamKind.preset:
         snapshot_id = uuid7()
         discovery.snapshot_id = snapshot_id
@@ -304,19 +298,25 @@ async def _run_upstream_pipeline(runtime: Any, upstream: Upstream) -> Upstream:
         )
         _apply_preset_discovery(runtime, upstream, discovery, discovered)
     else:
+        assert upstream_models is not None
         discovered = await discover_offerings(
             upstream, credential, protocol_map=protocol_map, models=upstream_models
         )
+
         def apply(state: Any) -> None:
             old_ids = {o.id for o in state.offerings if o.upstream_id == upstream.id}
             state.offerings = [o for o in state.offerings if o.upstream_id != upstream.id]
             state.model_mappings = [m for m in state.model_mappings if m.offering_id not in old_ids]
             state.offerings.extend(discovered)
+
         runtime.state_store.mutate(apply, trigger="upstream.offerings.refresh")
 
-    confirmed_count = sum(1 for ps in existing_probe.values() if ps)
-    result_text = f"探测完成：{len(model_ids)} 个模型，{confirmed_count} 个有可用协议"
-    refreshed = _update_upstream_health(runtime, upstream, result_text, model_protocol_probe=existing_probe)
+    confirmed_count = sum(1 for protocols in learned.values() if protocols)
+    result_text = (
+        f"已同步 {len(model_ids)} 个模型，已确认协议 {confirmed_count} 个"
+        f"（其余在首次请求时确认）"
+    )
+    refreshed = _update_upstream_health(runtime, upstream, result_text, model_protocol_probe=learned)
     return refreshed
 
 

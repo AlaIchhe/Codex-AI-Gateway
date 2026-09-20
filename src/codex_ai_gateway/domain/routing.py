@@ -60,6 +60,17 @@ def resolve_canonical_model(state: Any, model: str) -> CanonicalModel:
     )
 
 
+def _protocol_order(prefer_chat: bool) -> tuple[WireProtocol, WireProtocol]:
+    """候选协议顺序。
+
+    协议未确认时这个顺序就是试错顺序：``responses`` 优先以保留上游直通的
+    保真度（走 chat 必须过翻译层）。
+    """
+    if prefer_chat:
+        return (WireProtocol.chat_completions, WireProtocol.responses)
+    return (WireProtocol.responses, WireProtocol.chat_completions)
+
+
 def route_candidates(
     state: Any,
     canonical: CanonicalModel,
@@ -67,10 +78,14 @@ def route_candidates(
     prefer_chat: bool = False,
     circuit_breaker: CircuitBreaker | None = None,
 ) -> list[tuple[Offering, Upstream, WireProtocol]]:
-    """按生效优先级返回已确认 offering/upstream 候选。
+    """按生效优先级返回 (offering, upstream, 协议) 候选。
 
-    ``circuit_breaker`` 只提供 (upstream, provider_model) 粒度的失败避让窗口，
-    用于把近期失败的目标排到候选列表最后；它不再屏蔽目标，也不存在
+    协议已确认的 offering 直接成为候选；某 upstream 下完全没有协议记录时，
+    用 ``unconfirmed`` 占位展开成两个协议候选，让第一个真实请求充当探针。
+    已确认协议存在时不展开兜底——只学一个协议即可。
+
+    ``circuit_breaker`` 只提供 (upstream, provider_model, 协议) 粒度的失败避让
+    窗口，用于把近期失败的目标排到候选列表最后；它不再屏蔽目标，也不存在
     “全部目标冷却”这种不可路由状态（fail-open）。
     """
     enabled = {u.id: u for u in _enabled_upstreams(state)}
@@ -100,36 +115,38 @@ def route_candidates(
         ]
         if not candidates:
             continue
-        responses_offering = next(
-            (o for o in candidates if o.wire_protocol == WireProtocol.responses), None
-        )
-        chat_offering = next(
-            (o for o in candidates if o.wire_protocol == WireProtocol.chat_completions), None
-        )
         # 同一 upstream 的两种协议各自成为候选：某个协议端点不支持该模型时
         # （例如上游 responses 端点返回 400 unsupported_model），还能回落到
-        # 另一个协议，而不是把整个模型判死。
-        if prefer_chat:
-            preferred = [o for o in (chat_offering, responses_offering) if o is not None]
-        else:
-            preferred = [o for o in (responses_offering, chat_offering) if o is not None]
-        if not preferred:
-            continue
-        for offering in preferred:
+        # 另一个协议，而不是把整个模型判死。已确认协议优先；完全没有协议记录
+        # 时才拿 unconfirmed 占位展开两种协议，让真实请求充当探针。
+        pairs: list[tuple[Offering, WireProtocol]] = []
+        for protocol in _protocol_order(prefer_chat):
+            offering = next((o for o in candidates if o.wire_protocol == protocol), None)
+            if offering is not None:
+                pairs.append((offering, protocol))
+        if not pairs:
+            placeholder = next(
+                (o for o in candidates if o.wire_protocol == WireProtocol.unconfirmed), None
+            )
+            if placeholder is None:
+                continue
+            pairs = [(placeholder, protocol) for protocol in _protocol_order(prefer_chat)]
+        for offering, protocol in pairs:
             # 方案 A：失败目标只降权、不屏蔽。避让中的目标排在健康目标之后，
             # 全部目标都在避让时仍然 fail-open（尝试最优目标），绝不返回
-            # “所有上游均在冷却中”。
+            # “所有上游均在冷却中”。避让窗口按展开后的具体协议计算，
+            # 因此猜错某个协议后能立刻把另一个协议排到前面。
             avoid_seconds = 0.0
             if circuit_breaker is not None:
                 avoid_seconds = (
                     circuit_breaker.remaining(
                         upstream.id,
                         offering.provider_model_id,
-                        wire_protocol=offering.wire_protocol,
+                        wire_protocol=protocol,
                     )
                     or 0.0
                 )
-            responses_first.append((offering, upstream, offering.wire_protocol, avoid_seconds))
+            responses_first.append((offering, upstream, protocol, avoid_seconds))
     # 稳定排序：健康目标保持配置顺序，避让中的目标排到最后（最早恢复的优先）。
     responses_first.sort(key=lambda item: (item[3] > 0, item[3]))
     return [(offering, upstream, protocol) for offering, upstream, protocol, _ in responses_first]

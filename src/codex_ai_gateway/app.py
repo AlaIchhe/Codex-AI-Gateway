@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import logging
 import os
+from datetime import UTC, datetime
 from pathlib import Path
 
 from fastapi import FastAPI
@@ -20,6 +21,26 @@ from codex_ai_gateway.integrations.secret_store import SecretStore
 from codex_ai_gateway.persistence.file_store import init_data_dir
 from codex_ai_gateway.runtime import Runtime
 from codex_ai_gateway.services.local_codex import LocalCodexAutomationService
+
+MODEL_REFRESH_INTERVAL_SECONDS = 5 * 3600
+# 启动抖动上限：部署或重启不再集中触发一轮上游同步。
+MODEL_REFRESH_STARTUP_JITTER_SECONDS = 120.0
+# 距上次同步不足这个窗口就跳过，避免频繁重启反复拉取模型列表。
+MODEL_REFRESH_MIN_INTERVAL_SECONDS = 3600.0
+
+
+def _sync_is_due(upstream: object) -> bool:
+    # last_health_at 距今超过最小间隔（或从未同步）才需要再拉模型列表。
+    last = getattr(upstream, "last_health_at", None)
+    if not last:
+        return True
+    try:
+        stamp = datetime.fromisoformat(str(last))
+    except ValueError:
+        return True
+    if stamp.tzinfo is None:
+        stamp = stamp.replace(tzinfo=UTC)
+    return (datetime.now(UTC) - stamp).total_seconds() >= MODEL_REFRESH_MIN_INTERVAL_SECONDS
 
 
 def create_app(
@@ -100,16 +121,20 @@ def create_app(
 
     @app.on_event("startup")
     async def start_model_refresh_loop() -> None:
-        """后台定时刷新各上游模型列表与协议探测（每 5 小时）。"""
+        """后台定时同步各上游模型列表（启动先抖动，避免部署即打一轮上游）。"""
         import asyncio
+        import random
 
         async def _model_refresh_loop():
+            await asyncio.sleep(
+                random.uniform(0.0, MODEL_REFRESH_STARTUP_JITTER_SECONDS)
+            )
             while True:
                 try:
                     state = runtime.state_store.read_state()
                     refresh_upstreams = [
                         u for u in state.upstreams
-                        if u.status.value == "enabled"
+                        if u.status.value == "enabled" and _sync_is_due(u)
                     ]
                     for upstream in refresh_upstreams:
                         try:
@@ -117,7 +142,7 @@ def create_app(
                             await _run_upstream_pipeline(runtime, upstream)
                         except Exception:
                             logging.getLogger(__name__).exception(
-                                "自动模型探测失败: upstream=%s", upstream.id,
+                                "自动模型同步失败: upstream=%s", upstream.id,
                             )
                     from codex_ai_gateway.api.admin import _maybe_aggregate
                     from codex_ai_gateway.services.catalog_publishing import (
@@ -134,7 +159,7 @@ def create_app(
                         )
                 except Exception:
                     logging.getLogger(__name__).exception("模型刷新循环异常")
-                await asyncio.sleep(5 * 3600)
+                await asyncio.sleep(MODEL_REFRESH_INTERVAL_SECONDS)
 
         app.state.model_refresh_task = asyncio.create_task(_model_refresh_loop())
 
