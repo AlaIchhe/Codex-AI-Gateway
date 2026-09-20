@@ -10,6 +10,7 @@ from codex_ai_gateway.adapters.protocol_normal_form import (
     UntranslatableCapabilityError,
     ensure_prefill_continuation,
     normalize_request,
+    validate_translatable,
 )
 from codex_ai_gateway.domain.error_mapping import map_provider_error
 
@@ -48,6 +49,13 @@ def test_404_is_model_permission_not_quota():
 def test_502_is_upstream_fault():
     mapped = map_provider_error(502, body=b"", upstream_name="A")
     assert mapped["error_mapping_code"] == "provider_upstream_fault"
+
+
+def test_500_is_upstream_fault_not_client_error():
+    """裸 500 必须归为上游故障：否则会被当作 invalid_request 直接 stop、不切换备用上游。"""
+    mapped = map_provider_error(500, body=b"{}", upstream_name="A")
+    assert mapped["error_mapping_code"] == "provider_upstream_fault"
+    assert mapped["provider_error_type"] == "upstream_fault"
 
 
 def test_shorthand_input_item_treated_as_message():
@@ -140,3 +148,67 @@ def test_503_no_available_channel_code_maps_to_model_unavailable():
     body = json.dumps({"error": {"type": "no_available_channel"}})
     mapped = map_provider_error(503, body=body, upstream_name="A")
     assert mapped["error_mapping_code"] == "provider_model_unavailable"
+
+
+def test_history_image_degrades_to_text_placeholder():
+    """历史轮次里的图片降级为文本占位：一张老图片不应让会话永久不可用。"""
+    normal = normalize_request(
+        inbound_protocol="responses",
+        body={
+            "model": "glm-5.3-flash",
+            "input": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": "看下这张图"},
+                        {"type": "input_image", "image_url": "data:image/png;base64,AAAA"},
+                    ],
+                },
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "看到了"}],
+                },
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "现在这轮是纯文本"}],
+                },
+            ],
+        },
+    )
+    parts = normal.messages[0].content
+    assert parts[1]["type"] == "text"
+    assert parts[1]["text"] == "[image attachment omitted from older history]"
+    assert normal.messages[2].content[0]["text"] == "现在这轮是纯文本"
+    validate_translatable(normal)  # 不再抛错
+
+
+def test_current_turn_image_still_fails_closed():
+    """当前轮图片仍然 fail-closed：立刻 422，而不是被当成上游故障。"""
+    normal = normalize_request(
+        inbound_protocol="responses",
+        body={
+            "model": "glm-5.3-flash",
+            "input": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "旧轮"}],
+                },
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": "这轮带图"},
+                        {"type": "input_image", "image_url": "data:image/png;base64,AAAA"},
+                    ],
+                },
+            ],
+        },
+    )
+    assert normal.messages[0].content[0]["type"] == "text"
+    with pytest.raises(UntranslatableCapabilityError) as excinfo:
+        validate_translatable(normal)
+    assert excinfo.value.capability == "multimodal_input"

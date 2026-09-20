@@ -92,14 +92,16 @@ def map_provider_error(
         error_type = ProviderErrorType.model_permission
         code = "provider_model_unavailable"
         message = f"{prefix}上游不支持该模型或请求。"
-    elif status_code == 408 or status_code in (502, 504):
-        error_type = ProviderErrorType.upstream_fault
-        code = "provider_upstream_fault"
-        message = f"{prefix}上游连接或响应异常，请稍后重试。"
     elif status_code == 503:
         error_type = ProviderErrorType.upstream_fault
         code = "provider_upstream_fault"
         message = f"{prefix}上游暂不可用，请稍后重试。"
+    elif status_code == 408 or 500 <= status_code < 600:
+        # 任何 5xx 都是上游侧故障：必须继续切换备用上游并进入避让，
+        # 不能落进下面的 invalid_request 分支被当成客户端请求错误。
+        error_type = ProviderErrorType.upstream_fault
+        code = "provider_upstream_fault"
+        message = f"{prefix}上游连接或响应异常，请稍后重试。"
     else:
         # 400/405/413/422 等请求类错误：完整透传上游原始错误。
         error_type = ProviderErrorType.invalid_request

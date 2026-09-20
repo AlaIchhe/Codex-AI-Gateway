@@ -69,8 +69,9 @@ def route_candidates(
 ) -> list[tuple[Offering, Upstream, WireProtocol]]:
     """按生效优先级返回已确认 offering/upstream 候选。
 
-    ``circuit_breaker`` 按 (upstream, provider_model) 粒度剔除冷却中的目标，
-    而不是像旧实现那样冻结整个 upstream。
+    ``circuit_breaker`` 只提供 (upstream, provider_model) 粒度的失败避让窗口，
+    用于把近期失败的目标排到候选列表最后；它不再屏蔽目标，也不存在
+    “全部目标冷却”这种不可路由状态（fail-open）。
     """
     enabled = {u.id: u for u in _enabled_upstreams(state)}
     global_pref = next(
@@ -88,7 +89,7 @@ def route_candidates(
     order = (model_pref or global_pref).ordered_upstream_ids if (model_pref or global_pref) else []
     ordered = [enabled[i] for i in order if i in enabled]
     ordered.extend(u for u in enabled.values() if u not in ordered)
-    responses_first: list[tuple[Offering, Upstream, WireProtocol]] = []
+    responses_first: list[tuple[Offering, Upstream, WireProtocol, float]] = []
     for upstream in ordered:
         candidates = [
             o
@@ -97,14 +98,9 @@ def route_candidates(
             and o.status == OfferingStatus.approved
             and o.upstream_id == upstream.id
         ]
-        if circuit_breaker is not None:
-            candidates = [
-                o
-                for o in candidates
-                if not circuit_breaker.is_open(upstream.id, o.provider_model_id)
-            ]
         if not candidates:
             continue
+        offering: Offering | None = None
         if any(o.wire_protocol == WireProtocol.responses for o in candidates):
             responses_offering = next(
                 (o for o in candidates if o.wire_protocol == WireProtocol.responses), None
@@ -113,16 +109,27 @@ def route_candidates(
                 (o for o in candidates if o.wire_protocol == WireProtocol.chat_completions), None
             )
             if prefer_chat and chat_offering is not None:
-                responses_first.append((chat_offering, upstream, WireProtocol.chat_completions))
+                offering = chat_offering
             elif responses_offering is not None:
-                responses_first.append((responses_offering, upstream, WireProtocol.responses))
-            continue
-        if any(o.wire_protocol == WireProtocol.chat_completions for o in candidates):
+                offering = responses_offering
+        if offering is None:
             offering = next(
-                o for o in candidates if o.wire_protocol == WireProtocol.chat_completions
+                (o for o in candidates if o.wire_protocol == WireProtocol.chat_completions), None
             )
-            responses_first.append((offering, upstream, WireProtocol.chat_completions))
-    return responses_first
+        if offering is None:
+            continue
+        # 方案 A：失败目标只降权、不屏蔽。冷却中的目标排在健康目标之后，
+        # 全部目标都在冷却时仍然 fail-open（尝试最优目标），绝不返回
+        # “所有上游均在冷却中”。
+        avoid_seconds = 0.0
+        if circuit_breaker is not None:
+            avoid_seconds = (
+                circuit_breaker.remaining(upstream.id, offering.provider_model_id) or 0.0
+            )
+        responses_first.append((offering, upstream, offering.wire_protocol, avoid_seconds))
+    # 稳定排序：健康目标保持配置顺序，避让中的目标排到最后（最早恢复的优先）。
+    responses_first.sort(key=lambda item: (item[3] > 0, item[3]))
+    return [(offering, upstream, protocol) for offering, upstream, protocol, _ in responses_first]
 
 
 def earliest_cooldown_seconds(
@@ -132,7 +139,11 @@ def earliest_cooldown_seconds(
     *,
     now: float | None = None,
 ) -> float | None:
-    """该模型所有已批准 target 中最早的剩余冷却秒数。"""
+    """该模型所有已批准 target 中的最早避让剩余秒数（仅供观测/提示）。
+
+    方案 A 下这不构成门禁：``route_candidates`` 即使在所有 target 都处于
+    避让窗口时也照常返回候选，因此该值只用于展示与 ``Retry-After`` 提示。
+    """
     targets = [
         (offering.upstream_id, offering.provider_model_id)
         for offering in state.offerings

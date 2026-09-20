@@ -143,6 +143,19 @@ def _normalize_responses(body: dict[str, Any], model: str, stream: bool) -> Norm
         items = raw_input
     else:
         items = []
+    # 找出最后一条 user message：只有当前轮的用户图片需要 fail-closed，
+    # 更早历史里的图片对 chat 上游无意义，降级为文本占位，避免一张老图片
+    # 让整个会话永久不可用。
+    last_user_index: int | None = None
+    for index, candidate in enumerate(items):
+        if not isinstance(candidate, dict):
+            continue
+        candidate_type = candidate.get("type")
+        if candidate_type is None and ("role" in candidate or "content" in candidate):
+            candidate_type = "message"
+        if candidate_type == "message" and candidate.get("role", "user") == "user":
+            last_user_index = index
+
     pending_reasoning: list[str] = []
 
     def _take_pending_reasoning() -> str | None:
@@ -153,7 +166,7 @@ def _normalize_responses(body: dict[str, Any], model: str, stream: bool) -> Norm
         pending_reasoning = []
         return text or None
 
-    for item in items:
+    for item_index, item in enumerate(items):
         if isinstance(item, str):
             pending_reasoning = []
             messages.append(NormalMessage(role="user", content=[{"type": "text", "text": item}]))
@@ -170,6 +183,16 @@ def _normalize_responses(body: dict[str, Any], model: str, stream: bool) -> Norm
         if item_type == "message":
             role = item.get("role", "user")
             content = _normalize_content(item.get("content"))
+            if role == "user" and item_index != last_user_index:
+                content = [
+                    {
+                        "type": "text",
+                        "text": "[image attachment omitted from older history]",
+                    }
+                    if part.get("type") == "image"
+                    else part
+                    for part in content
+                ]
             reasoning = _take_pending_reasoning() if role == "assistant" else None
             if role != "assistant":
                 pending_reasoning = []

@@ -200,27 +200,69 @@ class TestCircuitBreaker:
 
 
 class TestRoutingIntegration:
-    def test_cooling_one_target_keeps_siblings_routable(self) -> None:
-        upstream = _upstream("u1")
-        offerings = [_offering("u1", "model-a", "canon-1"), _offering("u1", "model-b", "canon-2")]
-        state = _state([upstream], offerings)
+    """方案 A：避让窗口只做排序降权，永不屏蔽目标（fail-open）。"""
+
+    def test_failed_target_is_deprioritized_not_blocked(self) -> None:
+        upstreams = [_upstream("u1"), _upstream("u2")]
+        offerings = [
+            _offering("u1", "model-a", "canon-1"),
+            _offering("u2", "model-a", "canon-1"),
+        ]
+        state = _state(upstreams, offerings)
         breaker = CircuitBreaker(clock=lambda: 1000.0, jitter=lambda: 0.0)
         breaker.record_failure("u1", "model-a", status_code=429, error_type="rate_limit")
 
-        assert route_candidates(
+        candidates = route_candidates(
             state, _canonical("canon-1", "model-a"), circuit_breaker=breaker
-        ) == []
-        siblings = route_candidates(
-            state, _canonical("canon-2", "model-b"), circuit_breaker=breaker
         )
-        assert len(siblings) == 1
-        assert siblings[0][0].provider_model_id == "model-b"
+        # 两个 upstream 都是候选；避让中的 u1 只被排到末尾，没有被剔除。
+        assert [upstream.id for _, upstream, _ in candidates] == ["u2", "u1"]
 
-    def test_all_cooling_reports_earliest_retry(self) -> None:
+    def test_recovering_target_sorts_ahead_of_later_one(self) -> None:
+        upstreams = [_upstream("u1"), _upstream("u2")]
+        offerings = [
+            _offering("u1", "model-a", "canon-1"),
+            _offering("u2", "model-a", "canon-1"),
+        ]
+        state = _state(upstreams, offerings)
+        breaker = CircuitBreaker(clock=lambda: 1000.0, jitter=lambda: 0.0)
+        breaker.record_failure(
+            "u1", "model-a", status_code=429, error_type="rate_limit", retry_after="30"
+        )
+        breaker.record_failure("u2", "model-a", status_code=429, error_type="rate_limit")
+
+        candidates = route_candidates(
+            state, _canonical("canon-1", "model-a"), circuit_breaker=breaker
+        )
+        # 都在避让窗口时按剩余时间升序：u2（5s）先于 u1（30s），
+        # 说明排序依据是剩余时间而不是配置顺序。
+        assert [upstream.id for _, upstream, _ in candidates] == ["u2", "u1"]
+
+    def test_all_targets_avoiding_still_routes(self) -> None:
         upstream = _upstream("u1")
         state = _state([upstream], [_offering("u1", "model-a", "canon-1")])
         breaker = CircuitBreaker(clock=lambda: 1000.0, jitter=lambda: 0.0)
         breaker.record_failure("u1", "model-a", status_code=429, error_type="rate_limit")
         canonical = _canonical("canon-1", "model-a")
-        assert route_candidates(state, canonical, circuit_breaker=breaker) == []
+
+        candidates = route_candidates(state, canonical, circuit_breaker=breaker)
+        # 单个 target 全部避让时仍然可路由，不会退化成「所有上游均在冷却中」503。
+        assert len(candidates) == 1
+        assert candidates[0][0].provider_model_id == "model-a"
+        assert candidates[0][1].id == "u1"
+        # 该值仅供观测/Retry-After 提示，不再作为拒绝请求的依据。
         assert earliest_cooldown_seconds(state, canonical, breaker, now=1000.0) == 5.0
+
+    def test_empty_candidates_only_from_missing_offerings(self) -> None:
+        upstream = _upstream("u1")
+        state = _state([upstream], [_offering("u1", "model-a", "canon-1")])
+        breaker = CircuitBreaker(clock=lambda: 1000.0, jitter=lambda: 0.0)
+        breaker.record_failure("u1", "model-a", status_code=401, error_type="authentication")
+
+        # 另一个 canonical 模型本来就没有可用 offering：这才是候选为空的唯一原因。
+        assert (
+            route_candidates(state, _canonical("canon-2", "model-b"), circuit_breaker=breaker) == []
+        )
+        assert (
+            route_candidates(state, _canonical("canon-1", "model-a"), circuit_breaker=breaker) != []
+        )

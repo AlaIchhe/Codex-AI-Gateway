@@ -40,12 +40,12 @@ from codex_ai_gateway.api.errors import (
     gateway_error_response,
     make_auth_error,
     make_invalid_request,
+    make_untranslatable,
 )
 from codex_ai_gateway.domain.circuit_breaker import FailureClassification, FailureDecision
 from codex_ai_gateway.domain.error_mapping import map_provider_error
 from codex_ai_gateway.domain.routing import (
     RoutingError,
-    earliest_cooldown_seconds,
     resolve_canonical_model,
     route_candidates,
 )
@@ -134,22 +134,13 @@ async def _gateway(request: Request) -> Response:
             circuit_breaker=runtime.circuit_breaker,
         )
         if not candidates:
-            retry_after = earliest_cooldown_seconds(
-                state, canonical, runtime.circuit_breaker
-            )
-            if retry_after is None:
-                raise GatewayError(
-                    error_type="provider_error",
-                    code="no_available_upstream",
-                    message="该模型暂无可用上游，请检查上游配置或模型列表。",
-                    status_code=503,
-                )
+            # 方案 A：不存在“全部目标冷却 → 拒绝请求”的状态。候选为空只可能
+            # 是没有已批准 offering / 启用上游，与失败避让无关。
             raise GatewayError(
                 error_type="provider_error",
                 code="no_available_upstream",
-                message="该模型的所有上游均在冷却中，请稍后重试。",
+                message="该模型暂无可用上游，请检查上游配置或模型列表。",
                 status_code=503,
-                headers=_retry_after_headers(retry_after),
             )
         return await _attempt_with_fallback(request, runtime, canonical.id, candidates, body)
     except GatewayError as exc:
@@ -308,6 +299,18 @@ async def _attempt_with_fallback(
                 status_code=result.status_code,
                 media_type=result.headers.get("content-type", "application/json"),
             )
+        except UntranslatableCapabilityError as exc:
+            # 客户端/翻译层能力错误：请求本身无法翻译，与上游健康无关。
+            # 直接返回 4xx，不记录失败、不触发任何避让/冷却。
+            mapped = make_untranslatable(exc.message, exc.capability)
+            _finalize(
+                runtime,
+                event,
+                Outcome.failed,
+                mapped=mapped,
+                status_code=mapped.status_code,
+            )
+            return mapped_response(mapped)
         except Exception as exc:
             logger.warning("upstream attempt failed: %s", type(exc).__name__)
             mapped, classification = _record_upstream_failure(

@@ -603,8 +603,11 @@ export function UpstreamsPage() {
       >
         <div className="space-y-6">
           {detail?.cooldowns && detail.cooldowns.length > 0 && (
-            <section aria-label="冷却状态">
-              <h3 className="mb-2 font-medium">冷却中的目标</h3>
+            <section aria-label="失败避让状态">
+              <h3 className="mb-2 font-medium">避让中的目标</h3>
+              <p className="mb-2 text-sm text-muted-foreground">
+                近期失败的目标只是被排到候选列表末尾，仍会在其他目标失败时继续尝试，不会拒绝请求。
+              </p>
               <Table>
                 <TableHeader>
                   <TableRow>

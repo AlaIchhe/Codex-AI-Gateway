@@ -1,8 +1,12 @@
-"""按 (upstream, provider_model) 粒度的运行时熔断/冷却。
+"""按 (upstream, provider_model) 粒度的运行时失败避让窗口。
 
-替代旧的 ``Upstream.cooldown_until`` 全局冻结：失败只在正确的粒度上冷却，
+替代旧的 ``Upstream.cooldown_until`` 全局冻结：失败只在正确的粒度上记录，
 优先采用上游 ``Retry-After`` / 配额重置时间，带抖动与上限，并对“请求本身
-有问题”的错误完全不冷却。
+有问题”的错误完全不记录。
+
+方案 A：此窗口**只用于排序降权**——``route_candidates`` 把避让中的目标排到
+候选列表末尾，但永不屏蔽目标，因此不存在“全部上游均在冷却中 → 503”这种
+不可路由状态（fail-open，客户端每次都拿到真实的上游错误）。
 
 参考 opencodex ``src/combos/failover.ts`` 的两条原则：
 
