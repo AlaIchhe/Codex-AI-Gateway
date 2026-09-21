@@ -310,8 +310,8 @@ async def _run_upstream_pipeline(runtime: Any, upstream: Upstream) -> Upstream:
             #
             # offering.id 是 catalog candidate 的挂载点：换 id 会让
             # run_catalog_automation 判定成「新 offering」而重建 candidate，
-            # 于是 capability_probe_at 一起归零，6h 能力探测缓存形同虚设——
-            # 每一轮模型同步（5h 一次）都会重新打一遍上游推理请求。
+            # 于是该候选的目录证据与发布版本从零重建，
+            # 每一轮模型同步（5h 一次）都要重算一遍。
             identity = {
                 (o.provider_model_id, o.wire_protocol): o for o in previous
             }

@@ -32,8 +32,8 @@ def test_model_refresh_loop_task_is_started(tmp_path, monkeypatch) -> None:
 def test_logging_is_configured_so_info_logs_are_visible(monkeypatch) -> None:
     """不配置 root 时，codex_ai_gateway.* 的 INFO 日志会被静默丢弃。
 
-    线上表现：目录维护 / 能力探测真打了上游，journald 里一行都没有，
-    用户侧只剩「莫名 429」，无法归因到是网关自己在探测。
+    线上表现：目录维护打了上游，journald 里一行都没有，
+    用户侧只剩「莫名 429」，无法归因到是网关自己的行为。
     """
     import logging
 

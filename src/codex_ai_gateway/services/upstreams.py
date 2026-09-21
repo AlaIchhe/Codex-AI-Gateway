@@ -162,8 +162,10 @@ def build_preset_offerings(
 
 
 def _capabilities_from_metadata(item: dict[str, Any]) -> dict[str, Any]:
+    capabilities = item.get("capabilities")
+    capabilities = capabilities if isinstance(capabilities, dict) else {}
     return {
-        "modalities": item.get("capabilities", {}).get("modalities") or [],
-        "tools": item.get("capabilities", {}).get("tools") or [],
+        "modalities": capabilities.get("modalities") or [],
+        "tools": capabilities.get("tools") or [],
         "description": item.get("description"),
     }

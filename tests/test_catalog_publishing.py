@@ -8,6 +8,8 @@ from typing import Any
 
 from codex_ai_gateway.models.entities import (
     CatalogCandidate,
+    CatalogEvidenceSet,
+    CatalogFieldEvidence,
     CatalogRevision,
     CatalogRevisionStatus,
     MappingStatus,
@@ -23,12 +25,10 @@ from codex_ai_gateway.models.entities import (
     WireProtocol,
 )
 from codex_ai_gateway.services.catalog_publishing import (
-    CapabilityProbeOutcome,
     _build_model_info,
     _fallback_metadata,
     _metadata_from_upstream,
     _official_slug,
-    _post_capability_probe,
     _provider_family_slug,
     compact_catalog_history,
     evaluate_fields,
@@ -138,6 +138,65 @@ def test_metadata_from_upstream_defaults_text_modalities() -> None:
     assert metadata["context_window"] == 1000000
     assert metadata["input_modality"] == ["text"]
     assert metadata["output_modality"] == ["text"]
+
+
+def test_metadata_from_upstream_reads_declared_capabilities() -> None:
+    """上游把能力写在 capabilities 子对象里时同样要读出来（不发任何请求）。"""
+    metadata = _metadata_from_upstream(
+        {
+            "id": "vendor/model",
+            "context_length": 200000,
+            "capabilities": {
+                "modalities": ["text", "image"],
+                "tools": ["function"],
+                "tool_choice": True,
+                "reasoning": {"supported_efforts": ["low", "high"]},
+            },
+        }
+    )
+
+    assert metadata["context_window"] == 200000
+    assert metadata["input_modality"] == ["text", "image"]
+    assert metadata["supported_parameters"] == ["tool_choice", "tools"]
+    assert metadata["reasoning"] == {"supported_efforts": ["low", "high"]}
+
+
+def test_fallback_metadata_merges_declaration_and_existing_evidence() -> None:
+    """兜底元数据 = 上游声明 + 既有证据；两路都不需要网络请求。"""
+    offering = _offering("vendor/model").model_copy(
+        update={
+            "native_metadata_json": {
+                "id": "vendor/model",
+                "context_length": 200000,
+                "capabilities": {"tools": ["function"], "tool_choice": True},
+            }
+        }
+    )
+
+    metadata = _fallback_metadata(offering, None)
+    assert metadata["context_window"] == 200000
+    assert metadata["supported_parameters"] == ["tool_choice", "tools"]
+    assert "reasoning" not in metadata
+
+    evidence = CatalogEvidenceSet(
+        candidate_id="cand-1",
+        fields=[
+            CatalogFieldEvidence(
+                candidate_id="cand-1",
+                id=uuid7(),
+                field_path="reasoning_levels",
+                source_kind=SourceKind.upstream_native,
+                observed_value={"supported_efforts": ["low", "medium"]},
+                verification_status=VerificationStatus.complete,
+                observed_at=utc_now(),
+            )
+        ],
+    )
+
+    merged = _fallback_metadata(offering, evidence)
+    assert merged["reasoning"] == {"supported_efforts": ["low", "medium"]}
+    assert merged["supported_parameters"] == ["tool_choice", "tools"]
+
 
 
 def test_fallback_publication_uses_provider_model_id() -> None:
@@ -273,36 +332,42 @@ def _upstream() -> Upstream:
     )
 
 
+def _forbid_inference_requests(monkeypatch: Any) -> None:
+    """把 httpx 客户端换成「一创建就炸」的哨兵。
+
+    能力探测已被整体删除：目录维护只读上游 /models 声明与 OpenRouter 目录，
+    任何在这里创建 HTTP 客户端的行为都是回归（旧实现会真打上游并计费）。
+    """
+    import codex_ai_gateway.services.catalog_publishing as cp
+
+    class _ForbiddenClient:
+        def __init__(self, *_args: Any, **_kwargs: Any) -> None:
+            raise AssertionError("目录维护不得发起 HTTP 请求（能力探测已删除）")
+
+    monkeypatch.setattr(cp.httpx, "AsyncClient", _ForbiddenClient)
+
+
 def test_run_catalog_automation_publishes_upstream_fallback(
     tmp_path: Path, monkeypatch: Any
 ) -> None:
+    """上游 /models 声明了能力时，不借助任何推理请求即可发布。"""
     import codex_ai_gateway.services.catalog_publishing as cp
-
-    calls = {"probe": 0}
 
     async def fake_search_models(**_kwargs: Any) -> list[Any]:
         return []
 
-    async def fake_probe(*_args: Any, **_kwargs: Any) -> CapabilityProbeOutcome:
-        calls["probe"] += 1
-        return CapabilityProbeOutcome(
-            metadata={
-                "supported_parameters": ["tools", "tool_choice"],
-                "reasoning": {
-                    "supported_efforts": ["low", "medium", "high"],
-                    "default_effort": "medium",
-                },
-            },
-            conclusive=True,
-            detail="HTTP 200",
-        )
-
     monkeypatch.setattr(cp, "search_models", fake_search_models)
-    monkeypatch.setattr(cp, "probe_model_capabilities", fake_probe)
+    _forbid_inference_requests(monkeypatch)
 
-    offering = _offering("deepseek-v4.1-flash")
-    offering = offering.model_copy(
-        update={"native_metadata_json": {"id": "deepseek-v4.1-flash", "context_length": 1000000}}
+    offering = _offering("deepseek-v4.1-flash").model_copy(
+        update={
+            "native_metadata_json": {
+                "id": "deepseek-v4.1-flash",
+                "context_length": 1000000,
+                "supported_parameters": ["tools", "tool_choice"],
+                "reasoning": {"supported_efforts": ["low", "medium", "high"]},
+            }
+        }
     )
     state = _FakeState([offering], [_upstream()])
     runtime = _FakeRuntime(tmp_path, state)
@@ -313,29 +378,55 @@ def test_run_catalog_automation_publishes_upstream_fallback(
     info = state.publications[0].model_info_json
     assert info["slug"] == "deepseek-v4.1-flash"
     assert info["model_id"] == "deepseek-v4.1-flash"
-    assert calls["probe"] == 1
 
     second = asyncio.run(cp.run_catalog_automation(runtime))
     assert second["accepted"] == 1
-    assert calls["probe"] == 1, "能力探测结论已固化，不该重探"
+    assert len(state.publications) == 1, "内容未变化的候选不该重复发布"
 
     infos = load_published_model_infos(tmp_path, valid_slugs={"deepseek-v4.1-flash"})
     assert [item["slug"] for item in infos] == ["deepseek-v4.1-flash"]
 
 
-def test_resync_does_not_reprobe_after_conclusive_probe(
+def test_catalog_automation_never_touches_upstream_inference(
     tmp_path: Path, monkeypatch: Any
 ) -> None:
-    """模型同步之后，已经落地的能力探测结论必须还在。
+    """回归：上游没声明能力时宁可少发，也不能真打上游推理接口。
 
-    线上 2026-09-21 11:58 的现场：刷新循环同步完上游模型列表，offering 全换新
-    id → catalog candidate 重建 → capability_probe_at 归零 → 对 11 个
-    OpenRouter 未收录的模型重打了一遍上游推理请求（还不进用量页）。
+    旧实现的「能力探测」会发一条真实请求，上游照常计费——线上 2026-09-21
+    用户在账单里看到的就是它。这里用「一创建 HTTP 客户端就炸」的哨兵证明
+    目录维护不再发任何请求。
     """
-    import codex_ai_gateway.api.admin as admin
     import codex_ai_gateway.services.catalog_publishing as cp
 
-    calls = {"probe": 0}
+    async def fake_search_models(**_kwargs: Any) -> list[Any]:
+        return []
+
+    monkeypatch.setattr(cp, "search_models", fake_search_models)
+    _forbid_inference_requests(monkeypatch)
+
+    offering = _offering("mystery-model").model_copy(
+        update={
+            "native_metadata_json": {"id": "mystery-model", "context_length": 128000}
+        }
+    )
+    state = _FakeState([offering], [_upstream()])
+    runtime = _FakeRuntime(tmp_path, state)
+
+    result = asyncio.run(cp.run_catalog_automation(runtime))
+
+    assert result["accepted"] == 0
+    assert state.publications == []
+    candidate = next(item for item in state.catalog_candidates if item.offering_id == offering.id)
+    assert candidate.selection_result == SelectionResult.rejected
+    assert "tools_supported" in (candidate.rejection_reason or "")
+
+
+def test_resync_keeps_offering_and_candidate_identity(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    """模型同步复用 offering 身份，候选与既有目录证据不会每轮从零重建。"""
+    import codex_ai_gateway.api.admin as admin
+    import codex_ai_gateway.services.catalog_publishing as cp
 
     async def fake_fetch(*_args: Any, **_kwargs: Any) -> list[dict[str, Any]]:
         return [{"id": "deepseek-v4.1-flash"}]
@@ -343,17 +434,9 @@ def test_resync_does_not_reprobe_after_conclusive_probe(
     async def fake_search_models(**_kwargs: Any) -> list[Any]:
         return []
 
-    async def fake_probe(*_args: Any, **_kwargs: Any) -> CapabilityProbeOutcome:
-        calls["probe"] += 1
-        return CapabilityProbeOutcome(
-            metadata={"supported_parameters": ["tools", "tool_choice"]},
-            conclusive=True,
-            detail="HTTP 200",
-        )
-
     monkeypatch.setattr(admin, "fetch_upstream_models", fake_fetch)
     monkeypatch.setattr(cp, "search_models", fake_search_models)
-    monkeypatch.setattr(cp, "probe_model_capabilities", fake_probe)
+    _forbid_inference_requests(monkeypatch)
 
     upstream = _upstream().model_copy(
         update={"model_protocol_probe": {"deepseek-v4.1-flash": ["chat_completions"]}}
@@ -362,44 +445,28 @@ def test_resync_does_not_reprobe_after_conclusive_probe(
     runtime = _FakeRuntime(tmp_path, state)
 
     asyncio.run(admin._run_upstream_pipeline(runtime, upstream))
+    offering_ids = [offering.id for offering in state.offerings]
     asyncio.run(cp.run_catalog_automation(runtime))
-    assert calls["probe"] == 1
+    candidate_ids = [candidate.offering_id for candidate in state.catalog_candidates]
 
-    # 第二轮 = 5h 后的模型同步 + 目录维护：候选还在 TTL 内，不该再探。
     asyncio.run(admin._run_upstream_pipeline(runtime, upstream))
-    asyncio.run(cp.run_catalog_automation(runtime))
-    assert calls["probe"] == 1, "同步重建 offering 不应让能力探测缓存失效"
 
-    # 结论一旦被清掉（例如人工要求重探），下一轮才重新探测。
-    for candidate in state.catalog_candidates:
-        candidate.capability_probe_at = None
-    asyncio.run(cp.run_catalog_automation(runtime))
-    assert calls["probe"] == 2
+    assert [offering.id for offering in state.offerings] == offering_ids
+    assert [candidate.offering_id for candidate in state.catalog_candidates] == candidate_ids
 
 
-def test_catalog_automation_does_not_sweep_already_probed_models(
+
+def test_catalog_automation_publishes_all_declared_models(
     tmp_path: Path, monkeypatch: Any
 ) -> None:
-    """已有探测结论的模型不会再被周期性全量重探。
-
-    回归点：刷新循环每 5h 跑一次目录维护，旧实现按 TTL 让全部未收录模型
-    重新各打一次上游推理请求（远端 06:56 / 11:58 两轮现场）。
-    """
+    """一次同步带来 12 个只有上游声明的模型：全部发布，且不发推理请求。"""
     import codex_ai_gateway.services.catalog_publishing as cp
-
-    calls = {"probe": 0}
 
     async def fake_search_models(**_kwargs: Any) -> list[Any]:
         return []
 
-    async def fake_probe(*_args: Any, **_kwargs: Any) -> CapabilityProbeOutcome:
-        calls["probe"] += 1
-        return CapabilityProbeOutcome(
-            metadata={}, conclusive=True, detail="HTTP 200"
-        )
-
     monkeypatch.setattr(cp, "search_models", fake_search_models)
-    monkeypatch.setattr(cp, "probe_model_capabilities", fake_probe)
+    _forbid_inference_requests(monkeypatch)
 
     offerings = [
         _offering(f"upstream-model-{index}").model_copy(
@@ -415,237 +482,12 @@ def test_catalog_automation_does_not_sweep_already_probed_models(
         for index in range(12)
     ]
     state = _FakeState(offerings, [_upstream()])
-    state.catalog_candidates = [
-        _candidate(
-            id=f"cand-{index}",
-            offering_id=offering.id,
-            upstream_id=offering.upstream_id,
-            proposed_alias_slug=f"upstream-model-{index}",
-            capability_probe_at="2026-01-01T00:00:00+00:00",
-        )
-        for index, offering in enumerate(offerings)
-    ]
     runtime = _FakeRuntime(tmp_path, state)
 
     result = asyncio.run(cp.run_catalog_automation(runtime))
 
-    assert calls["probe"] == 0, "已有探测结论的模型不该被全量重探"
     assert result["accepted"] == len(offerings)
 
-
-class _FakeResponse:
-    def __init__(self, status_code: int, payload: Any) -> None:
-        self.status_code = status_code
-        self._payload = payload
-
-    def json(self) -> Any:
-        return self._payload
-
-
-class _FakeProbeClient:
-    def __init__(self, responses: list[_FakeResponse]) -> None:
-        self._responses = list(responses)
-        self.calls = 0
-
-    async def post(self, *_args: Any, **_kwargs: Any) -> _FakeResponse:
-        self.calls += 1
-        return self._responses.pop(0)
-
-
-def test_post_capability_probe_retries_transient_5xx(monkeypatch: Any) -> None:
-    import codex_ai_gateway.services.catalog_publishing as cp
-
-    sleeps: list[float] = []
-
-    async def fake_sleep(seconds: float) -> None:
-        sleeps.append(seconds)
-
-    monkeypatch.setattr(cp.asyncio, "sleep", fake_sleep)
-    client = _FakeProbeClient(
-        [_FakeResponse(503, {"error": "unavailable"}), _FakeResponse(200, {"ok": True})]
-    )
-    status, body = asyncio.run(_post_capability_probe(client, "url", {}, {}))
-    assert (status, body) == (200, {"ok": True})
-    assert client.calls == 2
-    assert sleeps == [cp.CAPABILITY_PROBE_RETRY_DELAY_SECONDS]
-
-
-def test_post_capability_probe_gives_up_after_max_attempts(monkeypatch: Any) -> None:
-    import codex_ai_gateway.services.catalog_publishing as cp
-
-    sleeps: list[float] = []
-
-    async def fake_sleep(seconds: float) -> None:
-        sleeps.append(seconds)
-
-    monkeypatch.setattr(cp.asyncio, "sleep", fake_sleep)
-    client = _FakeProbeClient(
-        [_FakeResponse(502, {}) for _ in range(cp.CAPABILITY_PROBE_MAX_ATTEMPTS)]
-    )
-    status, _body = asyncio.run(_post_capability_probe(client, "url", {}, {}))
-    assert status == 502
-    assert client.calls == cp.CAPABILITY_PROBE_MAX_ATTEMPTS
-    assert len(sleeps) == cp.CAPABILITY_PROBE_MAX_ATTEMPTS - 1
-
-
-def test_post_capability_probe_does_not_retry_429() -> None:
-    """429 是明确的限流信号，重试只会加深限流（对齐 opencodex）。"""
-    client = _FakeProbeClient([_FakeResponse(429, {"error": "rate"})])
-
-    status, body = asyncio.run(_post_capability_probe(client, "url", {}, {}))
-
-    assert (status, body) == (429, {"error": "rate"})
-    assert client.calls == 1
-
-
-def test_fallback_metadata_backs_off_after_transient_failure(
-    tmp_path: Path, monkeypatch: Any
-) -> None:
-    """瞬态失败不能当结论，但也不能每轮都重打：退避窗口内跳过。"""
-    import codex_ai_gateway.services.catalog_publishing as cp
-
-    offering = _offering("deepseek-v4.1-flash")
-    candidate = _candidate(offering_id=offering.id)
-    runtime = _FakeRuntime(tmp_path, _FakeState([offering], [_upstream()]))
-
-    async def failed_probe(*_args: Any, **_kwargs: Any) -> CapabilityProbeOutcome:
-        return CapabilityProbeOutcome(metadata={}, conclusive=False, detail="网络错误")
-
-    monkeypatch.setattr(cp, "probe_model_capabilities", failed_probe)
-    asyncio.run(_fallback_metadata(runtime, candidate, offering, _upstream(), None))
-    assert candidate.capability_probe_at is None, "瞬态失败不是结论"
-    assert candidate.capability_probe_failed_at is not None
-
-    calls = {"probe": 0}
-
-    async def ok_probe(*_args: Any, **_kwargs: Any) -> CapabilityProbeOutcome:
-        calls["probe"] += 1
-        return CapabilityProbeOutcome(
-            metadata={"supported_parameters": ["tools", "tool_choice"]},
-            conclusive=True,
-            detail="HTTP 200",
-        )
-
-    monkeypatch.setattr(cp, "probe_model_capabilities", ok_probe)
-    asyncio.run(_fallback_metadata(runtime, candidate, offering, _upstream(), None))
-    assert calls["probe"] == 0, "退避窗口内不该再打上游"
-
-    # 窗口过后必须重试，否则瞬时故障会把模型永久卡死。
-    candidate.capability_probe_failed_at = "2026-01-01T00:00:00+00:00"
-    asyncio.run(_fallback_metadata(runtime, candidate, offering, _upstream(), None))
-    assert calls["probe"] == 1
-    assert candidate.capability_probe_at is not None
-    assert candidate.capability_probe_failed_at is None
-
-
-def test_fallback_metadata_solidifies_negative_probe(
-    tmp_path: Path, monkeypatch: Any
-) -> None:
-    """上游明确答复「拿不到 tools 证据」也是结论，不该每轮重探。"""
-    import codex_ai_gateway.services.catalog_publishing as cp
-
-    offering = _offering("deepseek-v4.1-flash")
-    candidate = _candidate(offering_id=offering.id)
-    runtime = _FakeRuntime(tmp_path, _FakeState([offering], [_upstream()]))
-    calls = {"probe": 0}
-
-    async def negative_probe(*_args: Any, **_kwargs: Any) -> CapabilityProbeOutcome:
-        calls["probe"] += 1
-        return CapabilityProbeOutcome(metadata={}, conclusive=True, detail="HTTP 200")
-
-    monkeypatch.setattr(cp, "probe_model_capabilities", negative_probe)
-    asyncio.run(_fallback_metadata(runtime, candidate, offering, _upstream(), None))
-    assert candidate.capability_probe_at is not None
-    assert candidate.capability_probe_failed_at is None
-
-    asyncio.run(_fallback_metadata(runtime, candidate, offering, _upstream(), None))
-    assert calls["probe"] == 1, "结论已固化，不该重探"
-
-
-def test_probe_model_capabilities_classifies_status(monkeypatch: Any) -> None:
-    """状态码决定结论能不能固化：200/4xx 是定论，429/5xx/网络错误是瞬态。"""
-    import codex_ai_gateway.services.catalog_publishing as cp
-
-    async def probe_with(status: int | None, body: Any) -> CapabilityProbeOutcome:
-        async def fake_post(*_args: Any, **_kwargs: Any) -> tuple[int | None, Any]:
-            return status, body
-
-        monkeypatch.setattr(cp, "_post_capability_probe", fake_post)
-        return await cp.probe_model_capabilities(
-            _upstream(), "sk-test", "demo-model",
-            protocol=WireProtocol.chat_completions,
-        )
-
-    ok = asyncio.run(probe_with(200, {"choices": [{"message": {"content": "pong"}}]}))
-    assert ok.conclusive is True
-    result = ok.metadata["supported_parameters"]
-    assert result == ["tools", "tool_choice"], "200 说明上游接受了带 tools 的请求"
-
-    not_found = asyncio.run(probe_with(404, {"error": "no such model"}))
-    assert not_found.conclusive is True and not_found.detail == "HTTP 404"
-
-    limited = asyncio.run(probe_with(429, {"error": "rate"}))
-    assert limited.conclusive is False and limited.detail == "HTTP 429"
-
-    overloaded = asyncio.run(probe_with(503, {"error": "upstream"}))
-    assert overloaded.conclusive is False and overloaded.detail == "HTTP 503"
-
-    offline = asyncio.run(probe_with(None, None))
-    assert offline.conclusive is False and offline.detail == "网络错误"
-
-
-def test_run_catalog_automation_batches_fallback_probes(
-    tmp_path: Path, monkeypatch: Any
-) -> None:
-    import codex_ai_gateway.services.catalog_publishing as cp
-
-    active = 0
-    max_active = 0
-    calls = {"probe": 0}
-
-    async def fake_search_models(**_kwargs: Any) -> list[Any]:
-        return []
-
-    async def fake_probe(*_args: Any, **_kwargs: Any) -> CapabilityProbeOutcome:
-        nonlocal active, max_active
-        calls["probe"] += 1
-        active += 1
-        max_active = max(max_active, active)
-        await asyncio.sleep(0)
-        active -= 1
-        return CapabilityProbeOutcome(
-            metadata={
-                "supported_parameters": ["tools", "tool_choice"],
-                "reasoning": {"supported_efforts": ["low"], "default_effort": "low"},
-            },
-            conclusive=True,
-            detail="HTTP 200",
-        )
-
-    monkeypatch.setattr(cp, "search_models", fake_search_models)
-    monkeypatch.setattr(cp, "probe_model_capabilities", fake_probe)
-    monkeypatch.setattr(cp, "CAPABILITY_PROBE_BATCH_DELAY_SECONDS", 0)
-
-    offerings = []
-    for index in range(cp.CAPABILITY_PROBE_BATCH_SIZE + 1):
-        offering = _offering(f"fallback-{index}")
-        offerings.append(
-            offering.model_copy(
-                update={
-                    "native_metadata_json": {
-                        "id": f"fallback-{index}",
-                        "context_length": 1000000,
-                    }
-                }
-            )
-        )
-    state = _FakeState(offerings, [_upstream()])
-    runtime = _FakeRuntime(tmp_path, state)
-
-    result = asyncio.run(cp.run_catalog_automation(runtime))
-    assert result["accepted"] == len(offerings)
-    assert calls["probe"] == len(offerings)
-    assert max_active == cp.CAPABILITY_PROBE_BATCH_SIZE
 
 
 def test_run_catalog_automation_publishes_once_and_compacts(
@@ -656,24 +498,16 @@ def test_run_catalog_automation_publishes_once_and_compacts(
     async def fake_search_models(**_kwargs: Any) -> list[Any]:
         return []
 
-    async def fake_probe(*_args: Any, **_kwargs: Any) -> CapabilityProbeOutcome:
-        return CapabilityProbeOutcome(
-            metadata={
-                "supported_parameters": ["tools", "tool_choice"],
-                "reasoning": {"supported_efforts": ["low"], "default_effort": "low"},
-            },
-            conclusive=True,
-            detail="HTTP 200",
-        )
-
     monkeypatch.setattr(cp, "search_models", fake_search_models)
-    monkeypatch.setattr(cp, "probe_model_capabilities", fake_probe)
+    _forbid_inference_requests(monkeypatch)
 
     offering = _offering("deepseek-v4.1-flash").model_copy(
         update={
             "native_metadata_json": {
                 "id": "deepseek-v4.1-flash",
                 "context_length": 1000000,
+                "supported_parameters": ["tools", "tool_choice"],
+                "reasoning": {"supported_efforts": ["low"], "default_effort": "low"},
             }
         }
     )
@@ -689,6 +523,7 @@ def test_run_catalog_automation_publishes_once_and_compacts(
     assert second["published"] == []
     assert len(state.publications) == 1, "内容未变化的模型不应重复发布"
     assert runtime.state_store.mutate_calls == mutates_after_first + 3
+
 
 
 def _write_revision(

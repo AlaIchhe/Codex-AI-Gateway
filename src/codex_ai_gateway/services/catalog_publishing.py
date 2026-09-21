@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
-from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -30,7 +29,6 @@ from codex_ai_gateway.models.entities import (
     SelectionResult,
     SourceKind,
     Upstream,
-    UpstreamStatus,
     VerificationStatus,
     WireProtocol,
 )
@@ -124,11 +122,13 @@ def _upstream_modalities(values: Any, *, allow_image: bool = True) -> list[str]:
 def _metadata_from_upstream(
     native: dict[str, Any] | None, capabilities: dict[str, Any] | None = None
 ) -> dict[str, Any]:
-    """把上游原生 /models 条目归一化为网关内部元数据形态。"""
+    """把上游原生 /models 条目归一化为网关内部元数据形态（只读声明，不发请求）。"""
     source = native if isinstance(native, dict) else {}
     caps = capabilities if isinstance(capabilities, dict) else {}
     architecture = source.get("architecture")
     architecture = architecture if isinstance(architecture, dict) else {}
+    nested = source.get("capabilities")
+    nested = nested if isinstance(nested, dict) else {}
     metadata: dict[str, Any] = {}
     context = (
         source.get("context_window")
@@ -143,6 +143,7 @@ def _metadata_from_upstream(
         source.get("input_modalities")
         or architecture.get("input_modalities")
         or caps.get("modalities")
+        or nested.get("modalities")
         or []
     )
     outputs = (
@@ -153,9 +154,22 @@ def _metadata_from_upstream(
     metadata["input_modality"] = _upstream_modalities(inputs)
     metadata["output_modality"] = _upstream_modalities(outputs, allow_image=False)
     params = source.get("supported_parameters")
-    if isinstance(params, list) and params:
-        metadata["supported_parameters"] = [str(item) for item in params]
-    reasoning = source.get("reasoning")
+    declared = [str(item) for item in params] if isinstance(params, list) else []
+    declared.extend(_declared_parameters(source, caps))
+    if declared:
+        metadata["supported_parameters"] = sorted({item for item in declared if item})
+    reasoning = next(
+        (
+            value
+            for value in (
+                source.get("reasoning"),
+                nested.get("reasoning"),
+                caps.get("reasoning"),
+            )
+            if value is not None
+        ),
+        None,
+    )
     if reasoning is not None:
         metadata["reasoning"] = reasoning
     return metadata
@@ -185,294 +199,50 @@ def _provider_family_slug(offering: Offering, upstream: Upstream | None) -> str:
     return slug or offering.provider_model_id.lower().replace(".", "-")
 
 
-CAPABILITY_PROBE_TIMEOUT_SECONDS = 20.0
-CAPABILITY_PROBE_CONNECT_TIMEOUT_SECONDS = 5.0
-CAPABILITY_PROBE_MAX_TOKENS = 64
-# 能力探测是真打上游推理接口的请求，因此不做周期性重探：
-# 一个 offering 只在「还没有探测结论」时探一次，结论固化后长期有效。
-# 线上那轮「中午 12 点上游又被打了一遍」就是定时全量重探造成的。
-# 上游对能力探测有速率限制（TokenDance 并发 20 时大面积 429），
-# 所以分批探测；只对瞬态 5xx 退避重试——429 是明确的限流信号，
-# 重试只会加深限流（对齐 opencodex：429 不重试，仅重试瞬态 5xx）。
-CAPABILITY_PROBE_BATCH_SIZE = 5
-CAPABILITY_PROBE_BATCH_DELAY_SECONDS = 2.0
-CAPABILITY_PROBE_MAX_ATTEMPTS = 3
-CAPABILITY_PROBE_RETRY_DELAY_SECONDS = 2.0
-CAPABILITY_PROBE_RETRY_STATUSES = frozenset({500, 502, 503, 504})
-# 瞬态失败（网络错误 / 429 / 5xx）后的重试退避：同一个模型一天最多再试一次。
-# 没有它，拿不到结论的模型会在每轮目录维护里被反复重探——就是「全量探测」卷土重来。
-CAPABILITY_PROBE_RETRY_COOLDOWN_SECONDS = 24 * 3600
 CATALOG_REVISION_RETENTION = 200
-# 能力探测是真打上游推理请求、且不经过网关 usage 记录：没有日志时，
-# 用户只能看到「莫名 429」，完全无法归因到目录维护。
+# 目录维护只读上游 `/models` 声明与 OpenRouter 公开目录，永不向上游发送推理请求。
+# 旧实现会为每个 OpenRouter 未收录的模型真打一次 `max_tokens=64` 的「能力探测」，
+# 那条请求在上游照常计费（线上 2026-09-21 用户账单里看到的正是它），已整体删除。
 logger = logging.getLogger(__name__)
 
-_PROBED_REASONING = {
-    "supported_efforts": ["low", "medium", "high"],
-    "default_effort": "medium",
-}
 
+def _declared_parameters(source: dict[str, Any], caps: dict[str, Any]) -> list[str]:
+    """把上游元数据里显式声明的能力名归一化成 ``supported_parameters`` 词表。
 
-def _probe_is_conclusive(value: str | None) -> bool:
-    """探测结论是否已固化（有值即有效，不按 TTL 过期）。
-
-    探测本身会真打上游推理接口，而 TTL 一到、刷新循环一跑，上游就会收到
-    一轮「谁也没请求这些模型，却被逐个探了一遍」的推理请求。结论固化后，
-    只有从未探过的模型才会在首次发布时被探测。
+    只读上游自己写出来的字段（``tools`` / ``tool_choice`` /
+    ``structured_outputs``），不做任何推断、更不发请求。
     """
-    if not value:
-        return False
-    try:
-        datetime.fromisoformat(value)
-    except ValueError:
-        return False
-    return True
+    declared: list[str] = []
+    nested = source.get("capabilities")
+    for container in (source, nested, caps):
+        if not isinstance(container, dict):
+            continue
+        tools = container.get("tools")
+        if isinstance(tools, list) and tools:
+            declared.append("tools")
+        if container.get("tool_choice"):
+            declared.append("tool_choice")
+        if container.get("structured_outputs") or container.get("structured_output"):
+            declared.append("structured_outputs")
+    return declared
 
 
-def _probe_retry_is_due(failed_at: str | None) -> bool:
-    """瞬态失败是否已经过了退避窗口（没失败过就直接可探）。"""
-    if not failed_at:
-        return True
-    try:
-        failed = datetime.fromisoformat(failed_at)
-    except ValueError:
-        return True
-    if failed.tzinfo is None:
-        failed = failed.replace(tzinfo=UTC)
-    return (
-        datetime.now(UTC) - failed
-    ).total_seconds() >= CAPABILITY_PROBE_RETRY_COOLDOWN_SECONDS
-
-
-def _probe_tool_schema() -> dict[str, Any]:
-    return {
-        "type": "function",
-        "function": {
-            "name": "gateway_probe",
-            "description": "Return pong.",
-            "parameters": {"type": "object", "properties": {}, "required": []},
-        },
-    }
-
-
-def _probe_request_body(
-    protocol: WireProtocol, model_id: str, *, tools: bool, reasoning: bool
+def _fallback_metadata(
+    offering: Offering, existing_evidence: CatalogEvidenceSet | None
 ) -> dict[str, Any]:
-    if protocol == WireProtocol.responses:
-        body: dict[str, Any] = {
-            "model": model_id,
-            "input": "ping",
-            "max_output_tokens": CAPABILITY_PROBE_MAX_TOKENS,
-        }
-        if tools:
-            schema = _probe_tool_schema()["function"]
-            body["tools"] = [{"type": "function", **schema}]
-            body["tool_choice"] = "auto"
-        if reasoning:
-            body["reasoning"] = {"effort": "low"}
-        return body
-    body = {
-        "model": model_id,
-        "messages": [{"role": "user", "content": "ping"}],
-        "max_tokens": CAPABILITY_PROBE_MAX_TOKENS,
-    }
-    if tools:
-        body["tools"] = [_probe_tool_schema()]
-        body["tool_choice"] = "auto"
-    if reasoning:
-        body["reasoning_effort"] = "low"
-    return body
+    """上游兜底元数据：只合并上游原生声明与既有证据，不发起任何网络请求。
 
-
-def _has_reasoning_output(body: dict[str, Any] | None) -> bool:
-    if not isinstance(body, dict):
-        return False
-    choices = body.get("choices")
-    if isinstance(choices, list):
-        for choice in choices:
-            message = choice.get("message") if isinstance(choice, dict) else None
-            if isinstance(message, dict) and (
-                message.get("reasoning_content") or message.get("reasoning")
-            ):
-                return True
-    usage = body.get("usage")
-    if isinstance(usage, dict):
-        details = usage.get("completion_tokens_details")
-        if isinstance(details, dict) and details.get("reasoning_tokens"):
-            return True
-        if usage.get("reasoning_tokens"):
-            return True
-    output = body.get("output")
-    if isinstance(output, list):
-        for item in output:
-            if isinstance(item, dict) and item.get("type") == "reasoning":
-                return True
-    return bool(body.get("reasoning_content"))
-
-
-async def _post_capability_probe(
-    client: httpx.AsyncClient,
-    url: str,
-    headers: dict[str, str],
-    body: dict[str, Any],
-) -> tuple[int | None, dict[str, Any] | None]:
-    """发送一次探测请求；命中限流等可重试状态时退避重试。"""
-    status: int | None = None
-    parsed: dict[str, Any] | None = None
-    for attempt in range(CAPABILITY_PROBE_MAX_ATTEMPTS):
-        try:
-            response = await client.post(url, json=body, headers=headers)
-        except httpx.HTTPError:
-            return None, None
-        parsed = None
-        try:
-            payload = response.json()
-            if isinstance(payload, dict):
-                parsed = payload
-        except ValueError:
-            parsed = None
-        status = response.status_code
-        if status not in CAPABILITY_PROBE_RETRY_STATUSES:
-            return status, parsed
-        if attempt + 1 < CAPABILITY_PROBE_MAX_ATTEMPTS:
-            await asyncio.sleep(CAPABILITY_PROBE_RETRY_DELAY_SECONDS * (attempt + 1))
-    return status, parsed
-
-
-@dataclass(frozen=True)
-class CapabilityProbeOutcome:
-    """一次能力探测的结果，以及这份结论能不能固化。
-
-    ``conclusive`` 为 True 表示已经有定论：上游要么正常答复了（200），要么
-    明确拒绝了这次探测（非 429 的 4xx）。定论再探也不会变，落盘固化。
-    ``conclusive`` 为 False 表示瞬态失败（网络错误 / 429 / 5xx）：值得重试，
-    但必须按 ``CAPABILITY_PROBE_RETRY_COOLDOWN_SECONDS`` 退避。
+    上游 `/models` 没声明能力、OpenRouter 也没收录时，候选会因为缺少
+    tools / tool_choice / reasoning 证据而保持未发布——这是刻意的：能力探测
+    会真打上游推理接口并产生计费，代价高于少发几个模型。
     """
-
-    metadata: dict[str, Any]
-    conclusive: bool = False
-    detail: str = ""
-
-
-async def probe_model_capabilities(
-    upstream: Upstream,
-    api_credential: str,
-    model_id: str,
-    *,
-    protocol: WireProtocol,
-) -> CapabilityProbeOutcome:
-    """用极小请求探测 tools / tool_choice / reasoning，补齐上游兜底元数据。
-
-    OpenRouter 未收录的模型没有公开能力字段，这里发送一次（必要时两次）
-    ``max_tokens=64`` 的真实请求。200 即定论：拿得到就补元数据，拿不到
-    （例如模型确实不支持 tools）同样固化，不再反复重探；网络错误 / 429 / 5xx
-    留给调用方按退避窗口重试。
-    """
-    path = "/responses" if protocol == WireProtocol.responses else "/chat/completions"
-    url = f"{upstream.base_url.rstrip('/')}{path}"
-    headers = dict(upstream.default_headers)
-    headers["Authorization"] = f"Bearer {api_credential}"
-    timeout = httpx.Timeout(
-        CAPABILITY_PROBE_TIMEOUT_SECONDS,
-        connect=CAPABILITY_PROBE_CONNECT_TIMEOUT_SECONDS,
-    )
-    metadata: dict[str, Any] = {}
-    tools_ok = False
-    reasoning_ok = False
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        status, body = await _post_capability_probe(
-            client,
-            url,
-            headers,
-            _probe_request_body(protocol, model_id, tools=True, reasoning=False),
-        )
-        first_status = status
-        if status == 200:
-            tools_ok = True
-            reasoning_ok = _has_reasoning_output(body)
-        if tools_ok and not reasoning_ok:
-            status, _body = await _post_capability_probe(
-                client,
-                url,
-                headers,
-                _probe_request_body(protocol, model_id, tools=False, reasoning=True),
-            )
-            reasoning_ok = status == 200
-    if tools_ok:
-        metadata["supported_parameters"] = ["tools", "tool_choice"]
-    if reasoning_ok:
-        metadata["reasoning"] = dict(_PROBED_REASONING)
-    if tools_ok or reasoning_ok:
-        return CapabilityProbeOutcome(
-            metadata=metadata, conclusive=True, detail=f"HTTP {first_status}"
-        )
-    # 没拿到 200：非 429 的 4xx 是上游的明确答复（模型不存在 / 不接受该参数），
-    # 算定论；429 / 5xx / 网络错误算瞬态，交给退避重试。
-    if first_status is None:
-        return CapabilityProbeOutcome(metadata=metadata, detail="网络错误")
-    return CapabilityProbeOutcome(
-        metadata=metadata,
-        conclusive=400 <= first_status < 500 and first_status != 429,
-        detail=f"HTTP {first_status}",
-    )
-
-
-async def _fallback_metadata(
-    runtime: Any,
-    candidate: CatalogCandidate,
-    offering: Offering,
-    upstream: Upstream | None,
-    existing_evidence: CatalogEvidenceSet | None,
-) -> dict[str, Any]:
-    """上游兜底元数据：原生 /models 字段 + 一次性能力探测。"""
     metadata = _metadata_from_upstream(
         offering.native_metadata_json, offering.capabilities
     )
     existing = _metadata_from_evidence(
         existing_evidence.fields if existing_evidence else []
     )
-    metadata = _merge_metadata(metadata, existing)
-    if _probe_is_conclusive(candidate.capability_probe_at):
-        return metadata
-    # 瞬态失败要退避：否则拿不到结论的模型会在每一轮目录维护里被重探一遍。
-    if not _probe_retry_is_due(candidate.capability_probe_failed_at):
-        logger.debug(
-            "能力探测仍在退避窗口内，跳过 upstream=%s model=%s",
-            getattr(upstream, "name", None),
-            offering.provider_model_id,
-        )
-        return metadata
-    if upstream is None or upstream.status != UpstreamStatus.enabled:
-        return metadata
-    credential = runtime.secret_store.get_secret(upstream.auth_credential_ref) or ""
-    if not credential:
-        return metadata
-    logger.info(
-        "能力探测（会真实调用上游推理接口）upstream=%s model=%s protocol=%s",
-        upstream.name,
-        offering.provider_model_id,
-        getattr(offering.wire_protocol, "value", offering.wire_protocol),
-    )
-    outcome = await probe_model_capabilities(
-        upstream,
-        credential,
-        offering.provider_model_id,
-        protocol=offering.wire_protocol,
-    )
-    if outcome.conclusive:
-        # 定论（含「拿不到 tools 证据」这种否定结论）固化，不再重探。
-        candidate.capability_probe_at = utc_now()
-        candidate.capability_probe_failed_at = None
-    else:
-        candidate.capability_probe_failed_at = utc_now()
-        logger.info(
-            "能力探测瞬态失败（%s），%s 秒内不再重探 upstream=%s model=%s",
-            outcome.detail,
-            CAPABILITY_PROBE_RETRY_COOLDOWN_SECONDS,
-            upstream.name,
-            offering.provider_model_id,
-        )
-    return _merge_metadata(metadata, outcome.metadata)
+    return _merge_metadata(metadata, existing)
 
 
 def reconcile_metadata(openrouter: dict[str, Any], native: dict[str, Any] | None) -> dict[str, Any]:
@@ -879,9 +649,10 @@ def _rollback_candidate(entry: PublishedCatalogEntry) -> CatalogCandidate:
 
 
 async def run_catalog_automation(runtime: Any) -> dict[str, Any]:
-    """offering 注册或探测后的全自动目录维护：筛选通过即发布。
+    """offering 注册后的全自动目录维护：筛选通过即发布。
 
-    只对「还没有能力探测结论」的候选发探测请求，不做周期性全量重探。
+    元数据只来自上游 `/models` 声明、OpenRouter 公开目录与既有证据；
+    目录维护不向上游发送任何推理请求（能力探测会真打上游并计费）。
     """
     state = runtime.state_store.read_state()
     service = CatalogPublishingService(runtime.data_dir)
@@ -927,7 +698,7 @@ async def run_catalog_automation(runtime: Any) -> dict[str, Any]:
     for offering in offerings:
         if offering.status != OfferingStatus.approved:
             continue
-        # 协议未确认的 offering 先不进目录：能力探测是真打上游的推理请求，
+        # 协议未确认的 offering 先不进目录：目录发布要求协议面明确，
         # 等真实请求确认协议（offering 被提升为具体协议）之后再做。
         if offering.wire_protocol == WireProtocol.unconfirmed:
             continue
@@ -1011,7 +782,7 @@ async def run_catalog_automation(runtime: Any) -> dict[str, Any]:
     evidence_by_candidate = {
         item.candidate_id: item for item in state.catalog_evidence
     }
-    fallback_tasks: list[tuple[CatalogCandidate, Offering, Upstream | None]] = []
+    fallback_tasks: list[tuple[CatalogCandidate, Offering]] = []
     for candidate in candidates:
         offering = offering_by_id.get(candidate.offering_id)
         if offering is None:
@@ -1034,38 +805,18 @@ async def run_catalog_automation(runtime: Any) -> dict[str, Any]:
             candidate.public_snapshot_version = metadata.get("version_id")
             candidate.public_snapshot_time = utc_now()
             continue
-        # OpenRouter 未收录：用上游原生元数据 + 一次极小能力探测兜底发布。
+        # OpenRouter 未收录：只用上游 /models 原生声明与既有证据兜底。
+        # 这里不发任何推理请求——能力探测会真打上游并产生计费。
         upstream = upstream_by_id.get(offering.upstream_id)
         fallback_slug = _provider_family_slug(offering, upstream)
         if fallback_slug:
             candidate.proposed_alias_slug = fallback_slug
-        fallback_tasks.append((candidate, offering, upstream))
+        fallback_tasks.append((candidate, offering))
 
-    if fallback_tasks:
-        # 分批探测并限流：首次同步可能一次带来多个新模型，全量并发会大面积 429。
-        fallback_results: list[dict[str, Any]] = []
-        for start in range(0, len(fallback_tasks), CAPABILITY_PROBE_BATCH_SIZE):
-            batch = fallback_tasks[start : start + CAPABILITY_PROBE_BATCH_SIZE]
-            fallback_results.extend(
-                await asyncio.gather(
-                    *[
-                        _fallback_metadata(
-                            runtime,
-                            candidate,
-                            offering,
-                            upstream,
-                            evidence_by_candidate.get(candidate.id),
-                        )
-                        for candidate, offering, upstream in batch
-                    ]
-                )
-            )
-            if start + CAPABILITY_PROBE_BATCH_SIZE < len(fallback_tasks):
-                await asyncio.sleep(CAPABILITY_PROBE_BATCH_DELAY_SECONDS)
-        for (candidate, _offering, _upstream), metadata in zip(
-            fallback_tasks, fallback_results, strict=True
-        ):
-            metadata_by_candidate[candidate.id] = metadata
+    for candidate, offering in fallback_tasks:
+        metadata_by_candidate[candidate.id] = _fallback_metadata(
+            offering, evidence_by_candidate.get(candidate.id)
+        )
 
     evidence_input = list(state.catalog_evidence)
     for candidate_id, metadata in metadata_by_candidate.items():
@@ -1083,6 +834,17 @@ async def run_catalog_automation(runtime: Any) -> dict[str, Any]:
         list(state.upstreams),
         existing_evidence=evidence_input,
     )
+    for candidate in candidates:
+        if candidate.openrouter_model_id or candidate.selection_result == SelectionResult.accepted:
+            continue
+        # 上游 /models 没声明能力时这里会留下归因线索：候选保持未发布，
+        # 不再用「能力探测」真打上游推理接口（那会产生计费）。
+        logger.info(
+            "上游元数据不足以发布目录条目 model=%s 原因=%s",
+            candidate.proposed_alias_slug,
+            candidate.rejection_reason,
+        )
+
     accepted_ids = [
         candidate.id
         for candidate in candidates
@@ -1246,7 +1008,7 @@ def evaluate_fields(
     """逐字段评估必要属性，生成 evidence。"""
     now = utc_now()
     fields: list[CatalogFieldEvidence] = []
-    # 无 OpenRouter 身份的候选由上游原生元数据 + 能力探测兜底，证据来源据此标记。
+    # 无 OpenRouter 身份的候选只能靠上游原生声明兜底，证据来源据此标记。
     default_source = (
         SourceKind.openrouter
         if candidate.openrouter_model_id

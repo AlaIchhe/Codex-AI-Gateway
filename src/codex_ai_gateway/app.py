@@ -47,7 +47,7 @@ def _configure_logging() -> None:
     """让 ``codex_ai_gateway.*`` 的 INFO 日志真的落到 journald。
 
     uvicorn 只给自己那几个 logger 配 handler，root 仍是 WARNING：不显式配置时，
-    目录维护与能力探测的留痕会被静默丢掉，线上就只剩「莫名 429」，无法归因到
+    目录维护的留痕会被静默丢掉，线上就只剩「莫名 429」，无法归因到
     是网关自己在打上游。级别可用 ``CODEX_AI_GATEWAY_LOG_LEVEL`` 覆盖。
     """
     raw = os.environ.get("CODEX_AI_GATEWAY_LOG_LEVEL", "INFO").strip().upper()

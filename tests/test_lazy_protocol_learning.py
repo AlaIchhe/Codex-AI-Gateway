@@ -252,8 +252,8 @@ def test_upstream_pipeline_preserves_offering_identity(monkeypatch: Any) -> None
     """同步只刷新元数据，不能给仍在线的模型换 offering id。
 
     线上现象（2026-09-21 11:58）：模型刷新循环同步完 command ai 的 71 个模型，
-    offering 全部换成新 id，catalog candidate 随之重建、capability_probe_at
-    归零，于是对 11 个 OpenRouter 未收录的模型重打了一遍上游推理请求。
+    offering 全部换成新 id，catalog candidate 随之重建、既有目录证据被丢弃，
+    对 11 个 OpenRouter 未收录的模型每轮都要从零重建一次。
     """
     from codex_ai_gateway.api import admin
 
