@@ -43,6 +43,28 @@ def _sync_is_due(upstream: object) -> bool:
     return (datetime.now(UTC) - stamp).total_seconds() >= MODEL_REFRESH_MIN_INTERVAL_SECONDS
 
 
+def _configure_logging() -> None:
+    """让 ``codex_ai_gateway.*`` 的 INFO 日志真的落到 journald。
+
+    uvicorn 只给自己那几个 logger 配 handler，root 仍是 WARNING：不显式配置时，
+    目录维护与能力探测的留痕会被静默丢掉，线上就只剩「莫名 429」，无法归因到
+    是网关自己在打上游。级别可用 ``CODEX_AI_GATEWAY_LOG_LEVEL`` 覆盖。
+    """
+    raw = os.environ.get("CODEX_AI_GATEWAY_LOG_LEVEL", "INFO").strip().upper()
+    level = getattr(logging, raw, None)
+    if not isinstance(level, int):
+        level = logging.INFO
+    root = logging.getLogger()
+    if root.handlers:
+        if root.level > level:
+            root.setLevel(level)
+        return
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+
+
 def create_app(
     *,
     data_dir: Path | None = None,
@@ -50,6 +72,7 @@ def create_app(
     frontend_dist: Path | None = None,
 ) -> FastAPI:
     """构建并配置 FastAPI 应用。"""
+    _configure_logging()
     data_path = Path(data_dir) if data_dir else _default_data_dir()
     init_data_dir(data_path)
     selected_store = secret_store or _select_secret_store()
