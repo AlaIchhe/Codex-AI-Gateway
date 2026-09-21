@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import logging
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -186,7 +187,9 @@ def _provider_family_slug(offering: Offering, upstream: Upstream | None) -> str:
 CAPABILITY_PROBE_TIMEOUT_SECONDS = 20.0
 CAPABILITY_PROBE_CONNECT_TIMEOUT_SECONDS = 5.0
 CAPABILITY_PROBE_MAX_TOKENS = 64
-CAPABILITY_PROBE_TTL_SECONDS = 6 * 3600
+# 能力探测是真打上游推理接口的请求，因此不做周期性重探：
+# 一个 offering 只在「还没有探测结论」时探一次，结论固化后长期有效。
+# 线上那轮「中午 12 点上游又被打了一遍」就是定时全量重探造成的。
 # 上游对能力探测有速率限制（TokenDance 并发 20 时大面积 429），
 # 所以分批探测；只对瞬态 5xx 退避重试——429 是明确的限流信号，
 # 重试只会加深限流（对齐 opencodex：429 不重试，仅重试瞬态 5xx）。
@@ -196,22 +199,30 @@ CAPABILITY_PROBE_MAX_ATTEMPTS = 3
 CAPABILITY_PROBE_RETRY_DELAY_SECONDS = 2.0
 CAPABILITY_PROBE_RETRY_STATUSES = frozenset({500, 502, 503, 504})
 CATALOG_REVISION_RETENTION = 200
+# 能力探测是真打上游推理请求、且不经过网关 usage 记录：没有日志时，
+# 用户只能看到「莫名 429」，完全无法归因到目录维护。
+logger = logging.getLogger(__name__)
+
 _PROBED_REASONING = {
     "supported_efforts": ["low", "medium", "high"],
     "default_effort": "medium",
 }
 
 
-def _probe_is_fresh(value: str | None) -> bool:
+def _probe_is_conclusive(value: str | None) -> bool:
+    """探测结论是否已固化（有值即有效，不按 TTL 过期）。
+
+    探测本身会真打上游推理接口，而 TTL 一到、刷新循环一跑，上游就会收到
+    一轮「谁也没请求这些模型，却被逐个探了一遍」的推理请求。结论固化后，
+    只有从未探过的模型才会在首次发布时被探测。
+    """
     if not value:
         return False
     try:
-        probed = datetime.fromisoformat(value)
+        datetime.fromisoformat(value)
     except ValueError:
         return False
-    if probed.tzinfo is None:
-        probed = probed.replace(tzinfo=UTC)
-    return (datetime.now(UTC) - probed).total_seconds() < CAPABILITY_PROBE_TTL_SECONDS
+    return True
 
 
 def _probe_tool_schema() -> dict[str, Any]:
@@ -364,7 +375,7 @@ async def _fallback_metadata(
     upstream: Upstream | None,
     existing_evidence: CatalogEvidenceSet | None,
 ) -> dict[str, Any]:
-    """上游兜底元数据：原生 /models 字段 + 能力探测（按 TTL 复用）。"""
+    """上游兜底元数据：原生 /models 字段 + 一次性能力探测。"""
     metadata = _metadata_from_upstream(
         offering.native_metadata_json, offering.capabilities
     )
@@ -372,20 +383,26 @@ async def _fallback_metadata(
         existing_evidence.fields if existing_evidence else []
     )
     metadata = _merge_metadata(metadata, existing)
-    if _probe_is_fresh(candidate.capability_probe_at):
+    if _probe_is_conclusive(candidate.capability_probe_at):
         return metadata
     if upstream is None or upstream.status != UpstreamStatus.enabled:
         return metadata
     credential = runtime.secret_store.get_secret(upstream.auth_credential_ref) or ""
     if not credential:
         return metadata
+    logger.info(
+        "能力探测（会真实调用上游推理接口）upstream=%s model=%s protocol=%s",
+        upstream.name,
+        offering.provider_model_id,
+        getattr(offering.wire_protocol, "value", offering.wire_protocol),
+    )
     probe = await probe_model_capabilities(
         upstream,
         credential,
         offering.provider_model_id,
         protocol=offering.wire_protocol,
     )
-    # 探测失败（空结果）不落 TTL，下一轮刷新会重试；成功才缓存 6h。
+    # 探测失败（空结果）不落结论，下一轮刷新会重试；成功即固化。
     if probe:
         candidate.capability_probe_at = utc_now()
     return _merge_metadata(metadata, probe)
@@ -795,7 +812,10 @@ def _rollback_candidate(entry: PublishedCatalogEntry) -> CatalogCandidate:
 
 
 async def run_catalog_automation(runtime: Any) -> dict[str, Any]:
-    """offering 注册或探测后的全自动目录维护：筛选通过即发布。"""
+    """offering 注册或探测后的全自动目录维护：筛选通过即发布。
+
+    只对「还没有能力探测结论」的候选发探测请求，不做周期性全量重探。
+    """
     state = runtime.state_store.read_state()
     service = CatalogPublishingService(runtime.data_dir)
     offerings = list(state.offerings)
@@ -955,7 +975,7 @@ async def run_catalog_automation(runtime: Any) -> dict[str, Any]:
         fallback_tasks.append((candidate, offering, upstream))
 
     if fallback_tasks:
-        # 分批探测并限流：上游对能力探测有速率限制，全量并发会大面积 429。
+        # 分批探测并限流：首次同步可能一次带来多个新模型，全量并发会大面积 429。
         fallback_results: list[dict[str, Any]] = []
         for start in range(0, len(fallback_tasks), CAPABILITY_PROBE_BATCH_SIZE):
             batch = fallback_tasks[start : start + CAPABILITY_PROBE_BATCH_SIZE]

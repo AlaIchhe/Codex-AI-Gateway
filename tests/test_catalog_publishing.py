@@ -256,6 +256,7 @@ class _FakeState:
         self.catalog_evidence: list[Any] = []
         self.publications: list[PublishedCatalogEntry] = []
         self.openrouter_snapshots: list[Any] = []
+        self.model_mappings: list[Any] = []
 
 
 def _upstream() -> Upstream:
@@ -311,10 +312,114 @@ def test_run_catalog_automation_publishes_upstream_fallback(
 
     second = asyncio.run(cp.run_catalog_automation(runtime))
     assert second["accepted"] == 1
-    assert calls["probe"] == 1, "能力探测结果应在 TTL 内复用"
+    assert calls["probe"] == 1, "能力探测结论已固化，不该重探"
 
     infos = load_published_model_infos(tmp_path, valid_slugs={"deepseek-v4.1-flash"})
     assert [item["slug"] for item in infos] == ["deepseek-v4.1-flash"]
+
+
+def test_resync_does_not_reprobe_after_conclusive_probe(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    """模型同步之后，已经落地的能力探测结论必须还在。
+
+    线上 2026-09-21 11:58 的现场：刷新循环同步完上游模型列表，offering 全换新
+    id → catalog candidate 重建 → capability_probe_at 归零 → 对 11 个
+    OpenRouter 未收录的模型重打了一遍上游推理请求（还不进用量页）。
+    """
+    import codex_ai_gateway.api.admin as admin
+    import codex_ai_gateway.services.catalog_publishing as cp
+
+    calls = {"probe": 0}
+
+    async def fake_fetch(*_args: Any, **_kwargs: Any) -> list[dict[str, Any]]:
+        return [{"id": "deepseek-v4.1-flash"}]
+
+    async def fake_search_models(**_kwargs: Any) -> list[Any]:
+        return []
+
+    async def fake_probe(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        calls["probe"] += 1
+        return {"supported_parameters": ["tools", "tool_choice"]}
+
+    monkeypatch.setattr(admin, "fetch_upstream_models", fake_fetch)
+    monkeypatch.setattr(cp, "search_models", fake_search_models)
+    monkeypatch.setattr(cp, "probe_model_capabilities", fake_probe)
+
+    upstream = _upstream().model_copy(
+        update={"model_protocol_probe": {"deepseek-v4.1-flash": ["chat_completions"]}}
+    )
+    state = _FakeState([], [upstream])
+    runtime = _FakeRuntime(tmp_path, state)
+
+    asyncio.run(admin._run_upstream_pipeline(runtime, upstream))
+    asyncio.run(cp.run_catalog_automation(runtime))
+    assert calls["probe"] == 1
+
+    # 第二轮 = 5h 后的模型同步 + 目录维护：候选还在 TTL 内，不该再探。
+    asyncio.run(admin._run_upstream_pipeline(runtime, upstream))
+    asyncio.run(cp.run_catalog_automation(runtime))
+    assert calls["probe"] == 1, "同步重建 offering 不应让能力探测缓存失效"
+
+    # 结论一旦被清掉（例如人工要求重探），下一轮才重新探测。
+    for candidate in state.catalog_candidates:
+        candidate.capability_probe_at = None
+    asyncio.run(cp.run_catalog_automation(runtime))
+    assert calls["probe"] == 2
+
+
+def test_catalog_automation_does_not_sweep_already_probed_models(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    """已有探测结论的模型不会再被周期性全量重探。
+
+    回归点：刷新循环每 5h 跑一次目录维护，旧实现按 TTL 让全部未收录模型
+    重新各打一次上游推理请求（远端 06:56 / 11:58 两轮现场）。
+    """
+    import codex_ai_gateway.services.catalog_publishing as cp
+
+    calls = {"probe": 0}
+
+    async def fake_search_models(**_kwargs: Any) -> list[Any]:
+        return []
+
+    async def fake_probe(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        calls["probe"] += 1
+        return {}
+
+    monkeypatch.setattr(cp, "search_models", fake_search_models)
+    monkeypatch.setattr(cp, "probe_model_capabilities", fake_probe)
+
+    offerings = [
+        _offering(f"upstream-model-{index}").model_copy(
+            update={
+                "native_metadata_json": {
+                    "id": f"upstream-model-{index}",
+                    "context_length": 128000,
+                    "supported_parameters": ["tools", "tool_choice"],
+                    "reasoning": {"supported_efforts": ["low", "medium"]},
+                }
+            }
+        )
+        for index in range(12)
+    ]
+    state = _FakeState(offerings, [_upstream()])
+    state.catalog_candidates = [
+        _candidate(
+            id=f"cand-{index}",
+            offering_id=offering.id,
+            upstream_id=offering.upstream_id,
+            proposed_alias_slug=f"upstream-model-{index}",
+            capability_probe_at="2026-01-01T00:00:00+00:00",
+        )
+        for index, offering in enumerate(offerings)
+    ]
+    runtime = _FakeRuntime(tmp_path, state)
+
+    result = asyncio.run(cp.run_catalog_automation(runtime))
+
+    assert calls["probe"] == 0, "已有探测结论的模型不该被全量重探"
+    assert result["accepted"] == len(offerings)
 
 
 class _FakeResponse:

@@ -248,6 +248,49 @@ def test_upstream_pipeline_prunes_removed_models_from_protocol_memory(
     ]
 
 
+def test_upstream_pipeline_preserves_offering_identity(monkeypatch: Any) -> None:
+    """同步只刷新元数据，不能给仍在线的模型换 offering id。
+
+    线上现象（2026-09-21 11:58）：模型刷新循环同步完 command ai 的 71 个模型，
+    offering 全部换成新 id，catalog candidate 随之重建、capability_probe_at
+    归零，于是对 11 个 OpenRouter 未收录的模型重打了一遍上游推理请求。
+    """
+    from codex_ai_gateway.api import admin
+
+    models: list[dict[str, Any]] = [{"id": "model-a"}, {"id": "model-b"}]
+
+    async def fake_fetch(*_args: Any, **_kwargs: Any) -> list[dict[str, Any]]:
+        return [dict(item) for item in models]
+
+    monkeypatch.setattr(admin, "fetch_upstream_models", fake_fetch)
+
+    upstream = _upstream().model_copy(
+        update={"model_protocol_probe": {"model-a": ["chat_completions"]}}
+    )
+    state = _state([], [upstream])
+    runtime = _runtime(_Client([]), state)
+
+    asyncio.run(admin._run_upstream_pipeline(runtime, upstream))
+    first = {item.provider_model_id: item for item in state.offerings}
+    assert set(first) == {"model-a", "model-b"}
+
+    asyncio.run(admin._run_upstream_pipeline(runtime, upstream))
+    second = {item.provider_model_id: item for item in state.offerings}
+
+    assert set(second) == {"model-a", "model-b"}
+    for model_id, item in second.items():
+        assert item.id == first[model_id].id, f"{model_id} 的 offering id 被换掉了"
+        # 首次发现时间保持稳定，元数据本身照常刷新。
+        assert item.discovered_at == first[model_id].discovered_at
+
+    # 真下线的模型仍要被清掉，不能因为复用身份就变成僵尸条目。
+    models.clear()
+    models.append({"id": "model-a"})
+    asyncio.run(admin._run_upstream_pipeline(runtime, upstream))
+    assert [item.provider_model_id for item in state.offerings] == ["model-a"]
+    assert state.offerings[0].id == first["model-a"].id
+
+
 # ---------------------------------------------------------------------------
 # 路由：unconfirmed 展开成两个协议候选
 # ---------------------------------------------------------------------------

@@ -304,7 +304,23 @@ async def _run_upstream_pipeline(runtime: Any, upstream: Upstream) -> Upstream:
         )
 
         def apply(state: Any) -> None:
-            old_ids = {o.id for o in state.offerings if o.upstream_id == upstream.id}
+            previous = [o for o in state.offerings if o.upstream_id == upstream.id]
+            old_ids = {o.id for o in previous}
+            # 仍在线的模型必须复用原来的 offering 身份，只刷新元数据。
+            #
+            # offering.id 是 catalog candidate 的挂载点：换 id 会让
+            # run_catalog_automation 判定成「新 offering」而重建 candidate，
+            # 于是 capability_probe_at 一起归零，6h 能力探测缓存形同虚设——
+            # 每一轮模型同步（5h 一次）都会重新打一遍上游推理请求。
+            identity = {
+                (o.provider_model_id, o.wire_protocol): o for o in previous
+            }
+            for item in discovered:
+                old = identity.get((item.provider_model_id, item.wire_protocol))
+                if old is None:
+                    continue
+                item.id = old.id
+                item.discovered_at = old.discovered_at
             state.offerings = [o for o in state.offerings if o.upstream_id != upstream.id]
             state.model_mappings = [m for m in state.model_mappings if m.offering_id not in old_ids]
             state.offerings.extend(discovered)
