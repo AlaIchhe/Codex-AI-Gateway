@@ -246,7 +246,10 @@ class CatalogCandidate(BaseModel):
     public_snapshot_version: str | None = None
     public_snapshot_time: str | None = None
     native_upstream_metadata_time: str | None = None
+    # 能力探测的定论时间（含「拿不到 tools 证据」这种否定结论）。
     capability_probe_at: str | None = None
+    # 最近一次瞬态失败（网络 / 429 / 5xx）的时间，用于退避重试。
+    capability_probe_failed_at: str | None = None
     lineage_hash: str | None = None
     created_at: str
     updated_at: str

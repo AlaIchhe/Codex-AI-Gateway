@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -198,6 +199,9 @@ CAPABILITY_PROBE_BATCH_DELAY_SECONDS = 2.0
 CAPABILITY_PROBE_MAX_ATTEMPTS = 3
 CAPABILITY_PROBE_RETRY_DELAY_SECONDS = 2.0
 CAPABILITY_PROBE_RETRY_STATUSES = frozenset({500, 502, 503, 504})
+# 瞬态失败（网络错误 / 429 / 5xx）后的重试退避：同一个模型一天最多再试一次。
+# 没有它，拿不到结论的模型会在每轮目录维护里被反复重探——就是「全量探测」卷土重来。
+CAPABILITY_PROBE_RETRY_COOLDOWN_SECONDS = 24 * 3600
 CATALOG_REVISION_RETENTION = 200
 # 能力探测是真打上游推理请求、且不经过网关 usage 记录：没有日志时，
 # 用户只能看到「莫名 429」，完全无法归因到目录维护。
@@ -223,6 +227,21 @@ def _probe_is_conclusive(value: str | None) -> bool:
     except ValueError:
         return False
     return True
+
+
+def _probe_retry_is_due(failed_at: str | None) -> bool:
+    """瞬态失败是否已经过了退避窗口（没失败过就直接可探）。"""
+    if not failed_at:
+        return True
+    try:
+        failed = datetime.fromisoformat(failed_at)
+    except ValueError:
+        return True
+    if failed.tzinfo is None:
+        failed = failed.replace(tzinfo=UTC)
+    return (
+        datetime.now(UTC) - failed
+    ).total_seconds() >= CAPABILITY_PROBE_RETRY_COOLDOWN_SECONDS
 
 
 def _probe_tool_schema() -> dict[str, Any]:
@@ -320,17 +339,34 @@ async def _post_capability_probe(
     return status, parsed
 
 
+@dataclass(frozen=True)
+class CapabilityProbeOutcome:
+    """一次能力探测的结果，以及这份结论能不能固化。
+
+    ``conclusive`` 为 True 表示已经有定论：上游要么正常答复了（200），要么
+    明确拒绝了这次探测（非 429 的 4xx）。定论再探也不会变，落盘固化。
+    ``conclusive`` 为 False 表示瞬态失败（网络错误 / 429 / 5xx）：值得重试，
+    但必须按 ``CAPABILITY_PROBE_RETRY_COOLDOWN_SECONDS`` 退避。
+    """
+
+    metadata: dict[str, Any]
+    conclusive: bool = False
+    detail: str = ""
+
+
 async def probe_model_capabilities(
     upstream: Upstream,
     api_credential: str,
     model_id: str,
     *,
     protocol: WireProtocol,
-) -> dict[str, Any]:
+) -> CapabilityProbeOutcome:
     """用极小请求探测 tools / tool_choice / reasoning，补齐上游兜底元数据。
 
     OpenRouter 未收录的模型没有公开能力字段，这里发送一次（必要时两次）
-    ``max_tokens=64`` 的真实请求；失败时返回空元数据，候选保持拒绝。
+    ``max_tokens=64`` 的真实请求。200 即定论：拿得到就补元数据，拿不到
+    （例如模型确实不支持 tools）同样固化，不再反复重探；网络错误 / 429 / 5xx
+    留给调用方按退避窗口重试。
     """
     path = "/responses" if protocol == WireProtocol.responses else "/chat/completions"
     url = f"{upstream.base_url.rstrip('/')}{path}"
@@ -350,6 +386,7 @@ async def probe_model_capabilities(
             headers,
             _probe_request_body(protocol, model_id, tools=True, reasoning=False),
         )
+        first_status = status
         if status == 200:
             tools_ok = True
             reasoning_ok = _has_reasoning_output(body)
@@ -365,7 +402,19 @@ async def probe_model_capabilities(
         metadata["supported_parameters"] = ["tools", "tool_choice"]
     if reasoning_ok:
         metadata["reasoning"] = dict(_PROBED_REASONING)
-    return metadata
+    if tools_ok or reasoning_ok:
+        return CapabilityProbeOutcome(
+            metadata=metadata, conclusive=True, detail=f"HTTP {first_status}"
+        )
+    # 没拿到 200：非 429 的 4xx 是上游的明确答复（模型不存在 / 不接受该参数），
+    # 算定论；429 / 5xx / 网络错误算瞬态，交给退避重试。
+    if first_status is None:
+        return CapabilityProbeOutcome(metadata=metadata, detail="网络错误")
+    return CapabilityProbeOutcome(
+        metadata=metadata,
+        conclusive=400 <= first_status < 500 and first_status != 429,
+        detail=f"HTTP {first_status}",
+    )
 
 
 async def _fallback_metadata(
@@ -385,6 +434,14 @@ async def _fallback_metadata(
     metadata = _merge_metadata(metadata, existing)
     if _probe_is_conclusive(candidate.capability_probe_at):
         return metadata
+    # 瞬态失败要退避：否则拿不到结论的模型会在每一轮目录维护里被重探一遍。
+    if not _probe_retry_is_due(candidate.capability_probe_failed_at):
+        logger.debug(
+            "能力探测仍在退避窗口内，跳过 upstream=%s model=%s",
+            getattr(upstream, "name", None),
+            offering.provider_model_id,
+        )
+        return metadata
     if upstream is None or upstream.status != UpstreamStatus.enabled:
         return metadata
     credential = runtime.secret_store.get_secret(upstream.auth_credential_ref) or ""
@@ -396,16 +453,26 @@ async def _fallback_metadata(
         offering.provider_model_id,
         getattr(offering.wire_protocol, "value", offering.wire_protocol),
     )
-    probe = await probe_model_capabilities(
+    outcome = await probe_model_capabilities(
         upstream,
         credential,
         offering.provider_model_id,
         protocol=offering.wire_protocol,
     )
-    # 探测失败（空结果）不落结论，下一轮刷新会重试；成功即固化。
-    if probe:
+    if outcome.conclusive:
+        # 定论（含「拿不到 tools 证据」这种否定结论）固化，不再重探。
         candidate.capability_probe_at = utc_now()
-    return _merge_metadata(metadata, probe)
+        candidate.capability_probe_failed_at = None
+    else:
+        candidate.capability_probe_failed_at = utc_now()
+        logger.info(
+            "能力探测瞬态失败（%s），%s 秒内不再重探 upstream=%s model=%s",
+            outcome.detail,
+            CAPABILITY_PROBE_RETRY_COOLDOWN_SECONDS,
+            upstream.name,
+            offering.provider_model_id,
+        )
+    return _merge_metadata(metadata, outcome.metadata)
 
 
 def reconcile_metadata(openrouter: dict[str, Any], native: dict[str, Any] | None) -> dict[str, Any]:

@@ -23,6 +23,7 @@ from codex_ai_gateway.models.entities import (
     WireProtocol,
 )
 from codex_ai_gateway.services.catalog_publishing import (
+    CapabilityProbeOutcome,
     _build_model_info,
     _fallback_metadata,
     _metadata_from_upstream,
@@ -282,15 +283,19 @@ def test_run_catalog_automation_publishes_upstream_fallback(
     async def fake_search_models(**_kwargs: Any) -> list[Any]:
         return []
 
-    async def fake_probe(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+    async def fake_probe(*_args: Any, **_kwargs: Any) -> CapabilityProbeOutcome:
         calls["probe"] += 1
-        return {
-            "supported_parameters": ["tools", "tool_choice"],
-            "reasoning": {
-                "supported_efforts": ["low", "medium", "high"],
-                "default_effort": "medium",
+        return CapabilityProbeOutcome(
+            metadata={
+                "supported_parameters": ["tools", "tool_choice"],
+                "reasoning": {
+                    "supported_efforts": ["low", "medium", "high"],
+                    "default_effort": "medium",
+                },
             },
-        }
+            conclusive=True,
+            detail="HTTP 200",
+        )
 
     monkeypatch.setattr(cp, "search_models", fake_search_models)
     monkeypatch.setattr(cp, "probe_model_capabilities", fake_probe)
@@ -338,9 +343,13 @@ def test_resync_does_not_reprobe_after_conclusive_probe(
     async def fake_search_models(**_kwargs: Any) -> list[Any]:
         return []
 
-    async def fake_probe(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+    async def fake_probe(*_args: Any, **_kwargs: Any) -> CapabilityProbeOutcome:
         calls["probe"] += 1
-        return {"supported_parameters": ["tools", "tool_choice"]}
+        return CapabilityProbeOutcome(
+            metadata={"supported_parameters": ["tools", "tool_choice"]},
+            conclusive=True,
+            detail="HTTP 200",
+        )
 
     monkeypatch.setattr(admin, "fetch_upstream_models", fake_fetch)
     monkeypatch.setattr(cp, "search_models", fake_search_models)
@@ -383,9 +392,11 @@ def test_catalog_automation_does_not_sweep_already_probed_models(
     async def fake_search_models(**_kwargs: Any) -> list[Any]:
         return []
 
-    async def fake_probe(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+    async def fake_probe(*_args: Any, **_kwargs: Any) -> CapabilityProbeOutcome:
         calls["probe"] += 1
-        return {}
+        return CapabilityProbeOutcome(
+            metadata={}, conclusive=True, detail="HTTP 200"
+        )
 
     monkeypatch.setattr(cp, "search_models", fake_search_models)
     monkeypatch.setattr(cp, "probe_model_capabilities", fake_probe)
@@ -487,28 +498,100 @@ def test_post_capability_probe_does_not_retry_429() -> None:
     assert client.calls == 1
 
 
-def test_fallback_metadata_does_not_cache_failed_probe(
+def test_fallback_metadata_backs_off_after_transient_failure(
     tmp_path: Path, monkeypatch: Any
 ) -> None:
+    """瞬态失败不能当结论，但也不能每轮都重打：退避窗口内跳过。"""
     import codex_ai_gateway.services.catalog_publishing as cp
 
     offering = _offering("deepseek-v4.1-flash")
     candidate = _candidate(offering_id=offering.id)
     runtime = _FakeRuntime(tmp_path, _FakeState([offering], [_upstream()]))
 
-    async def failed_probe(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
-        return {}
+    async def failed_probe(*_args: Any, **_kwargs: Any) -> CapabilityProbeOutcome:
+        return CapabilityProbeOutcome(metadata={}, conclusive=False, detail="网络错误")
 
     monkeypatch.setattr(cp, "probe_model_capabilities", failed_probe)
     asyncio.run(_fallback_metadata(runtime, candidate, offering, _upstream(), None))
-    assert candidate.capability_probe_at is None
+    assert candidate.capability_probe_at is None, "瞬态失败不是结论"
+    assert candidate.capability_probe_failed_at is not None
 
-    async def ok_probe(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
-        return {"supported_parameters": ["tools", "tool_choice"]}
+    calls = {"probe": 0}
+
+    async def ok_probe(*_args: Any, **_kwargs: Any) -> CapabilityProbeOutcome:
+        calls["probe"] += 1
+        return CapabilityProbeOutcome(
+            metadata={"supported_parameters": ["tools", "tool_choice"]},
+            conclusive=True,
+            detail="HTTP 200",
+        )
 
     monkeypatch.setattr(cp, "probe_model_capabilities", ok_probe)
     asyncio.run(_fallback_metadata(runtime, candidate, offering, _upstream(), None))
+    assert calls["probe"] == 0, "退避窗口内不该再打上游"
+
+    # 窗口过后必须重试，否则瞬时故障会把模型永久卡死。
+    candidate.capability_probe_failed_at = "2026-01-01T00:00:00+00:00"
+    asyncio.run(_fallback_metadata(runtime, candidate, offering, _upstream(), None))
+    assert calls["probe"] == 1
     assert candidate.capability_probe_at is not None
+    assert candidate.capability_probe_failed_at is None
+
+
+def test_fallback_metadata_solidifies_negative_probe(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    """上游明确答复「拿不到 tools 证据」也是结论，不该每轮重探。"""
+    import codex_ai_gateway.services.catalog_publishing as cp
+
+    offering = _offering("deepseek-v4.1-flash")
+    candidate = _candidate(offering_id=offering.id)
+    runtime = _FakeRuntime(tmp_path, _FakeState([offering], [_upstream()]))
+    calls = {"probe": 0}
+
+    async def negative_probe(*_args: Any, **_kwargs: Any) -> CapabilityProbeOutcome:
+        calls["probe"] += 1
+        return CapabilityProbeOutcome(metadata={}, conclusive=True, detail="HTTP 200")
+
+    monkeypatch.setattr(cp, "probe_model_capabilities", negative_probe)
+    asyncio.run(_fallback_metadata(runtime, candidate, offering, _upstream(), None))
+    assert candidate.capability_probe_at is not None
+    assert candidate.capability_probe_failed_at is None
+
+    asyncio.run(_fallback_metadata(runtime, candidate, offering, _upstream(), None))
+    assert calls["probe"] == 1, "结论已固化，不该重探"
+
+
+def test_probe_model_capabilities_classifies_status(monkeypatch: Any) -> None:
+    """状态码决定结论能不能固化：200/4xx 是定论，429/5xx/网络错误是瞬态。"""
+    import codex_ai_gateway.services.catalog_publishing as cp
+
+    async def probe_with(status: int | None, body: Any) -> CapabilityProbeOutcome:
+        async def fake_post(*_args: Any, **_kwargs: Any) -> tuple[int | None, Any]:
+            return status, body
+
+        monkeypatch.setattr(cp, "_post_capability_probe", fake_post)
+        return await cp.probe_model_capabilities(
+            _upstream(), "sk-test", "demo-model",
+            protocol=WireProtocol.chat_completions,
+        )
+
+    ok = asyncio.run(probe_with(200, {"choices": [{"message": {"content": "pong"}}]}))
+    assert ok.conclusive is True
+    result = ok.metadata["supported_parameters"]
+    assert result == ["tools", "tool_choice"], "200 说明上游接受了带 tools 的请求"
+
+    not_found = asyncio.run(probe_with(404, {"error": "no such model"}))
+    assert not_found.conclusive is True and not_found.detail == "HTTP 404"
+
+    limited = asyncio.run(probe_with(429, {"error": "rate"}))
+    assert limited.conclusive is False and limited.detail == "HTTP 429"
+
+    overloaded = asyncio.run(probe_with(503, {"error": "upstream"}))
+    assert overloaded.conclusive is False and overloaded.detail == "HTTP 503"
+
+    offline = asyncio.run(probe_with(None, None))
+    assert offline.conclusive is False and offline.detail == "网络错误"
 
 
 def test_run_catalog_automation_batches_fallback_probes(
@@ -523,17 +606,21 @@ def test_run_catalog_automation_batches_fallback_probes(
     async def fake_search_models(**_kwargs: Any) -> list[Any]:
         return []
 
-    async def fake_probe(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+    async def fake_probe(*_args: Any, **_kwargs: Any) -> CapabilityProbeOutcome:
         nonlocal active, max_active
         calls["probe"] += 1
         active += 1
         max_active = max(max_active, active)
         await asyncio.sleep(0)
         active -= 1
-        return {
-            "supported_parameters": ["tools", "tool_choice"],
-            "reasoning": {"supported_efforts": ["low"], "default_effort": "low"},
-        }
+        return CapabilityProbeOutcome(
+            metadata={
+                "supported_parameters": ["tools", "tool_choice"],
+                "reasoning": {"supported_efforts": ["low"], "default_effort": "low"},
+            },
+            conclusive=True,
+            detail="HTTP 200",
+        )
 
     monkeypatch.setattr(cp, "search_models", fake_search_models)
     monkeypatch.setattr(cp, "probe_model_capabilities", fake_probe)
@@ -569,11 +656,15 @@ def test_run_catalog_automation_publishes_once_and_compacts(
     async def fake_search_models(**_kwargs: Any) -> list[Any]:
         return []
 
-    async def fake_probe(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
-        return {
-            "supported_parameters": ["tools", "tool_choice"],
-            "reasoning": {"supported_efforts": ["low"], "default_effort": "low"},
-        }
+    async def fake_probe(*_args: Any, **_kwargs: Any) -> CapabilityProbeOutcome:
+        return CapabilityProbeOutcome(
+            metadata={
+                "supported_parameters": ["tools", "tool_choice"],
+                "reasoning": {"supported_efforts": ["low"], "default_effort": "low"},
+            },
+            conclusive=True,
+            detail="HTTP 200",
+        )
 
     monkeypatch.setattr(cp, "search_models", fake_search_models)
     monkeypatch.setattr(cp, "probe_model_capabilities", fake_probe)
