@@ -1,7 +1,5 @@
 import type { ReactNode } from "react"
 
-import { AnimatedShinyText } from "@/components/magicui/animated-shiny-text"
-import { BlurFade } from "@/components/magicui/blur-fade"
 import { cn } from "@/lib/utils"
 
 export function PageHeader({
@@ -16,21 +14,23 @@ export function PageHeader({
   className?: string
 }) {
   return (
-    <BlurFade
+    <header
       className={cn(
-        "flex flex-wrap items-end justify-between gap-3",
+        "flex flex-wrap items-end justify-between gap-x-6 gap-y-3 pb-2",
         className,
       )}
     >
-      <div className="min-w-0">
-        <h1 className="text-2xl font-semibold tracking-tight">{title}</h1>
+      <div className="min-w-0 space-y-1">
+        <h1 className="text-xl font-semibold tracking-tight">{title}</h1>
         {description ? (
-          <AnimatedShinyText className="mt-1 block max-w-none text-sm">
+          <p className="max-w-2xl text-sm text-muted-foreground">
             {description}
-          </AnimatedShinyText>
+          </p>
         ) : null}
       </div>
-      {actions ? <div className="flex flex-wrap gap-2">{actions}</div> : null}
-    </BlurFade>
+      {actions ? (
+        <div className="flex flex-wrap items-center gap-2">{actions}</div>
+      ) : null}
+    </header>
   )
 }

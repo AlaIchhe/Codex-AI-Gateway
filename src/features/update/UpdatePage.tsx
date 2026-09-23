@@ -42,14 +42,8 @@ function formatTime(value: string | null | undefined): string {
 
 function InstallBadge({ status }: { status: string }) {
   if (status === "running") return <Badge variant="secondary">安装中</Badge>
-  if (status === "succeeded")
-    return (
-      <Badge className="bg-emerald-500/15 text-emerald-600 dark:text-emerald-400">
-        成功
-      </Badge>
-    )
-  if (status === "failed")
-    return <Badge className="bg-destructive/15 text-destructive">失败</Badge>
+  if (status === "succeeded") return <Badge variant="success">成功</Badge>
+  if (status === "failed") return <Badge variant="error">失败</Badge>
   return <Badge variant="secondary">空闲</Badge>
 }
 
@@ -130,7 +124,7 @@ export function UpdatePage() {
       />
 
       {!data?.managed ? (
-        <div className="flex items-start gap-2 border bg-muted/40 p-4 text-sm text-muted-foreground">
+        <div className="flex items-start gap-2 rounded-lg border bg-muted/40 p-4 text-sm text-muted-foreground">
           <AlertTriangle className="mt-0.5 size-4 shrink-0" />
           <span>
             当前进程不是 systemd 托管部署（未找到 <code>releases/</code> 与{" "}
@@ -140,21 +134,21 @@ export function UpdatePage() {
       ) : null}
 
       {data?.last_check_error ? (
-        <div className="flex items-start gap-2 border border-destructive/40 bg-destructive/10 p-4 text-sm text-destructive">
+        <div className="flex items-start gap-2 rounded-lg border border-destructive/30 bg-destructive/5 p-4 text-sm text-destructive-foreground">
           <AlertTriangle className="mt-0.5 size-4 shrink-0" />
           <span>清单检查失败：{data.last_check_error}</span>
         </div>
       ) : null}
 
       {data?.install_error ? (
-        <div className="flex items-start gap-2 border border-destructive/40 bg-destructive/10 p-4 text-sm text-destructive">
+        <div className="flex items-start gap-2 rounded-lg border border-destructive/30 bg-destructive/5 p-4 text-sm text-destructive-foreground">
           <AlertTriangle className="mt-0.5 size-4 shrink-0" />
           <span>上次安装失败：{data.install_error}</span>
         </div>
       ) : null}
 
       <div className="grid gap-4 lg:grid-cols-2">
-        <div className="space-y-3 border bg-card p-4">
+        <div className="space-y-3 rounded-lg border bg-card p-4">
           <h2 className="font-medium">版本状态</h2>
           <dl className="space-y-2 text-sm">
             <div className="flex items-center justify-between gap-3">
@@ -166,7 +160,7 @@ export function UpdatePage() {
               <dd className="flex items-center gap-2 font-mono">
                 {latest}
                 {data?.update_available ? (
-                  <Badge className="bg-primary/15 text-primary">可更新</Badge>
+                  <Badge variant="info">可更新</Badge>
                 ) : null}
               </dd>
             </div>
@@ -221,7 +215,7 @@ export function UpdatePage() {
                 href={data.notes_url}
                 target="_blank"
                 rel="noreferrer"
-                className="inline-flex h-9 items-center border px-3 text-sm text-muted-foreground transition-colors hover:text-foreground"
+                className="inline-flex h-8 items-center rounded-lg border px-3 text-sm text-muted-foreground transition-colors hover:text-foreground"
               >
                 查看 Release Notes
               </a>
@@ -229,7 +223,7 @@ export function UpdatePage() {
           </div>
         </div>
 
-        <div className="space-y-3 border bg-card p-4">
+        <div className="space-y-3 rounded-lg border bg-card p-4">
           <h2 className="font-medium">更新策略</h2>
           <div className="space-y-2">
             {(Object.keys(POLICY_LABELS) as UpdatePolicy[]).map((key) => {
@@ -242,9 +236,9 @@ export function UpdatePage() {
                   disabled={policy.isPending}
                   onClick={() => changePolicy(key)}
                   className={cn(
-                    "flex w-full items-start gap-3 border p-3 text-left transition-colors",
+                    "flex w-full items-start gap-3 rounded-md border p-3 text-left transition-colors",
                     active
-                      ? "border-primary/50 bg-primary/10"
+                      ? "border-foreground/30 bg-accent"
                       : "hover:bg-muted/60",
                   )}
                 >
@@ -281,7 +275,7 @@ export function UpdatePage() {
                 value={pinnedInput}
                 onChange={(event) => setPinnedInput(event.target.value)}
                 placeholder={data?.pinned_version ?? "例如 v0.2.27"}
-                className="h-9 min-w-0 flex-1 border bg-background px-3 font-mono text-sm outline-none focus:border-primary"
+                className="h-8 min-w-0 flex-1 rounded-lg border border-input bg-background px-2.5 font-mono text-sm outline-none focus-visible:ring-2 focus-visible:ring-ring dark:bg-input/32"
               />
               <Button
                 type="button"

@@ -3,15 +3,15 @@ import { routeTree } from "./routeTree.gen"
 
 function RouteError({ error }: { error: Error }) {
   return (
-    <div className="flex min-h-[50vh] flex-col items-center justify-center gap-4">
-      <p className="text-lg font-medium text-destructive">页面渲染出现错误</p>
+    <div className="flex min-h-[50vh] flex-col items-center justify-center gap-3">
+      <p className="text-sm font-medium">页面渲染出现错误</p>
       <p className="max-w-md text-center text-sm text-muted-foreground">
         {error.message || "发生了未知错误，请重试。"}
       </p>
       <button
         type="button"
         onClick={() => window.location.reload()}
-        className="rounded-md border px-4 py-2 text-sm font-medium transition-colors hover:bg-muted"
+        className="mt-1 h-8 rounded-lg border px-3 text-sm font-medium transition-colors hover:bg-accent"
       >
         重新加载
       </button>
@@ -22,9 +22,9 @@ function RouteError({ error }: { error: Error }) {
 function RoutePending() {
   return (
     <div className="flex min-h-[50vh] items-center justify-center">
-      <div className="flex flex-col items-center gap-3">
-        <div className="size-6 animate-spin rounded-full border-2 border-muted-foreground border-t-transparent" />
-        <p className="text-sm text-muted-foreground">加载中…</p>
+      <div className="flex items-center gap-2 text-xs text-muted-foreground">
+        <div className="size-3.5 animate-spin rounded-full border-[1.5px] border-current border-t-transparent" />
+        加载中…
       </div>
     </div>
   )

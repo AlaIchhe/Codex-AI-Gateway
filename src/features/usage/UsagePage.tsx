@@ -23,8 +23,6 @@ import {
   TableRow,
 } from "@/components/coss/components/table"
 import { Overlay } from "@/components/coss/overlay"
-import { BentoGrid } from "@/components/magicui/bento-grid"
-import { BlurFade } from "@/components/magicui/blur-fade"
 import { PageHeader } from "@/components/page-header"
 import { StatCard } from "@/components/stat-card"
 import {
@@ -197,7 +195,7 @@ export function UsagePage() {
   }
 
   return (
-    <section aria-labelledby="usage-heading" className="space-y-4">
+    <section aria-labelledby="usage-heading" className="space-y-6">
       <PageHeader
         title="用量"
         description="请求量、token、成本与上游归因的实时聚合。"
@@ -208,7 +206,7 @@ export function UsagePage() {
         }
       />
 
-      <BentoGrid className="grid-cols-2 xl:grid-cols-4">
+      <div className="grid grid-cols-2 gap-3 xl:grid-cols-4">
         <StatCard
           label="总请求"
           value={totals.attempts}
@@ -232,333 +230,319 @@ export function UsagePage() {
           description={`${activeUpstreams} 个上游`}
           delay={0.12}
         />
-      </BentoGrid>
-
-      <div className="grid gap-4 lg:grid-cols-2">
-        <BlurFade delay={0}>
-          <ChartCard
-            title="请求量"
-            loading={periodData.isLoading}
-            total={totals.attempts}
-            totalLabel="Total"
-          >
-            <ChartContainer config={chartConfig} className="h-72 w-full">
-              <AreaChart
-                data={periodRows}
-                margin={{ left: 8, right: 8, top: 8, bottom: 8 }}
-              >
-                <CartesianGrid strokeDasharray="3 3" vertical={false} />
-                <XAxis
-                  dataKey="bucket_start"
-                  stroke="currentColor"
-                  fontSize={12}
-                  tickLine={false}
-                  axisLine={false}
-                />
-                <YAxis
-                  stroke="currentColor"
-                  fontSize={12}
-                  tickLine={false}
-                  axisLine={false}
-                />
-                <ChartTooltip content={<ChartTooltipContent />} />
-                <ChartLegend content={<ChartLegendContent />} />
-                <Area
-                  type="monotone"
-                  dataKey="attempts"
-                  name="请求"
-                  stroke="var(--color-attempts)"
-                  fill="var(--color-attempts)"
-                  fillOpacity={0.15}
-                />
-              </AreaChart>
-            </ChartContainer>
-          </ChartCard>
-        </BlurFade>
-
-        <BlurFade delay={0.04}>
-          <ChartCard
-            title="Token Usage"
-            loading={periodData.isLoading}
-            total={totalTokens}
-            totalLabel="Total"
-          >
-            <ChartContainer config={chartConfig} className="h-72 w-full">
-              <AreaChart
-                data={periodRows}
-                margin={{ left: 8, right: 8, top: 8, bottom: 8 }}
-              >
-                <CartesianGrid strokeDasharray="3 3" vertical={false} />
-                <XAxis
-                  dataKey="bucket_start"
-                  stroke="currentColor"
-                  fontSize={12}
-                  tickLine={false}
-                  axisLine={false}
-                />
-                <YAxis
-                  stroke="currentColor"
-                  fontSize={12}
-                  tickLine={false}
-                  axisLine={false}
-                />
-                <ChartTooltip content={<ChartTooltipContent />} />
-                <ChartLegend content={<ChartLegendContent />} />
-                <Area
-                  type="monotone"
-                  dataKey="provider_reported_input_tokens"
-                  name="输入"
-                  stackId="tokens"
-                  stroke="var(--color-input)"
-                  fill="var(--color-input)"
-                  fillOpacity={0.3}
-                />
-                <Area
-                  type="monotone"
-                  dataKey="estimated_output_tokens"
-                  name="输出"
-                  stackId="tokens"
-                  stroke="var(--color-output)"
-                  fill="var(--color-output)"
-                  fillOpacity={0.3}
-                />
-                <Area
-                  type="monotone"
-                  dataKey="reasoning_tokens"
-                  name="推理"
-                  stackId="tokens"
-                  stroke="var(--color-reasoning)"
-                  fill="var(--color-reasoning)"
-                  fillOpacity={0.3}
-                />
-                <Area
-                  type="monotone"
-                  dataKey="cache_read_tokens"
-                  name="缓存"
-                  stackId="tokens"
-                  stroke="var(--color-cached)"
-                  fill="var(--color-cached)"
-                  fillOpacity={0.3}
-                />
-              </AreaChart>
-            </ChartContainer>
-          </ChartCard>
-        </BlurFade>
-
-        <BlurFade delay={0.08}>
-          <ChartCard
-            title="模型请求分布"
-            loading={modelData.isLoading}
-            total={totals.attempts}
-            totalLabel="Total"
-          >
-            <ChartContainer config={chartConfig} className="h-72 w-full">
-              <BarChart
-                data={modelRows.slice(0, 8)}
-                layout="vertical"
-                margin={{ left: 8, right: 8, top: 8, bottom: 8 }}
-              >
-                <CartesianGrid strokeDasharray="3 3" horizontal={false} />
-                <XAxis
-                  type="number"
-                  stroke="currentColor"
-                  fontSize={12}
-                  tickLine={false}
-                  axisLine={false}
-                />
-                <YAxis
-                  type="category"
-                  dataKey="bucket_start"
-                  width={160}
-                  stroke="currentColor"
-                  fontSize={12}
-                  tickLine={false}
-                  axisLine={false}
-                />
-                <ChartTooltip content={<ChartTooltipContent />} />
-                <Bar
-                  dataKey="attempts"
-                  name="请求"
-                  fill="var(--color-attempts)"
-                  radius={[0, 4, 4, 0]}
-                />
-              </BarChart>
-            </ChartContainer>
-          </ChartCard>
-        </BlurFade>
-
-        <BlurFade delay={0.12}>
-          <ChartCard
-            title="上游请求分布"
-            loading={upstreamData.isLoading}
-            total={totals.attempts}
-            totalLabel="Total"
-          >
-            <ChartContainer config={chartConfig} className="h-72 w-full">
-              <BarChart
-                data={upstreamRows.slice(0, 8)}
-                layout="vertical"
-                margin={{ left: 8, right: 8, top: 8, bottom: 8 }}
-              >
-                <CartesianGrid strokeDasharray="3 3" horizontal={false} />
-                <XAxis
-                  type="number"
-                  stroke="currentColor"
-                  fontSize={12}
-                  tickLine={false}
-                  axisLine={false}
-                />
-                <YAxis
-                  type="category"
-                  dataKey="bucket_start"
-                  width={160}
-                  stroke="currentColor"
-                  fontSize={12}
-                  tickLine={false}
-                  axisLine={false}
-                />
-                <ChartTooltip content={<ChartTooltipContent />} />
-                <Bar
-                  dataKey="attempts"
-                  name="请求"
-                  fill="var(--color-attempts)"
-                  radius={[0, 4, 4, 0]}
-                />
-              </BarChart>
-            </ChartContainer>
-          </ChartCard>
-        </BlurFade>
       </div>
 
-      <BlurFade delay={0.16}>
+      <div className="grid gap-3 lg:grid-cols-2">
         <ChartCard
-          title="Attempts 审计"
-          description="按关键词、结果与计费依据筛选。"
+          title="请求量"
+          loading={periodData.isLoading}
+          total={totals.attempts}
+          totalLabel="Total"
         >
-          <div className="mb-4 grid gap-3 md:grid-cols-4">
-            <div className="grid gap-2">
-              <Label htmlFor="attempt-keyword">关键词</Label>
-              <Input
-                id="attempt-keyword"
-                value={keyword}
-                onChange={(event) => setKeyword(event.target.value)}
+          <ChartContainer config={chartConfig} className="h-72 w-full">
+            <AreaChart
+              data={periodRows}
+              margin={{ left: 8, right: 8, top: 8, bottom: 8 }}
+            >
+              <CartesianGrid strokeDasharray="3 3" vertical={false} />
+              <XAxis
+                dataKey="bucket_start"
+                stroke="currentColor"
+                fontSize={12}
+                tickLine={false}
+                axisLine={false}
               />
-            </div>
-            <div className="grid gap-2">
-              <Label htmlFor="attempt-outcome">结果</Label>
-              <select
-                id="attempt-outcome"
-                className="min-h-11 border bg-background px-3 py-2 text-sm"
-                value={outcome}
-                onChange={(event) => setOutcome(event.target.value)}
-              >
-                <option value="all">全部</option>
-                <option value="completed">完成</option>
-                <option value="failed">失败</option>
-                <option value="cancelled">取消</option>
-                <option value="timed_out">超时</option>
-                <option value="interrupted">中断</option>
-              </select>
-            </div>
-            <div className="grid gap-2">
-              <Label htmlFor="attempt-basis">计费依据</Label>
-              <select
-                id="attempt-basis"
-                className="min-h-11 border bg-background px-3 py-2 text-sm"
-                value={basis}
-                onChange={(event) => setBasis(event.target.value)}
-              >
-                <option value="all">全部</option>
-                <option value="provider_reported">provider 上报</option>
-                <option value="estimated">本地估算</option>
-                <option value="mixed">混合</option>
-              </select>
-            </div>
-            <div className="flex items-end">
-              <Button size="sm" variant="outline" onClick={exportCsv}>
-                导出 CSV
-              </Button>
-            </div>
-          </div>
-          <Table>
-            <TableHeader>
-              <TableRow>
-                <TableHead>时间</TableHead>
-                <TableHead>模型</TableHead>
-                <TableHead>上游</TableHead>
-                <TableHead>尝试</TableHead>
-                <TableHead>结果</TableHead>
-                <TableHead>计费依据</TableHead>
-                <TableHead>错误</TableHead>
-              </TableRow>
-            </TableHeader>
-            <TableBody>
-              {filteredAttempts.map((attempt) => (
-                <TableRow key={attempt.id}>
-                  <TableCell>{attempt.started_at}</TableCell>
-                  <TableCell>{attempt.canonical_model_label ?? "-"}</TableCell>
-                  <TableCell>{attempt.upstream_label ?? "-"}</TableCell>
-                  <TableCell>
-                    {attempt.attempt_ordinal ?? 1}
-                    {attempt.fallback_trigger
-                      ? `（${attempt.fallback_trigger}）`
-                      : ""}
-                  </TableCell>
-                  <TableCell>{attempt.outcome}</TableCell>
-                  <TableCell>
-                    {attempt.reporting_basis === "provider_reported"
-                      ? "provider 上报"
-                      : attempt.reporting_basis === "mixed"
-                        ? "混合"
-                        : "本地估算"}
-                  </TableCell>
-                  <TableCell className="max-w-[320px]">
-                    {attempt.error_mapping_code ? (
-                      <div className="space-y-0.5">
-                        <div className="font-mono text-xs">
-                          {attempt.error_mapping_code}
-                        </div>
-                        {attempt.upstream_error_excerpt ? (
-                          <div
-                            className="truncate text-xs text-muted-foreground"
-                            title={attempt.upstream_error_excerpt}
-                          >
-                            {attempt.upstream_error_excerpt}
-                          </div>
-                        ) : null}
-                      </div>
-                    ) : (
-                      "-"
-                    )}
-                  </TableCell>
-                </TableRow>
-              ))}
-              {!filteredAttempts.length && !attempts.isLoading && (
-                <TableRow>
-                  <TableCell
-                    colSpan={7}
-                    className="text-center text-muted-foreground"
-                  >
-                    暂无匹配的用量记录。
-                  </TableCell>
-                </TableRow>
-              )}
-              {attempts.hasNextPage && (
-                <TableRow ref={loadMoreRef}>
-                  <TableCell
-                    colSpan={7}
-                    className="text-center text-muted-foreground"
-                  >
-                    {attempts.isFetchingNextPage
-                      ? "加载中…"
-                      : "滚动到底部加载更多"}
-                  </TableCell>
-                </TableRow>
-              )}
-            </TableBody>
-          </Table>
+              <YAxis
+                stroke="currentColor"
+                fontSize={12}
+                tickLine={false}
+                axisLine={false}
+              />
+              <ChartTooltip content={<ChartTooltipContent />} />
+              <ChartLegend content={<ChartLegendContent />} />
+              <Area
+                type="monotone"
+                dataKey="attempts"
+                name="请求"
+                stroke="var(--color-attempts)"
+                fill="var(--color-attempts)"
+                fillOpacity={0.15}
+              />
+            </AreaChart>
+          </ChartContainer>
         </ChartCard>
-      </BlurFade>
+        <ChartCard
+          title="Token Usage"
+          loading={periodData.isLoading}
+          total={totalTokens}
+          totalLabel="Total"
+        >
+          <ChartContainer config={chartConfig} className="h-72 w-full">
+            <AreaChart
+              data={periodRows}
+              margin={{ left: 8, right: 8, top: 8, bottom: 8 }}
+            >
+              <CartesianGrid strokeDasharray="3 3" vertical={false} />
+              <XAxis
+                dataKey="bucket_start"
+                stroke="currentColor"
+                fontSize={12}
+                tickLine={false}
+                axisLine={false}
+              />
+              <YAxis
+                stroke="currentColor"
+                fontSize={12}
+                tickLine={false}
+                axisLine={false}
+              />
+              <ChartTooltip content={<ChartTooltipContent />} />
+              <ChartLegend content={<ChartLegendContent />} />
+              <Area
+                type="monotone"
+                dataKey="provider_reported_input_tokens"
+                name="输入"
+                stackId="tokens"
+                stroke="var(--color-input)"
+                fill="var(--color-input)"
+                fillOpacity={0.3}
+              />
+              <Area
+                type="monotone"
+                dataKey="estimated_output_tokens"
+                name="输出"
+                stackId="tokens"
+                stroke="var(--color-output)"
+                fill="var(--color-output)"
+                fillOpacity={0.3}
+              />
+              <Area
+                type="monotone"
+                dataKey="reasoning_tokens"
+                name="推理"
+                stackId="tokens"
+                stroke="var(--color-reasoning)"
+                fill="var(--color-reasoning)"
+                fillOpacity={0.3}
+              />
+              <Area
+                type="monotone"
+                dataKey="cache_read_tokens"
+                name="缓存"
+                stackId="tokens"
+                stroke="var(--color-cached)"
+                fill="var(--color-cached)"
+                fillOpacity={0.3}
+              />
+            </AreaChart>
+          </ChartContainer>
+        </ChartCard>
+        <ChartCard
+          title="模型请求分布"
+          loading={modelData.isLoading}
+          total={totals.attempts}
+          totalLabel="Total"
+        >
+          <ChartContainer config={chartConfig} className="h-72 w-full">
+            <BarChart
+              data={modelRows.slice(0, 8)}
+              layout="vertical"
+              margin={{ left: 8, right: 8, top: 8, bottom: 8 }}
+            >
+              <CartesianGrid strokeDasharray="3 3" horizontal={false} />
+              <XAxis
+                type="number"
+                stroke="currentColor"
+                fontSize={12}
+                tickLine={false}
+                axisLine={false}
+              />
+              <YAxis
+                type="category"
+                dataKey="bucket_start"
+                width={160}
+                stroke="currentColor"
+                fontSize={12}
+                tickLine={false}
+                axisLine={false}
+              />
+              <ChartTooltip content={<ChartTooltipContent />} />
+              <Bar
+                dataKey="attempts"
+                name="请求"
+                fill="var(--color-attempts)"
+                radius={[0, 4, 4, 0]}
+              />
+            </BarChart>
+          </ChartContainer>
+        </ChartCard>
+        <ChartCard
+          title="上游请求分布"
+          loading={upstreamData.isLoading}
+          total={totals.attempts}
+          totalLabel="Total"
+        >
+          <ChartContainer config={chartConfig} className="h-72 w-full">
+            <BarChart
+              data={upstreamRows.slice(0, 8)}
+              layout="vertical"
+              margin={{ left: 8, right: 8, top: 8, bottom: 8 }}
+            >
+              <CartesianGrid strokeDasharray="3 3" horizontal={false} />
+              <XAxis
+                type="number"
+                stroke="currentColor"
+                fontSize={12}
+                tickLine={false}
+                axisLine={false}
+              />
+              <YAxis
+                type="category"
+                dataKey="bucket_start"
+                width={160}
+                stroke="currentColor"
+                fontSize={12}
+                tickLine={false}
+                axisLine={false}
+              />
+              <ChartTooltip content={<ChartTooltipContent />} />
+              <Bar
+                dataKey="attempts"
+                name="请求"
+                fill="var(--color-attempts)"
+                radius={[0, 4, 4, 0]}
+              />
+            </BarChart>
+          </ChartContainer>
+        </ChartCard>
+      </div>
+      <ChartCard
+        title="Attempts 审计"
+        description="按关键词、结果与计费依据筛选。"
+      >
+        <div className="mb-4 grid gap-3 md:grid-cols-4">
+          <div className="grid gap-2">
+            <Label htmlFor="attempt-keyword">关键词</Label>
+            <Input
+              id="attempt-keyword"
+              value={keyword}
+              onChange={(event) => setKeyword(event.target.value)}
+            />
+          </div>
+          <div className="grid gap-2">
+            <Label htmlFor="attempt-outcome">结果</Label>
+            <select
+              id="attempt-outcome"
+              className="h-8 rounded-lg border border-input bg-background px-2.5 text-sm shadow-xs/5 outline-none focus-visible:ring-2 focus-visible:ring-ring dark:bg-input/32"
+              value={outcome}
+              onChange={(event) => setOutcome(event.target.value)}
+            >
+              <option value="all">全部</option>
+              <option value="completed">完成</option>
+              <option value="failed">失败</option>
+              <option value="cancelled">取消</option>
+              <option value="timed_out">超时</option>
+              <option value="interrupted">中断</option>
+            </select>
+          </div>
+          <div className="grid gap-2">
+            <Label htmlFor="attempt-basis">计费依据</Label>
+            <select
+              id="attempt-basis"
+              className="h-8 rounded-lg border border-input bg-background px-2.5 text-sm shadow-xs/5 outline-none focus-visible:ring-2 focus-visible:ring-ring dark:bg-input/32"
+              value={basis}
+              onChange={(event) => setBasis(event.target.value)}
+            >
+              <option value="all">全部</option>
+              <option value="provider_reported">provider 上报</option>
+              <option value="estimated">本地估算</option>
+              <option value="mixed">混合</option>
+            </select>
+          </div>
+          <div className="flex items-end">
+            <Button size="sm" variant="outline" onClick={exportCsv}>
+              导出 CSV
+            </Button>
+          </div>
+        </div>
+        <Table>
+          <TableHeader>
+            <TableRow>
+              <TableHead>时间</TableHead>
+              <TableHead>模型</TableHead>
+              <TableHead>上游</TableHead>
+              <TableHead>尝试</TableHead>
+              <TableHead>结果</TableHead>
+              <TableHead>计费依据</TableHead>
+              <TableHead>错误</TableHead>
+            </TableRow>
+          </TableHeader>
+          <TableBody>
+            {filteredAttempts.map((attempt) => (
+              <TableRow key={attempt.id}>
+                <TableCell>{attempt.started_at}</TableCell>
+                <TableCell>{attempt.canonical_model_label ?? "-"}</TableCell>
+                <TableCell>{attempt.upstream_label ?? "-"}</TableCell>
+                <TableCell>
+                  {attempt.attempt_ordinal ?? 1}
+                  {attempt.fallback_trigger
+                    ? `（${attempt.fallback_trigger}）`
+                    : ""}
+                </TableCell>
+                <TableCell>{attempt.outcome}</TableCell>
+                <TableCell>
+                  {attempt.reporting_basis === "provider_reported"
+                    ? "provider 上报"
+                    : attempt.reporting_basis === "mixed"
+                      ? "混合"
+                      : "本地估算"}
+                </TableCell>
+                <TableCell className="max-w-[320px]">
+                  {attempt.error_mapping_code ? (
+                    <div className="space-y-0.5">
+                      <div className="font-mono text-xs">
+                        {attempt.error_mapping_code}
+                      </div>
+                      {attempt.upstream_error_excerpt ? (
+                        <div
+                          className="truncate text-xs text-muted-foreground"
+                          title={attempt.upstream_error_excerpt}
+                        >
+                          {attempt.upstream_error_excerpt}
+                        </div>
+                      ) : null}
+                    </div>
+                  ) : (
+                    "-"
+                  )}
+                </TableCell>
+              </TableRow>
+            ))}
+            {!filteredAttempts.length && !attempts.isLoading && (
+              <TableRow>
+                <TableCell
+                  colSpan={7}
+                  className="text-center text-muted-foreground"
+                >
+                  暂无匹配的用量记录。
+                </TableCell>
+              </TableRow>
+            )}
+            {attempts.hasNextPage && (
+              <TableRow ref={loadMoreRef}>
+                <TableCell
+                  colSpan={7}
+                  className="text-center text-muted-foreground"
+                >
+                  {attempts.isFetchingNextPage
+                    ? "加载中…"
+                    : "滚动到底部加载更多"}
+                </TableCell>
+              </TableRow>
+            )}
+          </TableBody>
+        </Table>
+      </ChartCard>
 
       <Overlay
         open={Boolean(retentionOpen)}

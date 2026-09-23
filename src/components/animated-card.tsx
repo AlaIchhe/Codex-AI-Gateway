@@ -1,18 +1,12 @@
 import type { ReactNode } from "react"
-import {
-  Card,
-  CardContent,
-  CardDescription,
-  CardHeader,
-  CardTitle,
-} from "@/components/coss/components/card"
-import { BlurFade } from "@/components/magicui/blur-fade"
 
+import { cn } from "@/lib/utils"
+
+/** 通用内容面板。名称与 `delay` 为兼容旧调用方保留，不再有动画。 */
 export function AnimatedCard({
   title,
   description,
   children,
-  delay = 0,
   contentClassName,
   className,
 }: {
@@ -24,16 +18,14 @@ export function AnimatedCard({
   className?: string
 }) {
   return (
-    <BlurFade className={className} delay={delay}>
-      <Card className="relative h-full overflow-hidden transition-all duration-300 hover:-translate-y-1 hover:shadow-lg">
-        <CardHeader>
-          <CardTitle>{title}</CardTitle>
-          {description ? (
-            <CardDescription>{description}</CardDescription>
-          ) : null}
-        </CardHeader>
-        <CardContent className={contentClassName}>{children}</CardContent>
-      </Card>
-    </BlurFade>
+    <section className={cn("rounded-lg border bg-card", className)}>
+      <header className="space-y-0.5 border-b px-4 py-3">
+        <h2 className="text-sm font-medium">{title}</h2>
+        {description ? (
+          <p className="text-xs text-muted-foreground">{description}</p>
+        ) : null}
+      </header>
+      <div className={cn("p-4", contentClassName)}>{children}</div>
+    </section>
   )
 }

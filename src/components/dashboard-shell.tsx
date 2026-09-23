@@ -1,60 +1,103 @@
 import { Link, Outlet } from "@tanstack/react-router"
 import {
-  BarChart3,
+  Blocks,
   Boxes,
+  ChartColumn,
+  CloudDownload,
+  LayoutGrid,
   Menu,
-  Network,
-  Package,
-  RefreshCw,
-  ShieldAlert,
+  Monitor,
+  Moon,
+  Server,
+  Sun,
+  Waypoints,
   X,
 } from "lucide-react"
 import { useState } from "react"
 import { Button } from "@/components/coss/components/button"
-import { AnimatedGridPattern } from "@/components/magicui/animated-grid-pattern"
-import { AnimatedShinyText } from "@/components/magicui/animated-shiny-text"
-import { AnimatedThemeToggler } from "@/components/magicui/animated-theme-toggler"
-import { LightRays } from "@/components/magicui/light-rays"
+import { useTheme } from "@/components/theme-provider"
 import { cn } from "@/lib/utils"
 
 const navigation = [
-  { to: "/", label: "总览", icon: Boxes },
-  { to: "/upstreams", label: "上游", icon: Network },
-  { to: "/models", label: "模型", icon: ShieldAlert },
-  { to: "/codex-plugins", label: "插件", icon: Package },
-  { to: "/usage", label: "用量", icon: BarChart3 },
-  { to: "/update", label: "更新", icon: RefreshCw },
+  { to: "/", label: "总览", icon: LayoutGrid },
+  { to: "/upstreams", label: "上游", icon: Server },
+  { to: "/models", label: "模型", icon: Boxes },
+  { to: "/codex-plugins", label: "插件", icon: Blocks },
+  { to: "/usage", label: "用量", icon: ChartColumn },
+  { to: "/update", label: "更新", icon: CloudDownload },
 ] as const
 
-function NavLinks({
-  className,
-  onNavigate,
-}: {
-  className?: string
-  onNavigate?: () => void
-}) {
+const THEME_ORDER = ["light", "dark", "system"] as const
+const THEME_META = {
+  light: { label: "浅色", icon: Sun },
+  dark: { label: "深色", icon: Moon },
+  system: { label: "跟随系统", icon: Monitor },
+} as const
+
+function ThemeToggle() {
+  const { theme, setTheme } = useTheme()
+  const meta = THEME_META[theme]
+  const Icon = meta.icon
+  const next =
+    THEME_ORDER[(THEME_ORDER.indexOf(theme) + 1) % THEME_ORDER.length]
   return (
-    <nav aria-label="管理导航" className={cn("grid gap-1", className)}>
-      {navigation.map((item) => {
-        const Icon = item.icon
-        return (
-          <Link
-            key={item.to}
-            to={item.to}
-            onClick={onNavigate}
-            activeProps={{
-              className:
-                "border-primary/40 bg-primary/10 text-primary shadow-[inset_0_1px_0_0_rgba(255,255,255,0.08)]",
-            }}
-            className="group relative flex items-center gap-3 rounded-xl border border-transparent px-3 py-2 text-sm text-muted-foreground transition-all duration-300 hover:border-border hover:bg-muted/70 hover:text-foreground"
-          >
-            <span className="absolute inset-y-2 left-0 w-px rounded-full bg-transparent transition-colors group-data-[status=active]:bg-primary" />
-            <Icon className="size-4 transition-transform duration-300 group-hover:-translate-y-0.5 group-hover:scale-105" />
-            <span>{item.label}</span>
-          </Link>
-        )
-      })}
+    <Button
+      type="button"
+      variant="ghost"
+      size="icon-sm"
+      aria-label={`主题：${meta.label}，切换为${THEME_META[next].label}`}
+      title={`主题：${meta.label}（按 D 切换）`}
+      onClick={() => setTheme(next)}
+      className="text-muted-foreground hover:text-foreground"
+    >
+      <Icon className="size-4" />
+    </Button>
+  )
+}
+
+function NavLinks({ onNavigate }: { onNavigate?: () => void }) {
+  return (
+    <nav aria-label="管理导航" className="grid gap-px">
+      {navigation.map(({ to, label, icon: Icon }) => (
+        <Link
+          key={to}
+          to={to}
+          onClick={onNavigate}
+          activeOptions={{ exact: to === "/" }}
+          className="flex h-8 items-center gap-2.5 rounded-md px-2 text-[13px] text-muted-foreground transition-colors hover:bg-sidebar-accent/60 hover:text-foreground data-[status=active]:bg-sidebar-accent data-[status=active]:font-medium data-[status=active]:text-foreground"
+        >
+          <Icon className="size-4 shrink-0" strokeWidth={1.75} />
+          {label}
+        </Link>
+      ))}
     </nav>
+  )
+}
+
+function Brand() {
+  return (
+    <Link to="/" className="flex items-center gap-2 px-2">
+      <span className="grid size-6 place-items-center rounded-md bg-foreground text-background">
+        <Waypoints className="size-3.5" strokeWidth={2.25} />
+      </span>
+      <span className="text-sm font-semibold tracking-tight">
+        Codex Gateway
+      </span>
+    </Link>
+  )
+}
+
+function TrustNote({ className }: { className?: string }) {
+  return (
+    <p
+      className={cn(
+        "flex items-start gap-2 px-2 text-xs leading-relaxed text-muted-foreground",
+        className,
+      )}
+    >
+      <span className="mt-1.5 size-1.5 shrink-0 rounded-full bg-warning" />
+      无鉴权控制模式，请仅在可信网络内使用。
+    </p>
   )
 }
 
@@ -62,90 +105,48 @@ export function DashboardShell() {
   const [mobileOpen, setMobileOpen] = useState(false)
 
   return (
-    <div className="relative min-h-dvh bg-background text-foreground">
-      <LightRays
-        count={5}
-        color="rgba(140, 180, 255, 0.12)"
-        blur={28}
-        speed={18}
-        className="fixed inset-0 -z-10"
-      />
-      <AnimatedGridPattern
-        numSquares={40}
-        maxOpacity={0.08}
-        className="fixed inset-0 -z-10 [mask-image:radial-gradient(ellipse_at_center,white,transparent_72%)]"
-      />
-
-      <div className="flex min-h-dvh">
-        <aside className="sticky top-0 hidden h-dvh w-64 shrink-0 flex-col overflow-hidden border-r bg-card/65 p-4  lg:flex">
-          <Link to="/" className="mb-6 flex items-center gap-3 rounded-xl p-2">
-            <span className="grid size-9 place-items-center rounded-xl bg-primary text-primary-foreground shadow-lg">
-              <Network className="size-5" />
-            </span>
-            <span className="font-heading text-base font-semibold tracking-tight">
-              Codex AI Gateway
-            </span>
-          </Link>
-
-          <NavLinks />
-
-          <div className="mt-auto rounded-xl border bg-background/70 p-3">
-            <p className="text-xs font-medium text-foreground">
-              无鉴权控制模式
-            </p>
-            <p className="mt-1 text-xs text-muted-foreground">
-              请仅在可信网络内使用。
-            </p>
-          </div>
-        </aside>
-
-        <div className="relative flex min-w-0 flex-1 flex-col">
-          <header className="sticky top-0 z-40 border-b bg-background/82 ">
-            <div className="mx-auto flex h-16 w-full max-w-7xl items-center justify-between gap-3 px-4">
-              <div className="flex items-center gap-2">
-                <Button
-                  type="button"
-                  variant="ghost"
-                  size="icon"
-                  aria-label={mobileOpen ? "关闭导航" : "打开导航"}
-                  className="lg:hidden"
-                  onClick={() => setMobileOpen((open) => !open)}
-                >
-                  {mobileOpen ? (
-                    <X className="size-4" />
-                  ) : (
-                    <Menu className="size-4" />
-                  )}
-                </Button>
-                <Link
-                  to="/"
-                  className="flex items-center gap-2 font-semibold lg:hidden"
-                >
-                  <Network className="size-4" />
-                  Gateway
-                </Link>
-                <AnimatedShinyText className="hidden text-sm sm:block">
-                  管理 · 路由 · 用量审计
-                </AnimatedShinyText>
-              </div>
-              <AnimatedThemeToggler className="grid size-9 place-items-center rounded-full border text-foreground/80 transition-colors hover:bg-muted hover:text-foreground [&_svg]:size-4" />
-            </div>
-          </header>
-
-          {mobileOpen ? (
-            <div className="border-b bg-background/92 px-4 py-3  lg:hidden">
-              <NavLinks onNavigate={() => setMobileOpen(false)} />
-            </div>
-          ) : null}
-
-          <main className="mx-auto w-full max-w-7xl flex-1 px-4 py-6">
-            <Outlet />
-          </main>
-
-          <footer className="border-t bg-background/70 px-4 py-3 text-center text-xs text-muted-foreground ">
-            无鉴权控制模式：管理端有意不设登录，请在可信网络内使用。
-          </footer>
+    <div className="flex min-h-dvh bg-background text-foreground">
+      <aside className="sticky top-0 hidden h-dvh w-56 shrink-0 flex-col gap-6 border-r border-sidebar-border bg-sidebar px-3 py-4 lg:flex">
+        <div className="flex items-center justify-between">
+          <Brand />
+          <ThemeToggle />
         </div>
+        <NavLinks />
+        <TrustNote className="mt-auto" />
+      </aside>
+
+      <div className="flex min-w-0 flex-1 flex-col">
+        <header className="sticky top-0 z-40 flex h-12 items-center justify-between border-b bg-background/80 px-3 backdrop-blur-md lg:hidden">
+          <div className="flex items-center gap-1">
+            <Button
+              type="button"
+              variant="ghost"
+              size="icon-sm"
+              aria-label={mobileOpen ? "关闭导航" : "打开导航"}
+              aria-expanded={mobileOpen}
+              onClick={() => setMobileOpen((open) => !open)}
+            >
+              {mobileOpen ? (
+                <X className="size-4" />
+              ) : (
+                <Menu className="size-4" />
+              )}
+            </Button>
+            <Brand />
+          </div>
+          <ThemeToggle />
+        </header>
+
+        {mobileOpen ? (
+          <div className="grid gap-4 border-b bg-sidebar px-3 py-3 lg:hidden">
+            <NavLinks onNavigate={() => setMobileOpen(false)} />
+            <TrustNote />
+          </div>
+        ) : null}
+
+        <main className="mx-auto w-full max-w-6xl flex-1 px-4 py-8 sm:px-8 lg:py-10">
+          <Outlet />
+        </main>
       </div>
     </div>
   )
