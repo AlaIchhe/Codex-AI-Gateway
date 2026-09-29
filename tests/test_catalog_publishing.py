@@ -30,10 +30,12 @@ from codex_ai_gateway.services.catalog_publishing import (
     _metadata_from_upstream,
     _official_slug,
     _provider_family_slug,
+    build_catalog_response,
     compact_catalog_history,
     evaluate_fields,
     load_published_model_infos,
     routable_slug_key,
+    validate_catalog_response,
 )
 from codex_ai_gateway.util import utc_now, uuid7
 
@@ -223,6 +225,55 @@ def test_fallback_publication_uses_provider_model_id() -> None:
     assert info["slug"] == "deepseek-v4.1-flash"
     assert info["model_id"] == "deepseek-v4.1-flash"
     assert info["reasoning_effort"] == "medium"
+    # 上游声明的 1M 窗口不可信（见下方 auto_compact 回归），发布条目必须自带保守阈值。
+    assert info["auto_compact_token_limit"] == 200_000
+
+
+def test_catalog_publishes_conservative_auto_compact_limit() -> None:
+    """上游声明的 context_window 不可信时，自动压缩阈值必须保守。
+
+    command ai 的 deepseek-v4.1-flash 声明 1M 窗口，实测 prompt ≈216k 就被上游
+    以不透明 400 拒绝（CommandCodeAI/command-code#952）。官方默认阈值是
+    ``0.9 × context_window``（≈943k），会话会在压缩之前撞墙，而且客户端识别不出
+    该错误、永远不会 compact，于是会话永久卡死。
+    """
+    doc = build_catalog_response(
+        [
+            {
+                "slug": "huge-window",
+                "name": "huge-window",
+                "model_id": "huge-window",
+                "context_window": 1_048_576,
+                "reasoning_levels": ["medium"],
+                "reasoning_effort": "medium",
+                "input_modalities": ["text"],
+                "output_modalities": ["text"],
+                "tools": True,
+                "tool_choice": True,
+                "structured_output": True,
+            },
+            {
+                "slug": "small-window",
+                "name": "small-window",
+                "model_id": "small-window",
+                "context_window": 128_000,
+                "reasoning_levels": ["medium"],
+                "reasoning_effort": "medium",
+                "input_modalities": ["text"],
+                "output_modalities": ["text"],
+                "tools": True,
+                "tool_choice": True,
+                "structured_output": True,
+            },
+        ]
+    )
+    validate_catalog_response(doc)
+    entries = {item["slug"]: item for item in doc["models"]}
+
+    # 大窗口：截到保守上限，保证「prompt + 预留输出」不会超出上游真实容量。
+    assert entries["huge-window"]["auto_compact_token_limit"] == 200_000
+    # 小窗口：不放大也不截断，仍按 0.9 × 窗口。
+    assert entries["small-window"]["auto_compact_token_limit"] == 115_200
 
 
 def test_openrouter_candidate_evidence_source_stays_openrouter() -> None:

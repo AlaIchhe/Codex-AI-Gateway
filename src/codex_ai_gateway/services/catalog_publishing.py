@@ -1108,6 +1108,9 @@ def _build_model_info(
         "name": candidate.proposed_alias_slug,
         "model_id": model_id,
         "context_window": context_window,
+        # 上游声明的窗口不可信（见 AUTO_COMPACT_TOKEN_LIMIT_CAP）：发布条目自带
+        # 保守阈值，客户端才不会在压缩之前就撞上上游的隐形上限。
+        "auto_compact_token_limit": auto_compact_token_limit(context_window),
         "reasoning_levels": reasoning_levels,
         "reasoning_effort": reasoning_effort,
         "input_modalities": _codex_supported_modalities(metadata.get("input_modality") or ["text"]),
@@ -1150,6 +1153,23 @@ async def fetch_upstream_metadata(
 # config.toml 受管 model_provider 承担，目录条目不承载路由或凭据。
 # ---------------------------------------------------------------------------
 
+# 自动压缩阈值的保守上限。
+#
+# Codex 在采样前压缩历史，触发点是 ``auto_compact_token_limit``；该字段缺省时
+# 官方算法退化为 ``0.9 × resolved_context_window``
+# （codex-rs/protocol/src/openai_models.rs: auto_compact_token_limit）。上游声明的
+# 窗口普遍不可信：command ai 的 deepseek-v4.1-flash 声明 1M，实测 prompt ≈216k
+# 即被不透明 400 拒绝（CommandCodeAI/command-code#952：真实约束是
+# prompt_tokens + max_completion_tokens ≲ 645k，且 212k 起已非确定性失败）。
+# 声明窗口不可信时，只有保守阈值能让客户端在撞墙前自己压缩。
+AUTO_COMPACT_TOKEN_LIMIT_CAP = 200_000
+
+
+def auto_compact_token_limit(context_window: int) -> int:
+    """0.9 × 窗口与保守上限取小值。小窗口模型不受上限影响。"""
+    return min((int(context_window) * 9) // 10, AUTO_COMPACT_TOKEN_LIMIT_CAP)
+
+
 OFFICIAL_MODEL_INFO_REQUIRED = [
     "slug",
     "display_name",
@@ -1171,6 +1191,7 @@ OFFICIAL_MODEL_INFO_REQUIRED = [
     "supports_reasoning_summaries",
     "supports_search_tool",
     "upgrade",
+    "auto_compact_token_limit",
 ]
 
 OFFICIAL_MODEL_INFO_FORBIDDEN = {"provider", "base_url", "env_key", "id", "name", "model_id"}
@@ -1290,6 +1311,11 @@ def _official_model_info(info: dict[str, Any]) -> dict[str, Any]:
         "context_window": context_window,
         "max_context_window": context_window,
         "effective_context_window_percent": 95,
+        # 显式给出自动压缩阈值：官方缺省是 0.9 × 窗口，对大窗口模型等于不设防。
+        # 历史发布资产里没有该字段，这里按窗口现算，不需要数据迁移。
+        "auto_compact_token_limit": int(
+            info.get("auto_compact_token_limit") or auto_compact_token_limit(context_window)
+        ),
         "input_modalities": _codex_supported_modalities(info.get("input_modalities") or ["text"]),
         "experimental_supported_tools": [],
         "base_instructions": str(info.get("base_instructions") or DEFAULT_BASE_INSTRUCTIONS),

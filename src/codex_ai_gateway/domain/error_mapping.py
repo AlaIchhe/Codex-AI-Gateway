@@ -91,6 +91,14 @@ _CONTEXT_LENGTH_HINTS = (
 # 它是模型级事实（套餐没这个模型），不是账号级鉴权失败，必须单独识别，
 # 否则会被 403 分支吞掉成 provider 级 authentication。
 _NOT_IN_PLAN_MARKERS = ("model_not_in_plan", "not_in_plan")
+# 「不透明 400」：上游只回一个 trace_id，既不指字段（param）也不给错误码。
+# command ai 的 deepseek-v4.1-flash 在超长上下文下就是这么拒绝的：
+# ``{"error":{"message":"invalid request error trace_id: ...","type":...}}``
+# （CommandCodeAI/command-code#952）。客户端读不出任何信息，只能永久卡死。
+_OPAQUE_INVALID_REQUEST_HINTS = ("trace_id", "invalid request error")
+# 只有请求本身已经很大时才敢按上下文超限解释：短请求的同类错误更像真的形状问题，
+# 猜错会白白触发一次压缩（要花钱）。
+_OPAQUE_CONTEXT_MIN_PROMPT_TOKENS = 100_000
 # 「上游内容审查拒收」：与请求格式无关，是上游对整包上下文做的内容判定。
 # 各家措辞完全不统一（DeepSeek / command ai 用 Content Exists Risk，DashScope
 # 用 DataInspectionFailed，Azure 用 ResponsibleAIPolicyViolation），这里尽量覆盖。
@@ -155,17 +163,77 @@ def _provider_error_code(body: bytes | str | None) -> str | None:
     return None
 
 
+def _is_opaque_invalid_request(body: bytes | str | None) -> bool:
+    """判断正文是不是「只有 trace_id 的不透明无效请求错误」。
+
+    判据（缺一不可）：
+
+    * 同时出现 ``trace_id`` 与 ``invalid request error`` 这类无信息量措辞；
+    * 正文里没有 ``code`` / ``param``——上游只要能指出具体字段或错误码，
+      就说明它说清楚了，不属于不透明，不能替它改成上下文超限。
+    """
+    text = _body_text(body)
+    if not text:
+        return False
+    lowered = text.lower()
+    if any(hint not in lowered for hint in _OPAQUE_INVALID_REQUEST_HINTS):
+        return False
+    try:
+        payload = json.loads(text)
+    except ValueError:
+        return False
+    if not isinstance(payload, dict):
+        return False
+    error = payload.get("error")
+    nodes = [payload, error] if isinstance(error, dict) else [payload]
+    for node in nodes:
+        if node.get("param") or node.get("code"):
+            return False
+        # 有些上游把真正的错误包成 JSON 字符串塞进 message：里面点名了字段或
+        # 错误码时同样不算不透明。
+        inner = node.get("message")
+        if isinstance(inner, str):
+            try:
+                nested = json.loads(inner)
+            except ValueError:
+                continue
+            if isinstance(nested, dict) and (nested.get("param") or nested.get("code")):
+                return False
+    return True
+
+
+def looks_like_context_length(text: bytes | str | None) -> bool:
+    """上游自述这是「上下文超限」。
+
+    服务于流内错误：上游先回 200 建立 SSE，再把错误塞进数据帧。此时没有状态码
+    也没有可信的请求大小，只能认上游自己的措辞。识别不出来就退化成普通上游错误
+    （宁可少压缩一次，也不要凭空让客户端丢弃一半历史）。
+    """
+    lowered = _body_text(text).lower()
+    if not lowered:
+        return False
+    if any(hint in lowered for hint in _CONTEXT_LENGTH_HINTS):
+        return True
+    return any(code in lowered for code in _CONTEXT_LENGTH_CODES)
+
+
 def map_provider_error(
     status_code: int,
     *,
     body: bytes | str | None = None,
     error_text: str | None = None,
     upstream_name: str | None = None,
+    prompt_tokens_estimate: int | None = None,
 ) -> dict[str, Any]:
     """将上游 HTTP 状态映射为稳定 provider 错误类别。
 
     上游名会附加到所有错误消息前；400/其他未分类状态透传上游原始
-    错误正文，不做二次解读。
+    错误正文，不做二次解读——只有「只有 trace_id 的不透明错误」是例外：
+    连同请求长度证据在内，它按上下文超限上报，好让客户端压缩后重试。
+
+    ``prompt_tokens_estimate`` 是出站请求的粗略 prompt token 估算，用于判断
+    不透明错误是否到了「只可能是上下文超限」的量级；None 表示没有长度证据，
+    此时不做猜测。
     """
     text = _body_text(body)
     prefix = f"[{upstream_name}] " if upstream_name else ""
@@ -190,6 +258,13 @@ def map_provider_error(
         provider_code in _CONTEXT_LENGTH_CODES
         or any(hint in lowered_text for hint in _CONTEXT_LENGTH_HINTS)
     )
+    opaque_context_overflow = (
+        not context_length_exceeded
+        and status_code in {400, 422}
+        and (prompt_tokens_estimate or 0) >= _OPAQUE_CONTEXT_MIN_PROMPT_TOKENS
+        and _is_opaque_invalid_request(body)
+    )
+    context_length_exceeded = context_length_exceeded or opaque_context_overflow
     # 只在 4xx 上判定：5xx 正文里偶然出现「content policy」是上游自身故障，
     # 不该被当成用户请求的内容问题。
     content_policy_blocked = 400 <= status_code < 500 and (
@@ -242,7 +317,12 @@ def map_provider_error(
         error_type = ProviderErrorType.invalid_request
         code = "provider_context_length_exceeded"
         detail = text or error_text or ""
-        if detail:
+        if opaque_context_overflow:
+            message = (
+                f"{prefix}上游返回不透明错误（{status_code}），当前请求已达上下文上限量级，"
+                f"按上下文超限处理：{detail}"
+            )
+        elif detail:
             message = f"{prefix}上游判定上下文超限（{status_code}）：{detail}"
         else:
             message = f"{prefix}上游判定上下文超限（{status_code}），请压缩历史后重试。"

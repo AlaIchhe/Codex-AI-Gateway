@@ -13,7 +13,8 @@ import json
 from types import SimpleNamespace
 from typing import Any
 
-from codex_ai_gateway.api.gateway import _attempt_with_fallback
+from codex_ai_gateway.api.errors import GatewayError
+from codex_ai_gateway.api.gateway import _attempt_with_fallback, _terminal_error_rank
 from codex_ai_gateway.domain.circuit_breaker import (
     CircuitBreaker,
     CooldownScope,
@@ -293,8 +294,214 @@ def test_not_in_plan_is_target_scoped_even_though_status_is_403() -> None:
         code="provider_model_not_in_plan",
     )
     assert classification.scope is CooldownScope.target
-    assert classification.base_cooldown_seconds >= 3600.0
 
+
+# ---------------------------------------------------------------------------
+# 上下文超限必须走 SSE response.failed
+# ---------------------------------------------------------------------------
+
+# command ai 线上真实返回：HTTP 400 + 只有 trace_id 的不透明错误正文。
+OPAQUE_INVALID_REQUEST_BODY = json.dumps(
+    {
+        "error": {
+            "message": json.dumps(
+                {
+                    "message": "invalid request error trace_id: c758dc743a2d62901589d4ba728241df",
+                    "type": "invalid_request_error",
+                }
+            )
+            + "\n",
+            "type": "invalid_request_error",
+        }
+    }
+).encode()
+
+
+class _ErrorStreamResponse:
+    """上游在流式路径上直接返回 4xx 时的最小替身。"""
+
+    def __init__(self, status_code: int, body: bytes) -> None:
+        self.status_code = status_code
+        self.headers: dict[str, str] = {}
+        self._body = body
+
+    async def read_error_body(self) -> bytes:
+        return self._body
+
+    async def aclose(self) -> None:
+        return None
+
+
+class _StreamingClient(_Client):
+    async def open_stream(self, upstream: Any, **kwargs: Any) -> Any:
+        self.calls.append(str(kwargs.get("path")))
+        if self._responses:
+            return self._responses.pop(0)
+        raise AssertionError("测试未预置上游响应")
+
+
+def _sse_text(response: Any) -> str:
+    async def _drain() -> bytes:
+        chunks: list[bytes] = []
+        async for chunk in response.body_iterator:
+            chunks.append(chunk if isinstance(chunk, bytes) else str(chunk).encode())
+        return b"".join(chunks)
+
+    return asyncio.run(_drain()).decode()
+
+
+def test_context_length_terminal_error_becomes_sse_failed_event() -> None:
+    """Codex 只在 SSE response.failed 的 code=context_length_exceeded 上压缩历史。
+
+    裸 400 会被 Codex 的 api_bridge 一律映射成 InvalidRequest，客户端永远不会
+    compact，会话就永久卡死在「上游返回 400」。这里锁住的是「错误必须以 SSE
+    失败事件上报，且 code 是官方认识的那一个」。
+    """
+    client = _StreamingClient([_ErrorStreamResponse(400, OPAQUE_INVALID_REQUEST_BODY)])
+    runtime = _runtime(client)
+    upstream = _upstream()
+
+    response = asyncio.run(
+        _attempt_with_fallback(
+            request=SimpleNamespace(headers={}),
+            runtime=runtime,
+            canonical_id="canon-1",
+            candidates=[
+                (_offering(WireProtocol.chat_completions), upstream, WireProtocol.chat_completions)
+            ],
+            body={"model": "model-a", "input": "x" * 500_000, "stream": True},
+        )
+    )
+
+    assert response.status_code == 200
+    text = _sse_text(response)
+    assert "event: response.failed" in text
+    assert '"code": "context_length_exceeded"' in text
+    # 客户端只认官方 code，内部归类名不能漏进 SSE。
+    assert "provider_context_length_exceeded" not in text
+
+
+def test_context_length_non_stream_request_keeps_http_error() -> None:
+    """非流式请求没有 SSE 通道，保持 HTTP 400 + 我们自己的错误码。"""
+    client = _Client(
+        [SimpleNamespace(status_code=400, headers={}, body=OPAQUE_INVALID_REQUEST_BODY)]
+    )
+    runtime = _runtime(client)
+    upstream = _upstream()
+
+    response = asyncio.run(
+        _attempt_with_fallback(
+            request=SimpleNamespace(headers={}),
+            runtime=runtime,
+            canonical_id="canon-1",
+            candidates=[
+                (_offering(WireProtocol.chat_completions), upstream, WireProtocol.chat_completions)
+            ],
+            body={"model": "model-a", "input": "x" * 500_000},
+        )
+    )
+
+    payload = json.loads(bytes(response.body))
+    assert response.status_code == 400
+    assert payload["error"]["code"] == "provider_context_length_exceeded"
+
+
+class _InStreamError:
+    """上游先回 200，再把硬错误塞进 SSE 数据帧（部分渠道确实这么做）。"""
+
+    def __init__(self, frames: list[bytes]) -> None:
+        self.status_code = 200
+        self.headers = {"content-type": "text/event-stream"}
+        self._frames = frames
+
+    def __aiter__(self) -> Any:
+        async def _gen() -> Any:
+            for frame in self._frames:
+                yield frame
+
+        return _gen()
+
+    async def aclose(self) -> None:
+        return None
+
+
+def test_in_stream_context_error_reports_official_code() -> None:
+    """流内报错也要给出官方 code，否则客户端不会压缩历史。"""
+    payload = json.dumps(
+        {
+            "error": {
+                "code": "context_length_exceeded",
+                "message": "This model's maximum context length is 216000 tokens.",
+            }
+        }
+    )
+    client = _StreamingClient([_InStreamError([f"data: {payload}\n\n".encode()])])
+    runtime = _runtime(client)
+    upstream = _upstream()
+
+    response = asyncio.run(
+        _attempt_with_fallback(
+            request=SimpleNamespace(headers={}),
+            runtime=runtime,
+            canonical_id="canon-1",
+            candidates=[
+                (_offering(WireProtocol.chat_completions), upstream, WireProtocol.chat_completions)
+            ],
+            body={"model": "model-a", "input": "hi", "stream": True},
+        )
+    )
+
+    assert response.status_code == 200
+    text = _sse_text(response)
+    assert "event: response.failed" in text
+    assert '"code": "context_length_exceeded"' in text
+
+
+def test_in_stream_error_without_context_hint_stays_generic() -> None:
+    """流内错误认不出是上下文超限时，不能假装它是——客户端会白白丢弃历史。"""
+    payload = json.dumps({"error": {"code": "internal_error", "message": "boom"}})
+    client = _StreamingClient([_InStreamError([f"data: {payload}\n\n".encode()])])
+    runtime = _runtime(client)
+    upstream = _upstream()
+
+    response = asyncio.run(
+        _attempt_with_fallback(
+            request=SimpleNamespace(headers={}),
+            runtime=runtime,
+            canonical_id="canon-1",
+            candidates=[
+                (_offering(WireProtocol.chat_completions), upstream, WireProtocol.chat_completions)
+            ],
+            body={"model": "model-a", "input": "hi", "stream": True},
+        )
+    )
+
+    text = _sse_text(response)
+    assert '"code": "context_length_exceeded"' not in text
+    assert '"code": "upstream_error"' in text
+
+
+def test_terminal_error_prefers_context_length_over_rate_limit() -> None:
+    """上下文超限是唯一能由客户端自动修复的失败，必须优先上报。"""
+    context_length = GatewayError(
+        error_type="provider_error",
+        code="provider_context_length_exceeded",
+        message="上游判定上下文超限。",
+        status_code=400,
+        details={"provider_error_type": ProviderErrorType.invalid_request.value},
+    )
+    rate_limited = GatewayError(
+        error_type="provider_error",
+        code="provider_rate_limited",
+        message="上游已限流。",
+        status_code=429,
+        details={"provider_error_type": ProviderErrorType.rate_limit.value},
+    )
+    assert _terminal_error_rank(context_length) > _terminal_error_rank(rate_limited)
+
+
+def test_not_in_plan_failure_is_target_scoped_and_long_lived() -> None:
+    """403 套餐缺模型：按 target 记住，且不污染同一上游的其它模型。"""
     breaker = _breaker()
     breaker.record_failure(
         "u1",

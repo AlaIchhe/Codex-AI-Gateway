@@ -55,7 +55,11 @@ from codex_ai_gateway.domain.circuit_breaker import (
     FailureClassification,
     FailureDecision,
 )
-from codex_ai_gateway.domain.error_mapping import ERROR_EXCERPT_LIMIT, map_provider_error
+from codex_ai_gateway.domain.error_mapping import (
+    ERROR_EXCERPT_LIMIT,
+    looks_like_context_length,
+    map_provider_error,
+)
 from codex_ai_gateway.domain.routing import (
     RoutingError,
     resolve_canonical_model,
@@ -242,6 +246,7 @@ async def _attempt_with_fallback(
 ) -> Response:
     last_error: GatewayError | None = None
     last_retry_after: float | None = None
+    client_wants_stream = bool(body.get("stream"))
     # 命中「不在套餐内」的记录：见 _register_not_in_plan 的剔除规则。
     not_in_plan_seen: dict[tuple[str, str], set[WireProtocol]] = {}
     dead_targets: set[tuple[str, str]] = set()
@@ -325,6 +330,7 @@ async def _attempt_with_fallback(
                     status_code=status_code,
                     headers=error_headers,
                     body=error_body,
+                    prompt_tokens_estimate=estimate_prompt_tokens(chat_body),
                 )
                 if mapped.code == _NOT_IN_PLAN_CODE:
                     _register_not_in_plan(
@@ -400,6 +406,7 @@ async def _attempt_with_fallback(
                 headers={},
                 body=b"",
                 error=exc,
+                prompt_tokens_estimate=estimate_prompt_tokens(chat_body),
             )
             _remember_request_digest(event, protocol, chat_body)
             _finalize(
@@ -420,7 +427,12 @@ async def _attempt_with_fallback(
                 continue
             return mapped_response(mapped)
     if last_error:
-        return mapped_response(last_error, headers=_retry_after_headers(last_retry_after))
+        return _terminal_failure_response(
+            last_error,
+            model_label=str(body.get("model") or canonical_id),
+            streaming=client_wants_stream,
+            headers=_retry_after_headers(last_retry_after),
+        )
     return gateway_error_response(
         error_type="provider_error",
         code="no_available_upstream",
@@ -445,6 +457,11 @@ _TERMINAL_ERROR_RANK: dict[str, int] = {
 
 
 def _terminal_error_rank(mapped: GatewayError) -> int:
+    # 上下文超限排最高：它是唯一「客户端自己就能修好」的失败（压缩历史后重试），
+    # 但前提是我们把官方错误码原样送到客户端的 SSE 通道；被任何别的错误盖掉，
+    # 用户看到的就是一条无法自助解决的死路。
+    if mapped.code == _CONTEXT_LENGTH_CODE:
+        return 5
     return _TERMINAL_ERROR_RANK.get(str(mapped.details.get("provider_error_type", "")), 0)
 
 
@@ -503,7 +520,28 @@ def _request_digest(body: dict[str, Any]) -> dict[str, Any]:
         "tool_call_count": tool_call_count,
         "tool_count": len(body.get("tools") or []),
         "stream": bool(body.get("stream")),
+        # 长度证据：上游只回「不透明 400」时，只有请求本身多大能区分
+        # 「上下文超限」与「请求形状错误」。
+        "estimated_prompt_tokens": estimate_prompt_tokens(body),
+        "max_tokens": body.get("max_tokens"),
+        "payload_bytes": _payload_bytes(body),
     }
+
+
+def estimate_prompt_tokens(body: Any) -> int:
+    """出站请求的粗略 prompt token 估算（字符数 // 4）。
+
+    只用来判断「这个请求是不是已经大到只可能是上下文超限」，不参与计费与
+    展示。宁可略高估：上游真实 prompt_tokens 才是权威值，这里偏保守。
+    """
+    return _payload_bytes(body) // 4
+
+
+def _payload_bytes(body: Any) -> int:
+    try:
+        return len(json.dumps(body, ensure_ascii=False).encode("utf-8"))
+    except (TypeError, ValueError):
+        return 0
 
 
 # 上游对 reasoning 回放过敏时，400 正文里会出现的家族词（bifrost
@@ -652,8 +690,15 @@ def _record_upstream_failure(
     body: bytes,
     error: Exception | None = None,
     wire_protocol: WireProtocol | None = None,
+    prompt_tokens_estimate: int | None = None,
 ) -> tuple[GatewayError, FailureClassification]:
-    mapped = _mapped_error(status_code or 502, body, error=error, upstream=upstream)
+    mapped = _mapped_error(
+        status_code or 502,
+        body,
+        error=error,
+        upstream=upstream,
+        prompt_tokens_estimate=prompt_tokens_estimate,
+    )
     excerpt = mapped.details.get("upstream_error_excerpt")
     if excerpt:
         logger.warning(
@@ -679,6 +724,10 @@ def _record_upstream_failure(
 
 
 _NOT_IN_PLAN_CODE = "provider_model_not_in_plan"
+# 网关内部的上下文超限码。对外必须改写成官方 ``context_length_exceeded``，
+# 因为 Codex 只在 SSE ``response.failed`` 的官方码上压缩历史。
+_CONTEXT_LENGTH_CODE = "provider_context_length_exceeded"
+_CLIENT_CONTEXT_LENGTH_CODE = "context_length_exceeded"
 
 
 def _register_not_in_plan(
@@ -886,12 +935,14 @@ def _mapped_error(
     *,
     error: Exception | None = None,
     upstream: Any = None,
+    prompt_tokens_estimate: int | None = None,
 ) -> GatewayError:
     provider = map_provider_error(
         status_code,
         body=body,
         error_text=str(error) if error else None,
         upstream_name=getattr(upstream, "name", None),
+        prompt_tokens_estimate=prompt_tokens_estimate,
     )
     return GatewayError(
         error_type="provider_error",
@@ -926,6 +977,35 @@ def mapped_response(exc: GatewayError, *, headers: dict[str, str] | None = None)
     )
 
 
+def _terminal_failure_response(
+    exc: GatewayError,
+    *,
+    model_label: str,
+    streaming: bool,
+    headers: dict[str, str] | None = None,
+) -> Response:
+    """全部候选都失败后的最终响应。
+
+    上下文超限走流式通道时必须伪装成一次「SSE 里失败的响应」而不是 HTTP 4xx：
+    Codex 的 api_bridge 把裸 4xx 一律映射成 InvalidRequest，客户端永远不会
+    触发 compact，会话就永久卡在同一个错误上。只有 ``response.failed`` 事件里
+    的官方 ``context_length_exceeded`` 会驱动客户端压缩历史后重试。
+
+    非流式请求没有 SSE 通道，保持 HTTP 错误（客户端能直接看到我们的内部码）。
+    """
+    if streaming and exc.code == _CONTEXT_LENGTH_CODE:
+        event = response_failed_event(
+            model_label, exc.message, code=_CLIENT_CONTEXT_LENGTH_CODE
+        )
+        return StreamingResponse(
+            iter([response_sse(event)]),
+            status_code=200,
+            media_type="text/event-stream",
+            headers=headers,
+        )
+    return mapped_response(exc, headers=headers)
+
+
 async def _stream_response(
     request: Request,
     runtime: Runtime,
@@ -951,6 +1031,9 @@ async def _stream_response(
         accumulated_tool_calls: dict[int, dict[str, Any]] = {}
         last_usage: dict[str, Any] | None = None
         last_finish_reason: str | None = None
+        # 上游在流内自述的错误（`data: {"error": ...}`）：有些上游先回 200
+        # 建立 SSE，再把「上下文超限」这类硬错误塞进数据帧。
+        stream_error_text = ""
         emitted_tool_starts: set[int] = set()
         sse_buffer = SSEFrameBuffer()
         responses_passthrough = ResponsesPassthrough()
@@ -1008,6 +1091,13 @@ async def _stream_response(
                 events = sse_buffer.feed(chunk)
                 for parsed in events:
                     _absorb_reasoning(parsed)
+                    raw_error = parsed.get("error")
+                    if raw_error:
+                        stream_error_text = (
+                            raw_error
+                            if isinstance(raw_error, str)
+                            else json.dumps(raw_error, ensure_ascii=False)
+                        )
                     chunk_usage = parsed.get("usage")
                     if isinstance(chunk_usage, dict):
                         # 只保留非 null 的 usage：多数上游中途 chunk 为 null，
@@ -1075,6 +1165,13 @@ async def _stream_response(
             if is_chat:
                 for parsed in sse_buffer.flush():
                     _absorb_reasoning(parsed)
+                    raw_error = parsed.get("error")
+                    if raw_error:
+                        stream_error_text = (
+                            raw_error
+                            if isinstance(raw_error, str)
+                            else json.dumps(raw_error, ensure_ascii=False)
+                        )
                     chunk_usage = parsed.get("usage")
                     if isinstance(chunk_usage, dict):
                         last_usage = chunk_usage
@@ -1096,14 +1193,29 @@ async def _stream_response(
                 if last_finish_reason is None:
                     # 上游流在 finish_reason 之前结束（典型为中途断开）。
                     # 伪装成 completed 会让 Codex 误认为回答完整，按失败收尾。
-                    error_msg = "上游流式响应在 finish_reason 之前中断，无法保证回答完整。"
+                    context_overflow = looks_like_context_length(stream_error_text)
+                    if context_overflow:
+                        error_msg = (
+                            "上游在流内判定上下文超限，请压缩历史后重试："
+                            f"{stream_error_text}"
+                        )
+                    else:
+                        error_msg = "上游流式响应在 finish_reason 之前中断，无法保证回答完整。"
                     runtime.circuit_breaker.record_failure(
                         upstream.id,
                         event.provider_model_id,
-                        status_code=502,
+                        status_code=400 if context_overflow else 502,
                         wire_protocol=protocol,
-                        error_type=ProviderErrorType.upstream_fault.value,
-                        code="provider_upstream_fault",
+                        error_type=(
+                            ProviderErrorType.invalid_request.value
+                            if context_overflow
+                            else ProviderErrorType.upstream_fault.value
+                        ),
+                        code=(
+                            _CONTEXT_LENGTH_CODE
+                            if context_overflow
+                            else "provider_upstream_fault"
+                        ),
                         message=error_msg,
                     )
                     _finalize(
@@ -1111,11 +1223,24 @@ async def _stream_response(
                         event,
                         Outcome.failed,
                         mapped=_mapped_error(
-                            502, b"", error=RuntimeError(error_msg), upstream=upstream
+                            (400 if context_overflow else 502),
+                            stream_error_text.encode() if context_overflow else b"",
+                            error=RuntimeError(error_msg),
+                            upstream=upstream,
                         ),
-                        status_code=502,
+                        status_code=400 if context_overflow else 502,
                     )
-                    yield response_sse(response_failed_event(model_label, error_msg))
+                    yield response_sse(
+                        response_failed_event(
+                            model_label,
+                            error_msg,
+                            code=(
+                                _CLIENT_CONTEXT_LENGTH_CODE
+                                if context_overflow
+                                else "upstream_error"
+                            ),
+                        )
+                    )
                     return
 
                 # 纯 tool call 回合不产生空 assistant message，

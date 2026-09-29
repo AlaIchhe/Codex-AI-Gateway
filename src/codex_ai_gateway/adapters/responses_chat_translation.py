@@ -835,8 +835,15 @@ def response_hygiene_message_events(
 HYGIENE_ITEM_ID = "msg_gateway_hygiene"
 
 
-def response_failed_event(model: str, error_message: str) -> dict[str, Any]:
-    """mid-stream 错误时通知客户端。"""
+def response_failed_event(
+    model: str, error_message: str, *, code: str = "upstream_error"
+) -> dict[str, Any]:
+    """mid-stream 错误时通知客户端。
+
+    ``code`` 必须是 Codex 认识的官方错误码：客户端只在
+    ``response.failed`` 且 ``code == "context_length_exceeded"`` 时压缩历史，
+    其它码一律按不可恢复失败处理。
+    """
     return {
         "type": "response.failed",
         "response": {
@@ -845,7 +852,7 @@ def response_failed_event(model: str, error_message: str) -> dict[str, Any]:
             "model": model,
             "status": "failed",
             "error": {
-                "code": "upstream_error",
+                "code": code,
                 "message": error_message,
             },
         },

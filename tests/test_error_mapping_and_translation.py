@@ -342,3 +342,73 @@ def test_5xx_mentioning_content_policy_stays_upstream_fault():
     )
     assert mapped["error_mapping_code"] == "provider_upstream_fault"
     assert mapped["provider_error_type"] == "upstream_fault"
+
+
+# command ai 线上真实返回：HTTP 400，错误正文里只有 trace_id，没有 code/param，
+# 也不提长度。Codex 只能靠网关把它翻译成 context_length_exceeded 才会压缩历史。
+OPAQUE_INVALID_REQUEST_BODY = json.dumps(
+    {
+        "error": {
+            "message": json.dumps(
+                {
+                    "message": "invalid request error trace_id: c758dc743a2d62901589d4ba728241df",
+                    "type": "invalid_request_error",
+                }
+            )
+            + "\n",
+            "type": "invalid_request_error",
+        }
+    }
+)
+
+
+def test_opaque_400_on_large_prompt_maps_to_context_length():
+    """不透明 400 + 超大 prompt：必须按上下文超限上报，否则会话永久卡死。"""
+    mapped = map_provider_error(
+        400,
+        body=OPAQUE_INVALID_REQUEST_BODY,
+        upstream_name="command ai",
+        prompt_tokens_estimate=243_616,
+    )
+    assert mapped["error_mapping_code"] == "provider_context_length_exceeded"
+    assert mapped["provider_error_type"] == "invalid_request"
+    assert "上下文" in mapped["message"]
+
+
+def test_opaque_422_on_large_prompt_maps_to_context_length():
+    mapped = map_provider_error(
+        422,
+        body=OPAQUE_INVALID_REQUEST_BODY,
+        upstream_name="command ai",
+        prompt_tokens_estimate=216_540,
+    )
+    assert mapped["error_mapping_code"] == "provider_context_length_exceeded"
+
+
+def test_opaque_400_on_small_prompt_stays_invalid_request():
+    """短请求的不透明 400 不能猜成上下文超限：猜错会白烧一次压缩。"""
+    mapped = map_provider_error(
+        400,
+        body=OPAQUE_INVALID_REQUEST_BODY,
+        upstream_name="command ai",
+        prompt_tokens_estimate=1_500,
+    )
+    assert mapped["error_mapping_code"] == "provider_invalid_request"
+
+
+def test_opaque_400_without_size_evidence_stays_invalid_request():
+    mapped = map_provider_error(
+        400, body=OPAQUE_INVALID_REQUEST_BODY, upstream_name="command ai"
+    )
+    assert mapped["error_mapping_code"] == "provider_invalid_request"
+
+
+def test_plain_400_without_trace_id_is_not_context_length():
+    """普通 400（上游指出了具体字段）保留原样，不能被新分支吞掉。"""
+    mapped = map_provider_error(
+        400,
+        body=json.dumps({"error": {"message": "messages is required", "param": "messages"}}),
+        upstream_name="A",
+        prompt_tokens_estimate=500_000,
+    )
+    assert mapped["error_mapping_code"] == "provider_invalid_request"
