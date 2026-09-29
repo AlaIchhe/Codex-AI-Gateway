@@ -22,17 +22,23 @@ from codex_ai_gateway.adapters.protocol_normal_form import (
     validate_translatable,
 )
 from codex_ai_gateway.adapters.responses_chat_translation import (
+    HYGIENE_ITEM_ID,
+    HistoryHygiene,
     chat_request_from_normal,
+    relocate_tool_outputs_in_body,
     response_completed_event,
     response_content_part_done_events,
     response_created_event,
     response_failed_event,
     response_function_call_done_events,
+    response_hygiene_message_events,
+    response_hygiene_message_item,
     response_message_done_event,
     response_message_started_events,
     response_sse,
     response_tool_call_started_event,
     restore_namespace_tool_name,
+    strip_reasoning_content,
     translate_chat_chunk_to_response_event,
 )
 from codex_ai_gateway.adapters.responses_passthrough import ResponsesPassthrough
@@ -251,6 +257,7 @@ async def _attempt_with_fallback(
         event = _new_event(runtime, canonical_id, offering, upstream, protocol, ordinal)
         runtime.usage_log.create_pending(event)
         chat_body: dict[str, Any] | None = None
+        hygiene = HistoryHygiene()
         try:
             custom_tool_names: set[str] = set()
             namespace_tool_aliases: dict[str, dict[str, str]] = {}
@@ -258,91 +265,66 @@ async def _attempt_with_fallback(
                 normal = normalize_request(inbound_protocol="responses", body=body)
                 validate_translatable(normal)
                 chat_body = chat_request_from_normal(
-                    normal, target_model=offering.provider_model_id
+                    normal,
+                    target_model=offering.provider_model_id,
+                    hygiene=hygiene,
+                    reasoning_cache=_reasoning_cache(runtime),
                 )
                 custom_tool_names = normal.custom_tool_names
                 namespace_tool_aliases = normal.namespace_tool_aliases
             else:
                 chat_body = disable_unsupported_web_search(ensure_prefill_continuation(body))
+                # Responses 透传路径不丢东西，但同样要修「工具结果没紧跟调用」
+                # 的形态：上游对夹在中间的 developer / message item 直接 400。
+                chat_body = relocate_tool_outputs_in_body(chat_body, hygiene=hygiene)
+            _record_history_hygiene(event, upstream, offering, protocol, hygiene)
             streaming = bool(body.get("stream"))
             path = (
                 "/chat/completions"
                 if protocol == WireProtocol.chat_completions
                 else "/responses"
             )
-            if streaming:
-                upstream_stream = await runtime.upstream_client.open_stream(
-                    upstream,
-                    path=path,
-                    method="POST",
-                    json_body=chat_body,
-                    headers=_public_headers(request),
-                )
-                if upstream_stream.status_code >= 400:
-                    status_code = upstream_stream.status_code
-                    error_headers = dict(upstream_stream.headers)
-                    error_body = await upstream_stream.read_error_body()
-                    await upstream_stream.aclose()
-                    mapped, classification = _record_upstream_failure(
-                        runtime,
-                        upstream,
-                        offering.provider_model_id,
-                        wire_protocol=protocol,
-                        status_code=status_code,
-                        headers=error_headers,
-                        body=error_body,
-                    )
-                    if mapped.code == _NOT_IN_PLAN_CODE:
-                        _register_not_in_plan(
-                            runtime,
-                            upstream,
-                            offering,
-                            protocol,
-                            seen=not_in_plan_seen,
-                            dead=dead_targets,
-                        )
-                    if classification.reason == CONTENT_POLICY_REASON:
-                        content_blocked_upstreams.add(upstream.id)
-                    _remember_request_digest(event, protocol, chat_body)
-                    _finalize(
-                        runtime, event, Outcome.failed, mapped=mapped, status_code=status_code
-                    )
-                    if _should_hop(offering, classification, status_code):
-                        last_error = _prefer_terminal_error(last_error, mapped)
-                        last_retry_after = runtime.circuit_breaker.remaining(
-                            upstream.id,
-                            offering.provider_model_id,
-                            wire_protocol=protocol,
-                        )
-                        continue
-                    return mapped_response(mapped)
-                return await _stream_response(
-                    request,
-                    runtime,
-                    event,
-                    upstream,
-                    upstream_stream,
-                    protocol,
-                    offering,
-                    custom_tool_names=custom_tool_names,
-                    namespace_tool_aliases=namespace_tool_aliases,
-                )
-            result = await runtime.upstream_client.request(
+            public_headers = _public_headers(request)
+
+            outcome = await _send_upstream(
+                runtime,
                 upstream,
                 path=path,
-                method="POST",
-                json_body=chat_body,
-                headers=_public_headers(request),
+                streaming=streaming,
+                payload=chat_body,
+                headers=public_headers,
             )
-            if result.status_code >= 400:
+            if outcome[0] == "error" and _reasoning_replay_error(outcome[1], outcome[3]):
+                # bifrost fail-soft：400 且正文提到 reasoning 家族词时，剥掉
+                # reasoning_content 后对同一个目标重试一次。剥不掉就不重试，
+                # 避免把同一个 400 白打一遍（上游配额很贵）。
+                if strip_reasoning_content(chat_body):
+                    logger.warning(
+                        "上游拒绝 reasoning 回放，剥离 reasoning_content 后同目标重试一次: "
+                        "upstream=%s model=%s protocol=%s",
+                        upstream.name,
+                        offering.provider_model_id,
+                            protocol.value,
+                    )
+                    outcome = await _send_upstream(
+                        runtime,
+                        upstream,
+                        path=path,
+                        streaming=streaming,
+                        payload=chat_body,
+                        headers=public_headers,
+                    )
+
+            if outcome[0] == "error":
+                status_code, error_headers, error_body = outcome[1], outcome[2], outcome[3]
                 mapped, classification = _record_upstream_failure(
                     runtime,
                     upstream,
                     offering.provider_model_id,
                     wire_protocol=protocol,
-                    status_code=result.status_code,
-                    headers=result.headers,
-                    body=result.body,
+                    status_code=status_code,
+                    headers=error_headers,
+                    body=error_body,
                 )
                 if mapped.code == _NOT_IN_PLAN_CODE:
                     _register_not_in_plan(
@@ -357,9 +339,9 @@ async def _attempt_with_fallback(
                     content_blocked_upstreams.add(upstream.id)
                 _remember_request_digest(event, protocol, chat_body)
                 _finalize(
-                    runtime, event, Outcome.failed, mapped=mapped, status_code=result.status_code
+                    runtime, event, Outcome.failed, mapped=mapped, status_code=status_code
                 )
-                if _should_hop(offering, classification, result.status_code):
+                if _should_hop(offering, classification, status_code):
                     last_error = _prefer_terminal_error(last_error, mapped)
                     last_retry_after = runtime.circuit_breaker.remaining(
                         upstream.id,
@@ -368,10 +350,27 @@ async def _attempt_with_fallback(
                     )
                     continue
                 return mapped_response(mapped)
+
+            if outcome[0] == "stream":
+                return await _stream_response(
+                    request,
+                    runtime,
+                    event,
+                    upstream,
+                    outcome[1],
+                    protocol,
+                    offering,
+                    custom_tool_names=custom_tool_names,
+                    namespace_tool_aliases=namespace_tool_aliases,
+                    hygiene=hygiene,
+                )
+
+            result = outcome[1]
             runtime.circuit_breaker.record_success(
                 upstream.id, offering.provider_model_id, wire_protocol=protocol
             )
             _learn_protocol(runtime, upstream, offering, protocol)
+            _remember_reasoning_from_chat_completion(runtime, result.body, protocol)
             _finalize_success(runtime, event, result.body)
             return Response(
                 content=result.body,
@@ -505,6 +504,142 @@ def _request_digest(body: dict[str, Any]) -> dict[str, Any]:
         "tool_count": len(body.get("tools") or []),
         "stream": bool(body.get("stream")),
     }
+
+
+# 上游对 reasoning 回放过敏时，400 正文里会出现的家族词（bifrost
+# encryptedreasoning.go 的 reasoningTokenWords）。
+_REASONING_FAMILY_WORDS = ("encrypted", "reasoning", "thinking", "thought")
+
+
+def _reasoning_replay_error(status_code: int | None, error_body: bytes) -> bool:
+    """这个 400 是不是「上游不接受 reasoning 回放」？
+
+    等价于 bifrost ``shouldStripReasoningAfterClientError``：只看状态码 400 与
+    正文里的 reasoning 家族词，不做语义解析。判定故意做得窄——再宽一点就会开始
+    吞掉真正的请求错误，把一次本该失败并回落到备用上游的请求变成两次无效重试。
+    """
+    if status_code != 400 or not error_body:
+        return False
+    lowered = error_body.decode("utf-8", errors="ignore").lower()
+    return any(word in lowered for word in _REASONING_FAMILY_WORDS)
+
+
+def _reasoning_cache(runtime: Runtime) -> Any:
+    return getattr(runtime, "reasoning_cache", None)
+
+
+def _record_history_hygiene(
+    event: UsageEvent,
+    upstream: Upstream,
+    offering: Any,
+    protocol: WireProtocol,
+    hygiene: HistoryHygiene,
+) -> None:
+    """把翻译阶段的历史修复/丢弃同时写进日志与 UsageEvent。
+
+    MCP / skill / 插件在 Codex 侧的失败表现是「模型不再提那次调用」，用户没有
+    任何线索。丢弃 tool_call 必须留下可检索的痕迹：日志给运维，UsageEvent 给
+    管理端的事件详情。
+    """
+    if hygiene.is_empty:
+        return
+    event.history_hygiene = hygiene.digest()
+    if hygiene.dropped_tool_calls or hygiene.orphan_tool_outputs:
+        logger.warning(
+            "历史里的 tool_call 没有工具结果，已丢弃: upstream=%s model=%s protocol=%s "
+            "dropped=%s orphan_outputs=%s",
+            upstream.name,
+            offering.provider_model_id,
+            protocol.value,
+            [
+                f"{call.get('name') or '(unnamed)'}({call.get('call_id') or 'no-id'})"
+                for call in hygiene.dropped_tool_calls
+            ],
+            hygiene.orphan_tool_outputs,
+        )
+    elif hygiene.relocated_tool_outputs:
+        logger.info(
+            "工具结果邻接归一化: upstream=%s model=%s protocol=%s moved=%d",
+            upstream.name,
+            offering.provider_model_id,
+            protocol.value,
+            hygiene.relocated_tool_outputs,
+        )
+
+
+def _remember_reasoning(
+    runtime: Runtime, reasoning_text: str | None, call_ids: list[str]
+) -> None:
+    """把本轮真实 reasoning 按 call_id 存进回放缓存（内存，不落盘、不记日志）。"""
+    cache = _reasoning_cache(runtime)
+    if cache is None or not call_ids:
+        return
+    if not isinstance(reasoning_text, str) or not reasoning_text.strip():
+        return
+    for call_id in call_ids:
+        try:
+            cache.put(call_id, reasoning_text)
+        except Exception:  # noqa: BLE001 - 缓存是尽力而为，绝不能影响请求
+            return
+
+
+def _remember_reasoning_from_chat_completion(
+    runtime: Runtime, body: bytes, protocol: WireProtocol
+) -> None:
+    """非流式 Chat 成功响应里的 reasoning_content + tool_call ids。"""
+    if protocol != WireProtocol.chat_completions or not body:
+        return
+    try:
+        payload = json.loads(body)
+    except (TypeError, ValueError):
+        return
+    if not isinstance(payload, dict):
+        return
+    choices = payload.get("choices") or []
+    if not choices or not isinstance(choices[0], dict):
+        return
+    message = choices[0].get("message") or {}
+    if not isinstance(message, dict):
+        return
+    call_ids = [
+        str(call["id"])
+        for call in message.get("tool_calls") or []
+        if isinstance(call, dict) and call.get("id")
+    ]
+    _remember_reasoning(runtime, message.get("reasoning_content"), call_ids)
+
+
+async def _send_upstream(
+    runtime: Runtime,
+    upstream: Upstream,
+    *,
+    path: str,
+    streaming: bool,
+    payload: dict[str, Any],
+    headers: dict[str, str],
+) -> tuple[Any, ...]:
+    """把一次出站请求发给上游，返回统一的 outcome 元组。
+
+    ``("stream", stream)`` / ``("result", result)`` 表示可继续处理；
+    ``("error", status_code, headers, body)`` 表示上游返回了 4xx/5xx，
+    由调用方决定剔除、回落还是直接返给客户端。
+    """
+    if streaming:
+        stream = await runtime.upstream_client.open_stream(
+            upstream, path=path, method="POST", json_body=payload, headers=headers
+        )
+        if stream.status_code >= 400:
+            error_headers = dict(stream.headers)
+            error_body = await stream.read_error_body()
+            await stream.aclose()
+            return ("error", stream.status_code, error_headers, error_body)
+        return ("stream", stream)
+    result = await runtime.upstream_client.request(
+        upstream, path=path, method="POST", json_body=payload, headers=headers
+    )
+    if result.status_code >= 400:
+        return ("error", result.status_code, dict(result.headers), result.body)
+    return ("result", result)
 
 
 def _record_upstream_failure(
@@ -802,6 +937,7 @@ async def _stream_response(
     *,
     custom_tool_names: set[str] | None = None,
     namespace_tool_aliases: dict[str, dict[str, str]] | None = None,
+    hygiene: HistoryHygiene | None = None,
 ) -> Response:
     is_chat = protocol == WireProtocol.chat_completions
     model_label = event.canonical_model_label or event.provider_model_id
@@ -811,6 +947,7 @@ async def _stream_response(
         stream_initialized = False
         message_started = False
         accumulated_text = ""
+        accumulated_reasoning = ""
         accumulated_tool_calls: dict[int, dict[str, Any]] = {}
         last_usage: dict[str, Any] | None = None
         last_finish_reason: str | None = None
@@ -820,6 +957,15 @@ async def _stream_response(
         READ_TIMEOUT = 15  # seconds per tick → keepalive or error
         MAX_IDLE_TICKS = 8  # 8 × 15s = 120s without data → error
         keepalive_frame = b": keepalive\n\n"
+
+        def _absorb_reasoning(parsed: dict[str, Any]) -> None:
+            """累积上游回传的真实 reasoning，供下一轮回填（不写日志）。"""
+            nonlocal accumulated_reasoning
+            choices = parsed.get("choices") or [{}]
+            delta = ((choices[0] or {}) if choices else {}).get("delta") or {}
+            text = delta.get("reasoning_content")
+            if isinstance(text, str) and text:
+                accumulated_reasoning += text
 
         stream_iter = upstream_stream.__aiter__()
 
@@ -861,6 +1007,7 @@ async def _stream_response(
                 # Chat 协议：SSE 解析 + 翻译
                 events = sse_buffer.feed(chunk)
                 for parsed in events:
+                    _absorb_reasoning(parsed)
                     chunk_usage = parsed.get("usage")
                     if isinstance(chunk_usage, dict):
                         # 只保留非 null 的 usage：多数上游中途 chunk 为 null，
@@ -927,6 +1074,7 @@ async def _stream_response(
 
             if is_chat:
                 for parsed in sse_buffer.flush():
+                    _absorb_reasoning(parsed)
                     chunk_usage = parsed.get("usage")
                     if isinstance(chunk_usage, dict):
                         last_usage = chunk_usage
@@ -988,6 +1136,19 @@ async def _stream_response(
                 if message_started:
                     yield response_sse(response_message_done_event(accumulated_text))
 
+                # 网关自查告警：历史里有 tool_call 被丢弃时，必须让用户在这里
+                # 看见是哪一次 MCP / skill / 插件调用断了，而不是等模型「装作
+                # 没发生」。用一条独立的 assistant message 承载，output_index
+                # 取当前所有 item 之后，避免和模型真正的输出抢位置。
+                hygiene_notice = hygiene.notice_text() if hygiene is not None else None
+                if hygiene_notice:
+                    next_output_index = max(
+                        [0, *(index + 1 for index in accumulated_tool_calls)]
+                    ) + 1
+                    for hygiene_event in response_hygiene_message_events(
+                        HYGIENE_ITEM_ID, next_output_index, hygiene_notice
+                    ):
+                        yield response_sse(hygiene_event)
 
                 output_items: list[dict[str, Any]] = []
                 for i in sorted(accumulated_tool_calls):
@@ -1037,6 +1198,10 @@ async def _stream_response(
                         "role": "assistant",
                         "content": [{"type": "output_text", "text": accumulated_text, "annotations": []}],
                     })
+                if hygiene_notice:
+                    output_items.append(
+                        response_hygiene_message_item(HYGIENE_ITEM_ID, hygiene_notice)
+                    )
 
                 yield response_sse(
                     response_completed_event(
@@ -1047,6 +1212,15 @@ async def _stream_response(
                     )
                 )
 
+            _remember_reasoning(
+                runtime,
+                accumulated_reasoning,
+                [
+                    str(tool_call["id"])
+                    for tool_call in accumulated_tool_calls.values()
+                    if tool_call.get("id")
+                ],
+            )
             runtime.circuit_breaker.record_success(
                 upstream.id, event.provider_model_id, wire_protocol=protocol
             )

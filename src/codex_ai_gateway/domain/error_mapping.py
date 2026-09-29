@@ -124,7 +124,13 @@ _CONTENT_POLICY_HINTS = (
 
 
 def _provider_error_code(body: bytes | str | None) -> str | None:
-    """从上游响应体中提取 error.code / error.type。"""
+    """从上游响应体中提取错误码。
+
+    先看 OpenAI 风格的 ``{"error": {"code": ..., "type": ...}}``；再看把错误码
+    直接放在顶层的形状（Novita / 部分 OpenAI 兼容层：
+    ``{"message": "...", "type": "invalid_request_error"}``，带 trace_id）。
+    只认 ``error`` 包装会把这些上游的错误码全丢掉，正文里的具体信号就没了。
+    """
     text = _body_text(body)
     if not text:
         return None
@@ -140,6 +146,12 @@ def _provider_error_code(body: bytes | str | None) -> str | None:
             value = error.get(key)
             if isinstance(value, str) and value.strip():
                 return value.strip().lower()
+    for key in ("code", "type"):
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip().lower()
+    if isinstance(error, str) and error.strip():
+        return error.strip().lower()
     return None
 
 

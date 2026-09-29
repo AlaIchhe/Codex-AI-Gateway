@@ -387,6 +387,9 @@ class UsageEvent(BaseModel):
     upstream_error_excerpt: str | None = None
     # 出站请求形态摘要（chat 翻译路径才有）：定位跨上游历史被拒时是哪条消息。
     outbound_request_digest: dict[str, Any] | None = None
+    # 翻译阶段对历史做的修复/丢弃（含被丢掉的 tool_call）：MCP / skill / 插件
+    # 在 Codex 侧只表现为「模型不提那件事了」，没有这个字段就无法定位是哪一环断的。
+    history_hygiene: dict[str, Any] = Field(default_factory=dict)
     attempt_ordinal: int = 1
     fallback_trigger: str | None = None
     reporting_basis: ReportingBasis = ReportingBasis.estimated

@@ -236,6 +236,20 @@ export type UsageSummaryRow = {
   cache_read_tokens: number
 }
 
+export type DroppedToolCall = {
+  call_id?: string | null
+  name?: string | null
+}
+
+// 网关翻译历史时对工具调用做的修复/丢弃：MCP / skill / 插件在 Codex 侧只
+// 表现为「模型不提那件事了」，没有这个字段就无法定位是哪一环断的。
+export type HistoryHygiene = {
+  dropped_tool_calls?: DroppedToolCall[] | null
+  orphan_tool_outputs?: string[] | null
+  relocated_tool_outputs?: number | null
+  blank_assistant_messages?: number | null
+}
+
 export type UsageAttempt = {
   id: string
   started_at: string
@@ -250,6 +264,7 @@ export type UsageAttempt = {
   error_mapping_code?: string | null
   upstream_error_excerpt?: string | null
   outbound_request_digest?: Record<string, unknown> | null
+  history_hygiene?: HistoryHygiene | null
   tokens: Record<string, number>
 }
 

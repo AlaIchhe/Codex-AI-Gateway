@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from codex_ai_gateway.domain.circuit_breaker import CircuitBreaker
+from codex_ai_gateway.domain.reasoning_cache import ReasoningReplayCache
 from codex_ai_gateway.domain.upstream_client import UpstreamClient
 from codex_ai_gateway.integrations.secret_store import SecretStore
 from codex_ai_gateway.persistence.file_store import StateStore
@@ -27,6 +28,8 @@ class Runtime:
     circuit_breaker: CircuitBreaker
     updater: UpdateService
     signing_key: bytes
+    # 工具调用回合的真实 reasoning：只存内存，用于下一轮回填 reasoning_content。
+    reasoning_cache: ReasoningReplayCache = field(default_factory=ReasoningReplayCache)
 
     @classmethod
     def create(cls, data_dir: Path, *, secret_store: SecretStore | None = None) -> Runtime:

@@ -50,6 +50,40 @@ function compact(n: number): string {
   return String(n)
 }
 
+type DroppedToolCallLine = {
+  label: string
+  callId: string | null
+}
+
+// 被丢弃的 tool_call / 孤立工具结果：Codex 侧只看到「模型不提那个工具了」，
+// 这里把具体是哪一个 MCP / skill / 插件调用断了明确列出来。
+function droppedToolCalls(
+  hygiene: UsageAttempt["history_hygiene"],
+): DroppedToolCallLine[] {
+  if (!hygiene) return []
+  const lines: DroppedToolCallLine[] = (hygiene.dropped_tool_calls ?? []).map(
+    (call) => ({
+      label: call.name?.trim() || "(未命名工具)",
+      callId: call.call_id ?? null,
+    }),
+  )
+  for (const callId of hygiene.orphan_tool_outputs ?? []) {
+    lines.push({ label: "(孤立工具结果)", callId })
+  }
+  return lines
+}
+
+function droppedToolCallText(
+  hygiene: UsageAttempt["history_hygiene"],
+): string | null {
+  const lines = droppedToolCalls(hygiene)
+  if (!lines.length) return null
+  const detail = lines
+    .map((line) => (line.callId ? `${line.label}(${line.callId})` : line.label))
+    .join("、")
+  return `已丢弃 ${lines.length} 个没有配对的工具调用：${detail}`
+}
+
 export function UsagePage() {
   const [retentionOpen, setRetentionOpen] = useOverlaySearch("retention")
   const [retention, setRetention] = useState("30")
@@ -144,6 +178,7 @@ export function UsagePage() {
       attempt.error_mapping_code,
       attempt.upstream_error_excerpt,
       attempt.fallback_trigger,
+      droppedToolCallText(attempt.history_hygiene),
     ]
       .filter(Boolean)
       .join(" ")
@@ -166,6 +201,7 @@ export function UsagePage() {
       "计费依据",
       "错误映射",
       "上游错误正文",
+      "历史清理",
     ]
     const values = filteredAttempts.map((attempt: UsageAttempt) => [
       attempt.started_at,
@@ -178,6 +214,7 @@ export function UsagePage() {
       attempt.reporting_basis,
       attempt.error_mapping_code,
       attempt.upstream_error_excerpt,
+      droppedToolCallText(attempt.history_hygiene),
     ])
     const csvEscape = (value: unknown) =>
       `"${String(value ?? "").replaceAll('"', '""')}"`
@@ -478,46 +515,62 @@ export function UsagePage() {
             </TableRow>
           </TableHeader>
           <TableBody>
-            {filteredAttempts.map((attempt) => (
-              <TableRow key={attempt.id}>
-                <TableCell>{attempt.started_at}</TableCell>
-                <TableCell>{attempt.canonical_model_label ?? "-"}</TableCell>
-                <TableCell>{attempt.upstream_label ?? "-"}</TableCell>
-                <TableCell>
-                  {attempt.attempt_ordinal ?? 1}
-                  {attempt.fallback_trigger
-                    ? `（${attempt.fallback_trigger}）`
-                    : ""}
-                </TableCell>
-                <TableCell>{attempt.outcome}</TableCell>
-                <TableCell>
-                  {attempt.reporting_basis === "provider_reported"
-                    ? "provider 上报"
-                    : attempt.reporting_basis === "mixed"
-                      ? "混合"
-                      : "本地估算"}
-                </TableCell>
-                <TableCell className="max-w-[320px]">
-                  {attempt.error_mapping_code ? (
-                    <div className="space-y-0.5">
-                      <div className="font-mono text-xs">
-                        {attempt.error_mapping_code}
+            {filteredAttempts.map((attempt) => {
+              const hygieneWarning = droppedToolCallText(
+                attempt.history_hygiene,
+              )
+              return (
+                <TableRow key={attempt.id}>
+                  <TableCell>{attempt.started_at}</TableCell>
+                  <TableCell>{attempt.canonical_model_label ?? "-"}</TableCell>
+                  <TableCell>{attempt.upstream_label ?? "-"}</TableCell>
+                  <TableCell>
+                    {attempt.attempt_ordinal ?? 1}
+                    {attempt.fallback_trigger
+                      ? `（${attempt.fallback_trigger}）`
+                      : ""}
+                  </TableCell>
+                  <TableCell>{attempt.outcome}</TableCell>
+                  <TableCell>
+                    {attempt.reporting_basis === "provider_reported"
+                      ? "provider 上报"
+                      : attempt.reporting_basis === "mixed"
+                        ? "混合"
+                        : "本地估算"}
+                  </TableCell>
+                  <TableCell className="max-w-[320px]">
+                    {attempt.error_mapping_code || hygieneWarning ? (
+                      <div className="space-y-0.5">
+                        {attempt.error_mapping_code ? (
+                          <div className="font-mono text-xs">
+                            {attempt.error_mapping_code}
+                          </div>
+                        ) : null}
+                        {attempt.upstream_error_excerpt ? (
+                          <div
+                            className="truncate text-xs text-muted-foreground"
+                            title={attempt.upstream_error_excerpt}
+                          >
+                            {attempt.upstream_error_excerpt}
+                          </div>
+                        ) : null}
+                        {hygieneWarning ? (
+                          <div
+                            className="truncate text-xs font-medium text-amber-600 dark:text-amber-500"
+                            title={hygieneWarning}
+                            data-testid="history-hygiene-warning"
+                          >
+                            ⚠ {hygieneWarning}
+                          </div>
+                        ) : null}
                       </div>
-                      {attempt.upstream_error_excerpt ? (
-                        <div
-                          className="truncate text-xs text-muted-foreground"
-                          title={attempt.upstream_error_excerpt}
-                        >
-                          {attempt.upstream_error_excerpt}
-                        </div>
-                      ) : null}
-                    </div>
-                  ) : (
-                    "-"
-                  )}
-                </TableCell>
-              </TableRow>
-            ))}
+                    ) : (
+                      "-"
+                    )}
+                  </TableCell>
+                </TableRow>
+              )
+            })}
             {!filteredAttempts.length && !attempts.isLoading && (
               <TableRow>
                 <TableCell
