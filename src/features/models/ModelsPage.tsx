@@ -95,10 +95,16 @@ export function ModelsPage() {
   )
 
   function openPriority(modelId: string, upstreamNames: string[]) {
+    // 顺序只认后端：它已按「模型自定义 > 全局偏好 > 上游注册顺序」排好
+    // upstream_names。这里绝不能再拿上游列表自身的顺序去过滤——列表按注册
+    // 顺序返回，与优先级无关，那会把「opencode 在前」显示成注册顺序。
+    const idByName = new Map(
+      (upstreams.data ?? []).map((upstream) => [upstream.name, upstream.id]),
+    )
     setOrder(
-      upstreams.data
-        ?.filter((u) => upstreamNames.includes(u.name))
-        .map((u) => u.id) ?? [],
+      upstreamNames
+        .map((name) => idByName.get(name))
+        .filter((id): id is string => Boolean(id)),
     )
     setPriorityModel(modelId)
   }
@@ -126,8 +132,23 @@ export function ModelsPage() {
           <Button
             size="sm"
             variant="outline"
-            disabled={resetAllRouting.isPending || !hasCustomRouting}
-            onClick={() => setResetConfirmOpen(true)}
+            disabled={resetAllRouting.isPending}
+            title={
+              hasCustomRouting
+                ? undefined
+                : "所有模型都在继承全局偏好，没有可重置的自定义优先级。"
+            }
+            onClick={() => {
+              if (!hasCustomRouting) {
+                // 没有自定义排序时按钮不再是「点了没反应」的静默 disabled：
+                // 明确告诉用户当前没有可重置的东西。
+                toast.info(
+                  "所有模型都在继承全局偏好，没有可重置的自定义优先级。",
+                )
+                return
+              }
+              setResetConfirmOpen(true)
+            }}
           >
             <RotateCcw className="size-3.5" />
             {resetAllRouting.isPending ? "重置中…" : "重置为全局优先级"}
