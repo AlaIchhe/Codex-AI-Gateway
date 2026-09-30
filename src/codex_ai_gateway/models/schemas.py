@@ -222,3 +222,31 @@ class UpdateStatusView(BaseModel):
     retained_releases: int = 0
     started: bool | None = None
     message: str | None = None
+
+class CodexCliUpdateRequest(BaseModel):
+    force: bool = False
+
+
+class CodexCliStatusView(BaseModel):
+    """Codex CLI 探测与更新状态。"""
+
+    installed: bool
+    runnable: bool
+    installed_but_broken: bool = False
+    path: str | None = None
+    version: str | None = None
+    error: str | None = None
+    install_kind: str = "unknown"
+    latest_version: str | None = None
+    latest_source: str | None = None
+    last_check_at: str | None = None
+    last_check_error: str | None = None
+    update_available: bool = False
+    update_status: str = "idle"
+    update_target: str | None = None
+    update_started_at: str | None = None
+    update_finished_at: str | None = None
+    update_error: str | None = None
+    update_log: list[str] = []
+    started: bool | None = None
+    message: str | None = None

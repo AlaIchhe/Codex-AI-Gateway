@@ -15,7 +15,15 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
-from codex_ai_gateway.api import admin, catalog, codex_integration, gateway, update, usage
+from codex_ai_gateway.api import (
+    admin,
+    catalog,
+    codex_cli,
+    codex_integration,
+    gateway,
+    update,
+    usage,
+)
 from codex_ai_gateway.api.errors import problem_json
 from codex_ai_gateway.integrations.secret_store import SecretStore
 from codex_ai_gateway.persistence.file_store import init_data_dir
@@ -86,6 +94,7 @@ def create_app(
 
     app.include_router(admin.router)
     app.include_router(catalog.router)
+    app.include_router(codex_cli.router)
     app.include_router(codex_integration.router)
     app.include_router(codex_integration.rev_router)
     app.include_router(usage.router)

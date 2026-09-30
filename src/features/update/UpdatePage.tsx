@@ -13,6 +13,7 @@ import { toast } from "sonner"
 import { Badge } from "@/components/coss/components/badge"
 import { Button } from "@/components/coss/components/button"
 import { PageHeader } from "@/components/page-header"
+import { CodexCliCard } from "@/features/update/CodexCliCard"
 import { api, type UpdatePolicy } from "@/lib/api"
 import { cn } from "@/lib/utils"
 
@@ -326,6 +327,7 @@ export function UpdatePage() {
           </div>
         </div>
       </div>
+      <CodexCliCard />
     </section>
   )
 }

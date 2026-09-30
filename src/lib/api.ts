@@ -28,6 +28,29 @@ export type UpstreamCooldown = {
   until: string
 }
 
+export type CodexCliStatus = {
+  installed: boolean
+  runnable: boolean
+  installed_but_broken: boolean
+  path: string | null
+  version: string | null
+  error: string | null
+  install_kind: string
+  latest_version: string | null
+  latest_source: string | null
+  last_check_at: string | null
+  last_check_error: string | null
+  update_available: boolean
+  update_status: string
+  update_target: string | null
+  update_started_at: string | null
+  update_finished_at: string | null
+  update_error: string | null
+  update_log: string[]
+  started?: boolean | null
+  message?: string | null
+}
+
 export type UpdatePolicy = "auto" | "notify" | "pinned"
 
 export type UpdateStatus = {
@@ -438,6 +461,14 @@ export const api = {
     request<UpdateStatus>("/admin/update/check", { method: "POST" }),
   runUpdate: (force = false) =>
     request<UpdateStatus>("/admin/update/run", {
+      method: "POST",
+      body: JSON.stringify({ force }),
+    }),
+  getCodexCliStatus: () => request<CodexCliStatus>("/admin/codex-cli/status"),
+  checkCodexCli: () =>
+    request<CodexCliStatus>("/admin/codex-cli/check", { method: "POST" }),
+  updateCodexCli: (force = false) =>
+    request<CodexCliStatus>("/admin/codex-cli/update", {
       method: "POST",
       body: JSON.stringify({ force }),
     }),

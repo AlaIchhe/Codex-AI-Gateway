@@ -12,6 +12,7 @@ from codex_ai_gateway.domain.upstream_client import UpstreamClient
 from codex_ai_gateway.integrations.secret_store import SecretStore
 from codex_ai_gateway.persistence.file_store import StateStore
 from codex_ai_gateway.persistence.usage_log import UsageLog
+from codex_ai_gateway.services.codex_cli import CodexCliService
 from codex_ai_gateway.services.gateway_token import create_gateway_token, get_or_create_signing_key
 from codex_ai_gateway.services.updater import UpdateService
 
@@ -27,6 +28,7 @@ class Runtime:
     upstream_client: UpstreamClient
     circuit_breaker: CircuitBreaker
     updater: UpdateService
+    codex_cli: CodexCliService
     signing_key: bytes
     # 工具调用回合的真实 reasoning：只存内存，用于下一轮回填 reasoning_content。
     reasoning_cache: ReasoningReplayCache = field(default_factory=ReasoningReplayCache)
@@ -46,6 +48,7 @@ class Runtime:
             upstream_client=UpstreamClient(runtime_secret),
             circuit_breaker=CircuitBreaker(),
             updater=UpdateService(data_dir),
+            codex_cli=CodexCliService(data_dir),
             signing_key=signing_key,
         )
 
