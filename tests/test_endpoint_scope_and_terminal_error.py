@@ -300,7 +300,22 @@ def test_not_in_plan_is_target_scoped_even_though_status_is_403() -> None:
 # 上下文超限必须走 SSE response.failed
 # ---------------------------------------------------------------------------
 
+# 上游**显式**自述上下文超限（OpenAI/DeepSeek 家族的典型措辞）。
+CONTEXT_LENGTH_BODY = json.dumps(
+    {
+        "error": {
+            "message": (
+                "This model's maximum context length is 1000000 tokens. "
+                "However, you requested 1200000 tokens."
+            ),
+            "code": "context_length_exceeded",
+            "type": "invalid_request_error",
+        }
+    }
+).encode()
+
 # command ai 线上真实返回：HTTP 400 + 只有 trace_id 的不透明错误正文。
+# 上游没有给出任何显式原因，网关只能原样透传，绝不能替它改口成上下文超限。
 OPAQUE_INVALID_REQUEST_BODY = json.dumps(
     {
         "error": {
@@ -357,7 +372,7 @@ def test_context_length_terminal_error_becomes_sse_failed_event() -> None:
     compact，会话就永久卡死在「上游返回 400」。这里锁住的是「错误必须以 SSE
     失败事件上报，且 code 是官方认识的那一个」。
     """
-    client = _StreamingClient([_ErrorStreamResponse(400, OPAQUE_INVALID_REQUEST_BODY)])
+    client = _StreamingClient([_ErrorStreamResponse(400, CONTEXT_LENGTH_BODY)])
     runtime = _runtime(client)
     upstream = _upstream()
 
@@ -384,7 +399,7 @@ def test_context_length_terminal_error_becomes_sse_failed_event() -> None:
 def test_context_length_non_stream_request_keeps_http_error() -> None:
     """非流式请求没有 SSE 通道，保持 HTTP 400 + 我们自己的错误码。"""
     client = _Client(
-        [SimpleNamespace(status_code=400, headers={}, body=OPAQUE_INVALID_REQUEST_BODY)]
+        [SimpleNamespace(status_code=400, headers={}, body=CONTEXT_LENGTH_BODY)]
     )
     runtime = _runtime(client)
     upstream = _upstream()
@@ -404,6 +419,34 @@ def test_context_length_non_stream_request_keeps_http_error() -> None:
     payload = json.loads(bytes(response.body))
     assert response.status_code == 400
     assert payload["error"]["code"] == "provider_context_length_exceeded"
+
+
+def test_opaque_400_is_not_relabelled_as_context_length() -> None:
+    """不透明 400 不得被包装成 SSE response.failed(code=context_length_exceeded)。
+
+    包装会驱动客户端压缩历史后重试；如果上游的真实拒绝原因跟长度无关，用户
+    就要为一次无效压缩买单，而且重试必然再次失败（CommandCodeAI/command-code#952）。
+    """
+    client = _StreamingClient([_ErrorStreamResponse(400, OPAQUE_INVALID_REQUEST_BODY)])
+    runtime = _runtime(client)
+    upstream = _upstream()
+
+    response = asyncio.run(
+        _attempt_with_fallback(
+            request=SimpleNamespace(headers={}),
+            runtime=runtime,
+            canonical_id="canon-1",
+            candidates=[
+                (_offering(WireProtocol.chat_completions), upstream, WireProtocol.chat_completions)
+            ],
+            body={"model": "model-a", "input": "x" * 500_000, "stream": True},
+        )
+    )
+
+    assert response.status_code == 400
+    payload = json.loads(bytes(response.body))
+    assert payload["error"]["code"] == "provider_invalid_request"
+    assert "trace_id" in payload["error"]["message"]
 
 
 class _InStreamError:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import json
 
 import pytest
@@ -13,6 +14,12 @@ from codex_ai_gateway.adapters.protocol_normal_form import (
     validate_translatable,
 )
 from codex_ai_gateway.domain.error_mapping import map_provider_error
+
+
+def test_error_mapper_has_no_request_size_knob():
+    """错误分类只能读上游正文，不许再拿请求大小反推上游语义。"""
+    params = inspect.signature(map_provider_error).parameters
+    assert "prompt_tokens_estimate" not in params
 
 
 def test_400_passes_through_upstream_body_with_name():
@@ -345,7 +352,8 @@ def test_5xx_mentioning_content_policy_stays_upstream_fault():
 
 
 # command ai 线上真实返回：HTTP 400，错误正文里只有 trace_id，没有 code/param，
-# 也不提长度。Codex 只能靠网关把它翻译成 context_length_exceeded 才会压缩历史。
+# 也不提长度。上游没有给出任何「上下文超限」的证据，网关就不能替它改口。
+# 曾经这里靠「prompt 估算 ≥100k」反推成 context_length_exceeded，那是猜测，已删除。
 OPAQUE_INVALID_REQUEST_BODY = json.dumps(
     {
         "error": {
@@ -362,45 +370,32 @@ OPAQUE_INVALID_REQUEST_BODY = json.dumps(
 )
 
 
-def test_opaque_400_on_large_prompt_maps_to_context_length():
-    """不透明 400 + 超大 prompt：必须按上下文超限上报，否则会话永久卡死。"""
+@pytest.mark.parametrize("status_code", [400, 422])
+def test_opaque_invalid_request_is_passed_through_verbatim(status_code):
+    """上游只回 trace_id：没有显式证据就不许替上游改口。"""
     mapped = map_provider_error(
-        400,
-        body=OPAQUE_INVALID_REQUEST_BODY,
-        upstream_name="command ai",
-        prompt_tokens_estimate=243_616,
+        status_code, body=OPAQUE_INVALID_REQUEST_BODY, upstream_name="command ai"
+    )
+    assert mapped["error_mapping_code"] == "provider_invalid_request"
+    assert mapped["provider_error_type"] == "invalid_request"
+    assert "trace_id" in mapped["message"]
+
+
+@pytest.mark.parametrize(
+    ("status_code", "message"),
+    [
+        (400, "This model's maximum context length is 128000 tokens"),
+        (422, "prompt is too long"),
+        (413, "input is too long"),
+    ],
+)
+def test_context_length_requires_explicit_upstream_evidence(status_code, message):
+    """只有上游自己写出「上下文超限」，才允许映射成 context_length_exceeded。"""
+    mapped = map_provider_error(
+        status_code, body=json.dumps({"error": {"message": message}}), upstream_name="A"
     )
     assert mapped["error_mapping_code"] == "provider_context_length_exceeded"
     assert mapped["provider_error_type"] == "invalid_request"
-    assert "上下文" in mapped["message"]
-
-
-def test_opaque_422_on_large_prompt_maps_to_context_length():
-    mapped = map_provider_error(
-        422,
-        body=OPAQUE_INVALID_REQUEST_BODY,
-        upstream_name="command ai",
-        prompt_tokens_estimate=216_540,
-    )
-    assert mapped["error_mapping_code"] == "provider_context_length_exceeded"
-
-
-def test_opaque_400_on_small_prompt_stays_invalid_request():
-    """短请求的不透明 400 不能猜成上下文超限：猜错会白烧一次压缩。"""
-    mapped = map_provider_error(
-        400,
-        body=OPAQUE_INVALID_REQUEST_BODY,
-        upstream_name="command ai",
-        prompt_tokens_estimate=1_500,
-    )
-    assert mapped["error_mapping_code"] == "provider_invalid_request"
-
-
-def test_opaque_400_without_size_evidence_stays_invalid_request():
-    mapped = map_provider_error(
-        400, body=OPAQUE_INVALID_REQUEST_BODY, upstream_name="command ai"
-    )
-    assert mapped["error_mapping_code"] == "provider_invalid_request"
 
 
 def test_plain_400_without_trace_id_is_not_context_length():
@@ -409,6 +404,5 @@ def test_plain_400_without_trace_id_is_not_context_length():
         400,
         body=json.dumps({"error": {"message": "messages is required", "param": "messages"}}),
         upstream_name="A",
-        prompt_tokens_estimate=500_000,
     )
     assert mapped["error_mapping_code"] == "provider_invalid_request"

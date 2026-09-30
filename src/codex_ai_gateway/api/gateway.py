@@ -330,7 +330,6 @@ async def _attempt_with_fallback(
                     status_code=status_code,
                     headers=error_headers,
                     body=error_body,
-                    prompt_tokens_estimate=estimate_prompt_tokens(chat_body),
                 )
                 if mapped.code == _NOT_IN_PLAN_CODE:
                     _register_not_in_plan(
@@ -406,7 +405,6 @@ async def _attempt_with_fallback(
                 headers={},
                 body=b"",
                 error=exc,
-                prompt_tokens_estimate=estimate_prompt_tokens(chat_body),
             )
             _remember_request_digest(event, protocol, chat_body)
             _finalize(
@@ -520,21 +518,10 @@ def _request_digest(body: dict[str, Any]) -> dict[str, Any]:
         "tool_call_count": tool_call_count,
         "tool_count": len(body.get("tools") or []),
         "stream": bool(body.get("stream")),
-        # 长度证据：上游只回「不透明 400」时，只有请求本身多大能区分
-        # 「上下文超限」与「请求形状错误」。
-        "estimated_prompt_tokens": estimate_prompt_tokens(body),
         "max_tokens": body.get("max_tokens"),
+        # 纯粹的体积度量（字节），只用于事后对账，不参与任何错误分类。
         "payload_bytes": _payload_bytes(body),
     }
-
-
-def estimate_prompt_tokens(body: Any) -> int:
-    """出站请求的粗略 prompt token 估算（字符数 // 4）。
-
-    只用来判断「这个请求是不是已经大到只可能是上下文超限」，不参与计费与
-    展示。宁可略高估：上游真实 prompt_tokens 才是权威值，这里偏保守。
-    """
-    return _payload_bytes(body) // 4
 
 
 def _payload_bytes(body: Any) -> int:
@@ -544,22 +531,29 @@ def _payload_bytes(body: Any) -> int:
         return 0
 
 
-# 上游对 reasoning 回放过敏时，400 正文里会出现的家族词（bifrost
-# encryptedreasoning.go 的 reasoningTokenWords）。
-_REASONING_FAMILY_WORDS = ("encrypted", "reasoning", "thinking", "thought")
+# 上游拒绝 reasoning 回放时，正文里会**点名它不接受的那个字段**。判据只有一条：
+# 上游自己写明了 reasoning 字段本身。旧实现照搬 bifrost 的家族词表
+# （encrypted / reasoning / thinking / thought 出现在正文任意位置即命中），那是
+# 猜测：一个只是碰巧提到「thinking」的请求形状错误也会被当成回放问题，白打一次
+# 上游。识别不出来就按原样失败／回落，不替上游改口。
+_REASONING_REPLAY_MARKERS = (
+    "reasoning_content",
+    "reasoning content",
+    "encrypted reasoning",
+)
 
 
 def _reasoning_replay_error(status_code: int | None, error_body: bytes) -> bool:
     """这个 400 是不是「上游不接受 reasoning 回放」？
 
-    等价于 bifrost ``shouldStripReasoningAfterClientError``：只看状态码 400 与
-    正文里的 reasoning 家族词，不做语义解析。判定故意做得窄——再宽一点就会开始
-    吞掉真正的请求错误，把一次本该失败并回落到备用上游的请求变成两次无效重试。
+    只看状态码 400 与上游正文里是否点名 reasoning 字段本身，不做语义解析、不猜
+    家族词。判定故意做得窄——再宽一点就会开始吞掉真正的请求错误，把一次本该失败
+    并回落到备用上游的请求变成两次无效重试。
     """
     if status_code != 400 or not error_body:
         return False
     lowered = error_body.decode("utf-8", errors="ignore").lower()
-    return any(word in lowered for word in _REASONING_FAMILY_WORDS)
+    return any(marker in lowered for marker in _REASONING_REPLAY_MARKERS)
 
 
 def _reasoning_cache(runtime: Runtime) -> Any:
@@ -690,14 +684,12 @@ def _record_upstream_failure(
     body: bytes,
     error: Exception | None = None,
     wire_protocol: WireProtocol | None = None,
-    prompt_tokens_estimate: int | None = None,
 ) -> tuple[GatewayError, FailureClassification]:
     mapped = _mapped_error(
         status_code or 502,
         body,
         error=error,
         upstream=upstream,
-        prompt_tokens_estimate=prompt_tokens_estimate,
     )
     excerpt = mapped.details.get("upstream_error_excerpt")
     if excerpt:
@@ -935,14 +927,12 @@ def _mapped_error(
     *,
     error: Exception | None = None,
     upstream: Any = None,
-    prompt_tokens_estimate: int | None = None,
 ) -> GatewayError:
     provider = map_provider_error(
         status_code,
         body=body,
         error_text=str(error) if error else None,
         upstream_name=getattr(upstream, "name", None),
-        prompt_tokens_estimate=prompt_tokens_estimate,
     )
     return GatewayError(
         error_type="provider_error",

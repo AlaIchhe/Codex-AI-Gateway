@@ -1093,7 +1093,11 @@ def _build_model_info(
     context_window = _safe_positive_int(metadata.get("context_window"))
     if context_window is None:
         raise ValueError(f"候选 {candidate.id} 缺少有效的 context_window")
-    reasoning_levels = _reasoning_levels(metadata.get("reasoning")) or ["medium"]
+    reasoning_levels = _reasoning_levels(metadata.get("reasoning"))
+    if not reasoning_levels:
+        # 推理等级是上游声明的事实：没有证据就不发布（run_maintenance 已经把缺该
+        # 证据的候选拒掉），绝不本地补一个 "medium" 冒充上游能力。
+        raise ValueError(f"候选 {candidate.id} 缺少推理等级证据")
     # 默认等级优先取上游(default_effort)，缺失时用列表首个；补全场景无 default_effort 时用列表首个。
     reasoning_raw = metadata.get("reasoning")
     default_effort = None
@@ -1108,9 +1112,6 @@ def _build_model_info(
         "name": candidate.proposed_alias_slug,
         "model_id": model_id,
         "context_window": context_window,
-        # 上游声明的窗口不可信（见 AUTO_COMPACT_TOKEN_LIMIT_CAP）：发布条目自带
-        # 保守阈值，客户端才不会在压缩之前就撞上上游的隐形上限。
-        "auto_compact_token_limit": auto_compact_token_limit(context_window),
         "reasoning_levels": reasoning_levels,
         "reasoning_effort": reasoning_effort,
         "input_modalities": _codex_supported_modalities(metadata.get("input_modality") or ["text"]),
@@ -1153,23 +1154,14 @@ async def fetch_upstream_metadata(
 # config.toml 受管 model_provider 承担，目录条目不承载路由或凭据。
 # ---------------------------------------------------------------------------
 
-# 自动压缩阈值的保守上限。
+# 目录不写 ``auto_compact_token_limit``：那是客户端自己的推导
+# （codex-rs/protocol/src/openai_models.rs: 缺省 0.9 × resolved_context_window，
+# 给了值反而取 min 把窗口压小）。网关没有能力证明上游声明的 context_window
+# 不可信，塞一个本地算出来的阈值就是拿猜测冒充上游事实，已删除。
 #
-# Codex 在采样前压缩历史，触发点是 ``auto_compact_token_limit``；该字段缺省时
-# 官方算法退化为 ``0.9 × resolved_context_window``
-# （codex-rs/protocol/src/openai_models.rs: auto_compact_token_limit）。上游声明的
-# 窗口普遍不可信：command ai 的 deepseek-v4.1-flash 声明 1M，实测 prompt ≈216k
-# 即被不透明 400 拒绝（CommandCodeAI/command-code#952：真实约束是
-# prompt_tokens + max_completion_tokens ≲ 645k，且 212k 起已非确定性失败）。
-# 声明窗口不可信时，只有保守阈值能让客户端在撞墙前自己压缩。
-AUTO_COMPACT_TOKEN_LIMIT_CAP = 200_000
-
-
-def auto_compact_token_limit(context_window: int) -> int:
-    """0.9 × 窗口与保守上限取小值。小窗口模型不受上限影响。"""
-    return min((int(context_window) * 9) // 10, AUTO_COMPACT_TOKEN_LIMIT_CAP)
-
-
+# 同理不写 ``effective_context_window_percent``：客户端对该字段有 serde 默认值
+# （0.149.0 与 0.159.2 均为 ``default_effective_context_window_percent() = 95``），
+# 省略即等于 95，而网关自己写一个百分比只是在替客户端做它已经做过的决定。
 OFFICIAL_MODEL_INFO_REQUIRED = [
     "slug",
     "display_name",
@@ -1183,7 +1175,6 @@ OFFICIAL_MODEL_INFO_REQUIRED = [
     "additional_speed_tiers",
     "availability_nux",
     "default_reasoning_summary",
-    "effective_context_window_percent",
     "max_context_window",
     "service_tiers",
     "supports_image_detail_original",
@@ -1191,7 +1182,6 @@ OFFICIAL_MODEL_INFO_REQUIRED = [
     "supports_reasoning_summaries",
     "supports_search_tool",
     "upgrade",
-    "auto_compact_token_limit",
 ]
 
 OFFICIAL_MODEL_INFO_FORBIDDEN = {"provider", "base_url", "env_key", "id", "name", "model_id"}
@@ -1278,16 +1268,20 @@ def _official_model_info(info: dict[str, Any]) -> dict[str, Any]:
     slug = str(info.get("slug") or "").strip()
     if not slug:
         raise ValueError("发布条目缺少 slug，无法生成官方目录条目")
-    # 优先使用完整等级列表；缺失时以 reasoning_effort 兜底为单一等级。
+    # 等级列表本身就是上游声明的证据；缺失时才退到上游声明的默认等级。
     levels = [str(item) for item in (info.get("reasoning_levels") or []) if str(item)]
     if not levels:
-        levels = [str(info.get("reasoning_effort") or "medium")]
+        levels = [item for item in [str(info.get("reasoning_effort") or "").strip()] if item]
+    if not levels:
+        raise ValueError(f"发布条目 {slug} 缺少推理等级证据，拒绝生成目录条目")
     # 按低→高排序（Codex 目录惯例），未知等级置末尾。
     levels = _sort_reasoning_levels(levels)
-    effort = str(info.get("reasoning_effort") or levels[0] or "medium")
-    context_window = int(info.get("context_window") or 128000)
-    if context_window <= 0:
-        raise ValueError(f"发布条目 {slug} 的 context_window 必须为正整数")
+    effort = str(info.get("reasoning_effort") or levels[0])
+    # context_window 必须来自上游声明：缺了就拒绝生成条目，绝不本地编一个数字
+    # （曾经这里缺省成 128000，一个从未被上游证实过的窗口）。
+    context_window = _safe_positive_int(info.get("context_window"))
+    if context_window is None:
+        raise ValueError(f"发布条目 {slug} 缺少有效的 context_window（必须来自上游声明）")
     # Codex CLI 0.147+ 的 ModelInfo serde 要求以下布尔/标量字段必须存在，
     # 缺失会导致 load_catalog_json 直接拒绝整个目录（E2E 实测）。
     supports_reasoning_summaries = any(item != "none" for item in levels)
@@ -1310,12 +1304,6 @@ def _official_model_info(info: dict[str, Any]) -> dict[str, Any]:
         "truncation_policy": {"mode": "tokens", "limit": 10000},
         "context_window": context_window,
         "max_context_window": context_window,
-        "effective_context_window_percent": 95,
-        # 显式给出自动压缩阈值：官方缺省是 0.9 × 窗口，对大窗口模型等于不设防。
-        # 历史发布资产里没有该字段，这里按窗口现算，不需要数据迁移。
-        "auto_compact_token_limit": int(
-            info.get("auto_compact_token_limit") or auto_compact_token_limit(context_window)
-        ),
         "input_modalities": _codex_supported_modalities(info.get("input_modalities") or ["text"]),
         "experimental_supported_tools": [],
         "base_instructions": str(info.get("base_instructions") or DEFAULT_BASE_INSTRUCTIONS),

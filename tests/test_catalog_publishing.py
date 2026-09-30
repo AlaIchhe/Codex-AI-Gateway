@@ -6,6 +6,8 @@ import asyncio
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from codex_ai_gateway.models.entities import (
     CatalogCandidate,
     CatalogEvidenceSet,
@@ -225,17 +227,18 @@ def test_fallback_publication_uses_provider_model_id() -> None:
     assert info["slug"] == "deepseek-v4.1-flash"
     assert info["model_id"] == "deepseek-v4.1-flash"
     assert info["reasoning_effort"] == "medium"
-    # 上游声明的 1M 窗口不可信（见下方 auto_compact 回归），发布条目必须自带保守阈值。
-    assert info["auto_compact_token_limit"] == 200_000
+    # 自动压缩阈值不落库：上游声明的 context_window 是唯一证据，Codex 自己按
+    # 0.9 × context_window 推导，网关不再塞入任何本地猜测出来的数字。
+    assert "auto_compact_token_limit" not in info
 
 
-def test_catalog_publishes_conservative_auto_compact_limit() -> None:
-    """上游声明的 context_window 不可信时，自动压缩阈值必须保守。
+def test_catalog_omits_auto_compact_limit_so_codex_derives_it() -> None:
+    """目录不许携带网关猜出来的自动压缩阈值。
 
-    command ai 的 deepseek-v4.1-flash 声明 1M 窗口，实测 prompt ≈216k 就被上游
-    以不透明 400 拒绝（CommandCodeAI/command-code#952）。官方默认阈值是
-    ``0.9 × context_window``（≈943k），会话会在压缩之前撞墙，而且客户端识别不出
-    该错误、永远不会 compact，于是会话永久卡死。
+    Codex 的 ``ModelInfo::auto_compact_token_limit()``
+    （codex-rs/protocol/src/openai_models.rs）在字段缺省时用
+    ``0.9 × resolved_context_window``，字段存在时反而会取 ``min`` 把上游声明的
+    窗口压缩掉。网关没有能力证明上游窗口不可信，因此必须留空，只认上游声明。
     """
     doc = build_catalog_response(
         [
@@ -270,10 +273,53 @@ def test_catalog_publishes_conservative_auto_compact_limit() -> None:
     validate_catalog_response(doc)
     entries = {item["slug"]: item for item in doc["models"]}
 
-    # 大窗口：截到保守上限，保证「prompt + 预留输出」不会超出上游真实容量。
-    assert entries["huge-window"]["auto_compact_token_limit"] == 200_000
-    # 小窗口：不放大也不截断，仍按 0.9 × 窗口。
-    assert entries["small-window"]["auto_compact_token_limit"] == 115_200
+    assert "auto_compact_token_limit" not in entries["huge-window"]
+    assert "auto_compact_token_limit" not in entries["small-window"]
+    # 上游声明的窗口原样透传给客户端，不做任何截断。
+    assert entries["huge-window"]["context_window"] == 1_048_576
+    assert entries["small-window"]["context_window"] == 128_000
+
+
+def _complete_model_info() -> dict[str, object]:
+    return {
+        "slug": "evidence-only",
+        "name": "evidence-only",
+        "model_id": "evidence-only",
+        "context_window": 128_000,
+        "reasoning_levels": ["medium"],
+        "reasoning_effort": "medium",
+        "input_modalities": ["text"],
+        "output_modalities": ["text"],
+        "tools": True,
+        "tool_choice": True,
+        "structured_output": True,
+    }
+
+
+def test_catalog_entry_omits_effective_context_window_percent() -> None:
+    """占比字段交给客户端默认值，网关不再自己写一个 95。
+
+    Codex 的 ``ModelInfo`` 对该字段有 serde 默认值（0.149.0 / 0.159.2 均为
+    ``default_effective_context_window_percent() = 95``），省略与写 95 等价；
+    写死的数字只会让「这个百分比是谁定的」变得不可考。
+    """
+    doc = build_catalog_response([_complete_model_info()])
+    validate_catalog_response(doc)
+    assert "effective_context_window_percent" not in doc["models"][0]
+
+
+def test_catalog_entry_refuses_to_invent_missing_upstream_evidence() -> None:
+    """缺上游声明的窗口 / 推理等级就拒绝生成条目，不本地编默认值。"""
+    without_window = _complete_model_info()
+    del without_window["context_window"]
+    with pytest.raises(ValueError):
+        build_catalog_response([without_window])
+
+    without_reasoning = _complete_model_info()
+    del without_reasoning["reasoning_levels"]
+    del without_reasoning["reasoning_effort"]
+    with pytest.raises(ValueError):
+        build_catalog_response([without_reasoning])
 
 
 def test_openrouter_candidate_evidence_source_stays_openrouter() -> None:

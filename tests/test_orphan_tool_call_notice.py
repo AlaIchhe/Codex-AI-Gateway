@@ -265,13 +265,23 @@ def test_strip_reasoning_content_only_reports_real_change() -> None:
 
 
 def test_reasoning_replay_error_is_narrow() -> None:
+    # 只有上游**点名 reasoning 字段本身**才算「拒绝 reasoning 回放」。
     assert _reasoning_replay_error(
-        400, b'{"error":{"message":"The reasoning_content must be passed back"}}'
+        400,
+        b'{"error":{"message":"The `reasoning_content` in the thinking mode must be passed back to the API."}}',
     )
-    assert _reasoning_replay_error(400, b'{"error":{"message":"encrypted content"}}')
+    assert _reasoning_replay_error(
+        400, b'{"error":{"message":"encrypted reasoning is not supported here"}}'
+    )
     # 非 400 不触发。
     assert not _reasoning_replay_error(
         401, b'{"error":{"message":"reasoning not allowed"}}'
+    )
+    # 正文里只是碰巧出现 reasoning 家族词（encrypted / thinking / thought），
+    # 不足以断言上游在抱怨 reasoning 回放：那是猜测，只会白打一次上游。
+    assert not _reasoning_replay_error(400, b'{"error":{"message":"encrypted content"}}')
+    assert not _reasoning_replay_error(
+        400, b'{"error":{"message":"thinking is required for this endpoint"}}'
     )
     # 与 reasoning 无关的 400 不触发：不能把真正的请求错误吞掉。
     assert not _reasoning_replay_error(
